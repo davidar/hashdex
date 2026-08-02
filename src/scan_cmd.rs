@@ -20,7 +20,15 @@ pub struct ScanOptions {
     /// Resolve listed files through the local walk (inverted indexes +
     /// observation store). Never touches the network.
     pub resolve: bool,
+    /// Probe every filter even when a smaller one already matched
+    /// (full attribution at the cost of big-filter page faults).
+    pub probe_all: bool,
 }
+
+/// Filters at least this big are probed only for files no smaller filter
+/// recognized: each probe of a bigger-than-RAM mmap is a random page
+/// fault, and known-file corroboration isn't worth disk seeks.
+const EXPENSIVE_FILTER_BYTES: u64 = 2 << 30;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum ListMode {
@@ -49,13 +57,29 @@ struct FileResult {
 /// can find files by digest.
 pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> Result<()> {
     // Collect the file list first so workers can chew through it by index.
+    // hdx's own cache (dumps, extracts, filters, local.db) is excluded —
+    // it would pollute the known/unknown metrics with our own artifacts —
+    // unless a scan root points inside it explicitly.
+    let own_cache = crate::cache::cache_dir();
+    let mut excluded_own_cache = false;
     let mut files = Vec::new();
     for root in paths {
         if root.is_file() {
             files.push(root.clone());
             continue;
         }
-        for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let prune_cache = !root.starts_with(&own_cache);
+        let walker = walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                if prune_cache && e.path() == own_cache {
+                    excluded_own_cache = true;
+                    return false;
+                }
+                true
+            });
+        for entry in walker {
             match entry {
                 Ok(e) if e.file_type().is_file() => files.push(e.into_path()),
                 Ok(_) => {}
@@ -64,6 +88,12 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
         }
     }
     let total = files.len();
+    if excluded_own_cache {
+        eprintln!(
+            "excluding hashdex's own cache ({}); scan it explicitly to include it",
+            own_cache.display()
+        );
+    }
 
     let mut index = if opts.no_index {
         None
@@ -87,8 +117,15 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
     }
     eprintln!("scanning {total} files ({} in index)…", cached.len());
 
+    // Probe cheapest-first so membership is usually settled before any
+    // bigger-than-RAM filter would need a disk seek.
+    let mut probe_order: Vec<&NamedFilter> = filters.iter().collect();
+    probe_order.sort_by_key(|f| f.bytes);
+    let probe_order = &probe_order;
+
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
+    let big_skipped_files = AtomicUsize::new(0);
     let results: Mutex<Vec<FileResult>> = Mutex::new(Vec::with_capacity(total));
     let skipped: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let threads = std::thread::available_parallelism()
@@ -109,7 +146,15 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
                         Ok(Some(mut r)) => {
                             let sha1_hex = hex_upper(&r.sha1);
                             let sha256_hex = hex_lower(&r.sha256);
-                            for f in filters {
+                            let mut skipped_big = false;
+                            for f in probe_order {
+                                if !opts.probe_all
+                                    && f.bytes >= EXPENSIVE_FILTER_BYTES
+                                    && !r.matched.is_empty()
+                                {
+                                    skipped_big = true;
+                                    continue;
+                                }
                                 let key: &[u8] = match f.scheme {
                                     Scheme::Sha1 => sha1_hex.as_bytes(),
                                     Scheme::Sha256 => sha256_hex.as_bytes(),
@@ -118,6 +163,10 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
                                 if f.bloom.check(key) {
                                     r.matched.push(f.name.clone());
                                 }
+                            }
+                            r.matched.sort();
+                            if skipped_big {
+                                big_skipped_files.fetch_add(1, Ordering::Relaxed);
                             }
                             results.lock().unwrap().push(r);
                         }
@@ -267,6 +316,7 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
         "unknown": scanned - known,
         "hashed": scanned - reused,
         "from_index": reused,
+        "big_filters_skipped_files": big_skipped_files.load(Ordering::Relaxed),
         "per_filter": per_filter.iter().map(|(k, v)| (k.to_string(), v)).collect::<std::collections::BTreeMap<_,_>>(),
         "filters_loaded": filters.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
     });
@@ -282,6 +332,13 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
         );
         for (f, n) in &per_filter {
             println!("  {f}: {n} files");
+        }
+        let big_skipped = big_skipped_files.load(Ordering::Relaxed);
+        if big_skipped > 0 {
+            println!(
+                "  ({big_skipped} known files skipped filters over {} — per-filter counts are a floor; --probe-all for full attribution)",
+                human(EXPENSIVE_FILTER_BYTES)
+            );
         }
         println!(
             "  hashed {} files, reused {reused} from local index",

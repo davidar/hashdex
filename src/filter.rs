@@ -167,6 +167,9 @@ pub struct NamedFilter {
     pub name: String,
     pub scheme: Scheme,
     pub bloom: Bloom,
+    /// On-disk size; scan probes filters cheapest-first and can skip
+    /// RAM-dwarfing ones once a file is already known.
+    pub bytes: u64,
 }
 
 pub fn filters_dir() -> PathBuf {
@@ -201,6 +204,7 @@ pub fn load_all() -> Result<Vec<NamedFilter>> {
                 name: parts[0].to_string(),
                 scheme,
                 bloom,
+                bytes: entry.metadata().map(|m| m.len()).unwrap_or(0),
             }),
             Err(e) => eprintln!("warning: skipping filter {fname}: {e}"),
         }

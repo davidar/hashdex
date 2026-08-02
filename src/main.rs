@@ -86,6 +86,10 @@ enum Command {
         /// store (offline; implies --list all unless --list given)
         #[arg(long)]
         resolve: bool,
+        /// Probe every filter even for files a smaller filter already
+        /// matched (full attribution; slower with bigger-than-RAM filters)
+        #[arg(long)]
+        probe_all: bool,
     },
     /// Find local files by digest (from the index hdx scan maintains)
     Locate {
@@ -171,6 +175,7 @@ async fn main() -> Result<()> {
                 list,
                 rehash,
                 resolve,
+                probe_all,
             }),
             _,
         ) => {
@@ -193,6 +198,7 @@ async fn main() -> Result<()> {
                 no_index: cli.no_cache,
                 rehash: *rehash,
                 resolve: *resolve,
+                probe_all: *probe_all,
             };
             scan_cmd::scan(paths, &filters, &opts)?;
         }

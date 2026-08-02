@@ -470,3 +470,35 @@ fn fetch_registry_works_offline() {
     let out = env.hdx(&["filters", "fetch", "--from", "http://localhost:1/x.bloom"]);
     assert!(!out.status.success());
 }
+
+/// hdx's own cache (dumps, extracts, filters, local.db) must not pollute
+/// scan metrics; an explicit scan root inside the cache still works.
+#[test]
+fn scan_excludes_own_cache_dir() {
+    let env = TestEnv::new("owncache");
+    env.write("real.txt", b"some real file");
+    let cache_junk = env.root.join("cache/hashdex/extracts");
+    std::fs::create_dir_all(&cache_junk).unwrap();
+    std::fs::write(cache_junk.join("dump.tsv"), b"cached artifact bytes").unwrap();
+
+    // A scan whose root contains the cache prunes the cache subtree.
+    let out = env.hdx(&["scan", env.root.to_str().unwrap(), "--json"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let summary = scan_summary(&out);
+    assert_eq!(
+        summary["files"], 1,
+        "expected only work/real.txt: {summary}"
+    );
+    assert!(
+        stderr(&out).contains("excluding hashdex's own cache"),
+        "no exclusion notice: {}",
+        stderr(&out)
+    );
+
+    // A root inside the cache is an explicit request — nothing is pruned.
+    let out = env.hdx(&["scan", cache_junk.to_str().unwrap(), "--json"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let summary = scan_summary(&out);
+    assert_eq!(summary["files"], 1, "explicit cache scan saw: {summary}");
+    assert!(!stderr(&out).contains("excluding hashdex's own cache"));
+}
