@@ -131,7 +131,14 @@ async fn main() -> Result<()> {
         .build()?;
 
     match (&cli.command, &cli.hash) {
-        (Some(Command::Scan { paths, list, rehash }), _) => {
+        (
+            Some(Command::Scan {
+                paths,
+                list,
+                rehash,
+            }),
+            _,
+        ) => {
             if paths.is_empty() {
                 anyhow::bail!("hdx scan: no paths given");
             }
@@ -173,7 +180,9 @@ async fn main() -> Result<()> {
             }
             if hits.is_empty() {
                 let (n, _) = ix.stats()?;
-                eprintln!("no local file with that digest ({n} files indexed; hdx scan to index more)");
+                eprintln!(
+                    "no local file with that digest ({n} files indexed; hdx scan to index more)"
+                );
                 std::process::exit(1);
             }
         }
@@ -272,7 +281,10 @@ fn render(res: &Resolution, json: bool, nested: bool) {
         for (i, claim) in f.claims.iter().enumerate() {
             let label = if i == 0 { f.backend.as_str() } else { "" };
             match &claim.url {
-                Some(url) => println!("{indent}  {label:<20} {}\n{indent}  {:<20} → {url}", claim.statement, ""),
+                Some(url) => println!(
+                    "{indent}  {label:<20} {}\n{indent}  {:<20} → {url}",
+                    claim.statement, ""
+                ),
                 None => println!("{indent}  {label:<20} {}", claim.statement),
             }
         }
@@ -286,7 +298,13 @@ fn render(res: &Resolution, json: bool, nested: bool) {
         .filter(|c| *c != res.coord.to_string())
         .collect();
     if !all.is_empty() {
-        println!("{indent}  {:<20} {}", "coordinates", all.into_iter().collect::<Vec<_>>().join("\n                       "));
+        println!(
+            "{indent}  {:<20} {}",
+            "coordinates",
+            all.into_iter()
+                .collect::<Vec<_>>()
+                .join("\n                       ")
+        );
     }
 
     if !res.misses.is_empty() {

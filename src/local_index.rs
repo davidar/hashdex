@@ -18,6 +18,9 @@ pub struct CachedEntry {
     pub sha256: [u8; 32],
 }
 
+/// A freshly hashed file bound for the index: (path, size, mtime_ns, sha1, sha256).
+pub type FreshEntry = (String, u64, i64, [u8; 20], [u8; 32]);
+
 fn db_path() -> std::path::PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -83,11 +86,7 @@ impl LocalIndex {
 
     /// Upsert freshly hashed files and drop entries whose paths were
     /// walked over but no longer exist, all in one transaction.
-    pub fn commit_scan(
-        &mut self,
-        fresh: &[(String, u64, i64, [u8; 20], [u8; 32])],
-        stale_paths: &[String],
-    ) -> Result<()> {
+    pub fn commit_scan(&mut self, fresh: &[FreshEntry], stale_paths: &[String]) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -128,19 +127,21 @@ impl LocalIndex {
             32 => "sha256",
             n => anyhow::bail!("locate: need a sha1 or sha256 digest, got {n} bytes"),
         };
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT path, size FROM local_files WHERE {col} = ?1"))?;
-        let rows = stmt.query_map([digest], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT path, size FROM local_files WHERE {col} = ?1"
+        ))?;
+        let rows = stmt.query_map([digest], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+        })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn stats(&self) -> Result<(u64, u64)> {
-        let (n, bytes): (i64, Option<i64>) = self.conn.query_row(
-            "SELECT COUNT(*), SUM(size) FROM local_files",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        let (n, bytes): (i64, Option<i64>) =
+            self.conn
+                .query_row("SELECT COUNT(*), SUM(size) FROM local_files", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
         Ok((n as u64, bytes.unwrap_or(0) as u64))
     }
 }

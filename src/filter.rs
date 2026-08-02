@@ -42,9 +42,8 @@ impl Bloom {
         if mmap.len() < HEADER_LEN {
             bail!("bloom filter too short: {}", path.display());
         }
-        let u64_at = |i: usize| -> u64 {
-            u64::from_le_bytes(mmap[i * 8..i * 8 + 8].try_into().unwrap())
-        };
+        let u64_at =
+            |i: usize| -> u64 { u64::from_le_bytes(mmap[i * 8..i * 8 + 8].try_into().unwrap()) };
         let version = u64_at(0);
         if version & 0xff != 1 {
             bail!("unsupported bloom filter version {version}");
@@ -238,6 +237,79 @@ mod tests {
             }
         }
         assert!(fp <= 5, "false-positive rate wildly off: {fp}/10000");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("hdx-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Pins the on-disk format and the membership hashing bit-for-bit.
+    /// The DCSO hashing was verified byte-exact against CIRCL's live
+    /// filter (Go-semantics wrapping multiply — see module docs); if this
+    /// golden digest changes, compatibility with every published filter
+    /// breaks. Do not update the constant to make the test pass.
+    #[test]
+    fn dcso_format_golden() {
+        let mut b = BloomBuilder::new(100, 0.01).unwrap();
+        for key in [
+            "A9993E364706816ABA3E25717850C26C9CD0D89D",
+            "DA39A3EE5E6B4B0D3255BFEF95601890AFD80709",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ] {
+            b.add(key.as_bytes());
+        }
+        let dir = tmp_dir("bloom-golden");
+        let path = dir.join("g.bloom");
+        b.write(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let digest: [u8; 32] = {
+            use sha2::Digest;
+            sha2::Sha256::digest(&bytes).into()
+        };
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex, "593635f214df50af3fe42b41b3c86fa6ca6c79c312a66818ed748435982bc6ae",
+            "DCSO filter bytes changed — this breaks compatibility with published filters"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn open_err(path: &Path) -> String {
+        match Bloom::open(path) {
+            Ok(_) => panic!("{} unexpectedly opened as a valid filter", path.display()),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn open_rejects_garbage() {
+        let dir = tmp_dir("bloom-garbage");
+
+        // too short to hold a header
+        let short = dir.join("short.bloom");
+        std::fs::write(&short, b"not a bloom").unwrap();
+        assert!(open_err(&short).contains("too short"));
+
+        // wrong version word
+        let mut b = BloomBuilder::new(10, 0.01).unwrap();
+        b.add(b"X");
+        let good = dir.join("good.bloom");
+        b.write(&good).unwrap();
+        let mut bytes = std::fs::read(&good).unwrap();
+        bytes[0] = 2;
+        let badver = dir.join("badver.bloom");
+        std::fs::write(&badver, &bytes).unwrap();
+        assert!(open_err(&badver).contains("version"));
+
+        // header intact but bit array cut off
+        let full = std::fs::read(&good).unwrap();
+        let truncated = dir.join("trunc.bloom");
+        std::fs::write(&truncated, &full[..full.len() - 8]).unwrap();
+        assert!(open_err(&truncated).contains("truncated"));
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

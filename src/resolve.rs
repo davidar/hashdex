@@ -21,7 +21,11 @@ pub struct Options {
 }
 
 pub async fn resolve(client: &Client, coord: &Coord, opts: &Options) -> Result<Resolution> {
-    let cache = if opts.no_cache { None } else { Cache::open().ok() };
+    let cache = if opts.no_cache {
+        None
+    } else {
+        Cache::open().ok()
+    };
     let mut findings = Vec::new();
     let mut misses = Vec::new();
     let mut to_fetch = Vec::new();

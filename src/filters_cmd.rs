@@ -156,7 +156,11 @@ pub async fn fetch(
         if !unknown.is_empty() {
             anyhow::bail!(
                 "unknown filter name(s): {} (run `hdx filters fetch` to list)",
-                unknown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                unknown
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
         REGISTRY
@@ -180,7 +184,10 @@ async fn fetch_one(
     std::fs::create_dir_all(&dir)?;
     let dest = dir.join(format!("{name}.{scheme}.bloom"));
     if dest.exists() {
-        eprintln!("already installed: {} (delete to re-download)", dest.display());
+        eprintln!(
+            "already installed: {} (delete to re-download)",
+            dest.display()
+        );
         return Ok(());
     }
     let part = dir.join(format!("{name}.{scheme}.bloom.part"));
@@ -264,8 +271,7 @@ pub fn build(
     // Pass 1: count valid lines so the filter can be sized.
     let mut n: u64 = 0;
     for path in inputs {
-        let f = std::fs::File::open(path)
-            .with_context(|| format!("open {}", path.display()))?;
+        let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
         for line in std::io::BufReader::new(f).lines() {
             let line = line?;
             let t = line.trim();
@@ -307,7 +313,7 @@ pub fn build(
             };
             builder.add(key.as_bytes());
             done += 1;
-            if done % 50_000_000 == 0 {
+            if done.is_multiple_of(50_000_000) {
                 eprintln!("  … {done}/{n}");
             }
         }

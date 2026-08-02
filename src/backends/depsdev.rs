@@ -54,13 +54,22 @@ pub async fn lookup(client: &Client, coord: &Coord) -> Result<Option<Finding>> {
                 .map(|p| format!(", published {}", &p[..10.min(p.len())]))
                 .unwrap_or_default();
             Some(Claim::new(
-                format!("{}: {}@{}{}", system.to_lowercase(), name, version, published),
+                format!(
+                    "{}: {}@{}{}",
+                    system.to_lowercase(),
+                    name,
+                    version,
+                    published
+                ),
                 registry_url(system, name, version),
             ))
         })
         .collect();
     if total > 10 {
-        claims.push(Claim::new(format!("… and {} more results", total - 10), None));
+        claims.push(Claim::new(
+            format!("… and {} more results", total - 10),
+            None,
+        ));
     }
     Ok(Some(Finding {
         backend: NAME.into(),
@@ -74,11 +83,13 @@ fn registry_url(system: &str, name: &str, version: &str) -> Option<String> {
         "CARGO" => Some(format!("https://crates.io/crates/{name}/{version}")),
         "NPM" => Some(format!("https://www.npmjs.com/package/{name}/v/{version}")),
         "PYPI" => Some(format!("https://pypi.org/project/{name}/{version}/")),
-        "RUBYGEMS" => Some(format!("https://rubygems.org/gems/{name}/versions/{version}")),
+        "RUBYGEMS" => Some(format!(
+            "https://rubygems.org/gems/{name}/versions/{version}"
+        )),
         "NUGET" => Some(format!("https://www.nuget.org/packages/{name}/{version}")),
-        "MAVEN" => name.split_once(':').map(|(g, a)| {
-            format!("https://central.sonatype.com/artifact/{g}/{a}/{version}")
-        }),
+        "MAVEN" => name
+            .split_once(':')
+            .map(|(g, a)| format!("https://central.sonatype.com/artifact/{g}/{a}/{version}")),
         _ => None,
     }
 }

@@ -127,7 +127,7 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
                         Err(e) => eprintln!("warning: {}: {e}", files[i].display()),
                     }
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if d % 100_000 == 0 {
+                    if d.is_multiple_of(100_000) {
                         eprintln!("  … {d}/{total}");
                     }
                 }
@@ -142,7 +142,7 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
     // Persist: fresh hashes in, vanished paths out.
     let reused = results.iter().filter(|r| r.from_index).count();
     if let Some(ix) = &mut index {
-        let fresh: Vec<(String, u64, i64, [u8; 20], [u8; 32])> = results
+        let fresh: Vec<crate::local_index::FreshEntry> = results
             .iter()
             .filter(|r| !r.from_index)
             .map(|r| {

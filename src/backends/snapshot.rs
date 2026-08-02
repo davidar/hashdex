@@ -35,9 +35,8 @@ pub async fn lookup(client: &Client, coord: &Coord) -> Result<Option<Finding>> {
             let first_seen = r["first_seen"].as_str().unwrap_or("");
             // Timestamped archive URL: the immutable coordinate that stays
             // dereferenceable after the mutable mirror moves on.
-            let url = format!(
-                "https://snapshot.debian.org/archive/{archive}/{first_seen}{path}/{name}"
-            );
+            let url =
+                format!("https://snapshot.debian.org/archive/{archive}/{first_seen}{path}/{name}");
             Some(Claim::new(
                 format!("{name} in {archive}{path} (first seen {first_seen})"),
                 Some(url),
@@ -45,7 +44,10 @@ pub async fn lookup(client: &Client, coord: &Coord) -> Result<Option<Finding>> {
         })
         .collect();
     if total > 5 {
-        claims.push(Claim::new(format!("… and {} more locations", total - 5), None));
+        claims.push(Claim::new(
+            format!("… and {} more locations", total - 5),
+            None,
+        ));
     }
     claims.push(Claim::new(
         "raw bytes by hash",

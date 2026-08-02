@@ -79,6 +79,7 @@ impl Coord {
     ///   - SRI: "sha512-<base64>", "sha256-<base64>", "sha1-<base64>"
     ///   - bare hex, length-disambiguated: 32=md5, 40=sha1, 64=sha256, 128=sha512
     ///   - bare base32 (32 chars, A-Z2-7): CDX-style sha1
+    ///
     /// Bare 64-hex is ambiguous with blake2s256; we default to sha256 —
     /// use an explicit "blake2s256:" prefix for blake2.
     pub fn parse(input: &str) -> Result<Coord> {
@@ -142,7 +143,7 @@ impl fmt::Display for Coord {
 
 fn decode_hex(s: &str) -> Result<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("not valid hex: {s:?}");
     }
     Ok((0..s.len())
@@ -157,7 +158,8 @@ mod tests {
 
     #[test]
     fn parse_forms() {
-        let c = Coord::parse("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855").unwrap();
+        let c = Coord::parse("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            .unwrap();
         assert_eq!(c.scheme, Scheme::Sha256);
         let c = Coord::parse("sha1:da39a3ee5e6b4b0d3255bfef95601890afd80709").unwrap();
         assert_eq!(c.scheme, Scheme::Sha1);
@@ -167,5 +169,103 @@ mod tests {
         let c = Coord::parse("3I42H3S6NNFQ2MSVX7XZKYAYSCX5QBYJ").unwrap();
         assert_eq!(c.scheme, Scheme::Sha1);
         assert_eq!(c.hex(), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    }
+
+    #[test]
+    fn parse_bare_hex_by_length() {
+        for (hex, scheme) in [
+            ("900150983cd24fb0d6963f7d28e17f72", Scheme::Md5),
+            ("a9993e364706816aba3e25717850c26c9cd0d89d", Scheme::Sha1),
+            (
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                Scheme::Sha256,
+            ),
+            (
+                "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+                 2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+                Scheme::Sha512,
+            ),
+        ] {
+            let c = Coord::parse(hex).unwrap();
+            assert_eq!(c.scheme, scheme, "wrong scheme inferred for {hex}");
+            assert_eq!(c.hex(), hex);
+        }
+        // uppercase hex and surrounding whitespace are accepted
+        let c = Coord::parse("  A9993E364706816ABA3E25717850C26C9CD0D89D\n").unwrap();
+        assert_eq!(c.scheme, Scheme::Sha1);
+        assert_eq!(c.hex(), "a9993e364706816aba3e25717850c26c9cd0d89d");
+    }
+
+    #[test]
+    fn parse_scheme_prefixes() {
+        // bare 64-hex defaults to sha256; the explicit prefix flips it
+        let hex = "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982";
+        assert_eq!(Coord::parse(hex).unwrap().scheme, Scheme::Sha256);
+        let c = Coord::parse(&format!("blake2s256:{hex}")).unwrap();
+        assert_eq!(c.scheme, Scheme::Blake2s256);
+        let c = Coord::parse(&format!("blake2s:{hex}")).unwrap();
+        assert_eq!(c.scheme, Scheme::Blake2s256);
+
+        // prefix aliases and case-insensitivity
+        let hex = "f2ba8f84ab5c1bce84a7b441cb1959cfc7093b7f";
+        for prefix in ["sha1_git", "sha1-git", "git"] {
+            let c = Coord::parse(&format!("{prefix}:{hex}")).unwrap();
+            assert_eq!(c.scheme, Scheme::Sha1Git);
+        }
+        for spelling in ["SHA-256", "sha-256", "Sha256"] {
+            let c = Coord::parse(&format!(
+                "{spelling}:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            ))
+            .unwrap();
+            assert_eq!(c.scheme, Scheme::Sha256);
+        }
+        let c = Coord::parse("md5:900150983cd24fb0d6963f7d28e17f72").unwrap();
+        assert_eq!(c.scheme, Scheme::Md5);
+    }
+
+    #[test]
+    fn parse_sri() {
+        let c = Coord::parse("sha256-ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=").unwrap();
+        assert_eq!(c.scheme, Scheme::Sha256);
+        assert_eq!(
+            c.hex(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let c = Coord::parse(
+            "sha512-3a81oZNherrMQXNJriBBMRLm+k6JqX6iCp7u5ktV05ohkpkqJ0/BqDa6PCOj/uu9RU1EI2Q86A4qmslPpUyknw==",
+        )
+        .unwrap();
+        assert_eq!(c.scheme, Scheme::Sha512);
+    }
+
+    #[test]
+    fn parse_rejects() {
+        // unknown prefix
+        assert!(Coord::parse("sha3:ba7816bf8f01cfea414140de5dae2223").is_err());
+        // digest length does not match the named scheme
+        assert!(Coord::parse("sha256:a9993e364706816aba3e25717850c26c9cd0d89d").is_err());
+        // odd-length and non-hex input
+        assert!(Coord::parse("abc").is_err());
+        assert!(Coord::parse("zz993e364706816aba3e25717850c26c9cd0d89d").is_err());
+        // hex of a length no scheme uses
+        assert!(Coord::parse("a9993e364706816aba3e25717850c26c").is_ok()); // 32 = md5
+        assert!(Coord::parse("a9993e364706816aba3e25717850c2").is_err()); // 30
+        assert!(Coord::parse("").is_err());
+    }
+
+    #[test]
+    fn display_roundtrip() {
+        for input in [
+            "sha1:a9993e364706816aba3e25717850c26c9cd0d89d",
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "sha1_git:f2ba8f84ab5c1bce84a7b441cb1959cfc7093b7f",
+            "blake2s256:508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982",
+            "md5:900150983cd24fb0d6963f7d28e17f72",
+        ] {
+            let c = Coord::parse(input).unwrap();
+            assert_eq!(c.to_string(), input);
+            let again = Coord::parse(&c.to_string()).unwrap();
+            assert_eq!(again, c);
+        }
     }
 }
