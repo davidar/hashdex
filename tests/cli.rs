@@ -344,7 +344,15 @@ fn index_build_and_offline_resolve() {
         assert!(out.status.success(), "offline miss for {hash}");
         let text = stdout(&out);
         assert!(text.contains("fatcat"), "no attestor line in:\n{text}");
-        assert!(text.contains("https://fatcat.wiki/file/"));
+        // idents render as join keys; no fatcat.wiki URL (the site is dead)
+        assert!(
+            text.contains("scholarly file file_"),
+            "no ident in:\n{text}"
+        );
+        assert!(
+            !text.contains("fatcat.wiki"),
+            "dead URL resurfaced:\n{text}"
+        );
         // crosswalk: the other coordinates surface
         assert!(text.contains(ABC_SHA1) || text.contains(ABC_MD5));
     }

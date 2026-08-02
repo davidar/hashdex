@@ -105,12 +105,13 @@ fn fatcat_finding(row: &[u8]) -> Finding {
             fatcat_ident(release)
         )
     };
+    // No URL: fatcat.wiki is offline, and the wayback/DOI identifiers
+    // live in the published dataset, not in these rows — the fatcat
+    // network backend supplies them. The idents remain as join keys
+    // into the raw dumps.
     Finding {
         backend: "fatcat".into(),
-        claims: vec![Claim::new(
-            statement,
-            Some(format!("https://fatcat.wiki/file/{ident}")),
-        )],
+        claims: vec![Claim::new(statement, None)],
         coords: vec![
             format!("sha1:{}", hex(&row[0..20])),
             format!("sha256:{}", hex(&row[20..52])),
@@ -698,14 +699,19 @@ mod tests {
             assert!(f.coords.contains(&format!("sha1:{SHA1_ABC}")));
             assert!(f.coords.contains(&format!("md5:{MD5_ABC}")));
             assert!(f.claims[0].statement.contains("release_"));
-            let url = f.claims[0].url.as_deref().unwrap();
-            assert!(url.starts_with("https://fatcat.wiki/file/"));
+            // fatcat.wiki is dead: rows render idents (join keys into the
+            // dumps) but no URL — the network backend owns live links.
+            assert!(f.claims[0].url.is_none());
             // ident: lowercase base32, 26 chars for 16 bytes
-            let ident = url.rsplit('/').next().unwrap();
+            let ident = f.claims[0]
+                .statement
+                .split("file_")
+                .nth(1)
+                .unwrap()
+                .split(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit()))
+                .next()
+                .unwrap();
             assert_eq!(ident.len(), 26);
-            assert!(ident
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
         }
 
         // empty-release row renders without a release claim

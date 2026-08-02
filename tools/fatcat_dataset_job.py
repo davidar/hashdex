@@ -411,6 +411,17 @@ CARD = """\
 license: cc0-1.0
 pretty_name: fatcat files — hash-keyed scholarly file catalog
 tags: [file-hashes, bibliography, fatcat, provenance]
+configs:
+- config_name: default
+  data_files:
+  - split: train
+    path: data/*.parquet
+- config_name: maps
+  data_files:
+  - split: sha1
+    path: maps/sha1.parquet
+  - split: md5
+    path: maps/md5.parquet
 ---
 
 One row per (file x release) from the **final fatcat bulk export**

@@ -1,5 +1,6 @@
 pub mod circl;
 pub mod depsdev;
+pub mod fatcat;
 pub mod rekor;
 pub mod snapshot;
 pub mod swh;
@@ -33,6 +34,11 @@ pub fn all() -> Vec<Backend> {
             name: circl::NAME,
             supports: circl::supports,
             lookup: |c, k| Box::pin(circl::lookup(c, k)),
+        },
+        Backend {
+            name: fatcat::NAME,
+            supports: fatcat::supports,
+            lookup: |c, k| Box::pin(fatcat::lookup(c, k)),
         },
         Backend {
             name: swh::NAME,
