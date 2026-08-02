@@ -1,0 +1,329 @@
+use crate::coord::Scheme;
+use crate::filter::NamedFilter;
+use crate::local_index::{CachedEntry, LocalIndex};
+use anyhow::Result;
+use serde_json::json;
+use sha2::Digest;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+pub struct ScanOptions {
+    pub list: ListMode,
+    pub json: bool,
+    /// Skip the local hash index entirely (no reads, no writes).
+    pub no_index: bool,
+    /// Rehash every file even if the index has a fresh entry.
+    pub rehash: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum ListMode {
+    None,
+    Unknown,
+    Known,
+    All,
+}
+
+struct FileResult {
+    path: PathBuf,
+    size: u64,
+    mtime_ns: i64,
+    sha1: [u8; 20],
+    sha256: [u8; 32],
+    from_index: bool,
+    matched: Vec<String>, // filter names
+}
+
+/// Walk paths, hash every regular file (sha1 + sha256 in one pass), check
+/// membership filters locally. Zero network. This is the personal-NSRL
+/// scan: "which of my files are publicly known bytes."
+///
+/// Hashes persist in the local index (updatedb-style): unchanged files
+/// (same size + mtime) are not re-read on later scans, and `hdx locate`
+/// can find files by digest.
+pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> Result<()> {
+    // Collect the file list first so workers can chew through it by index.
+    let mut files = Vec::new();
+    for root in paths {
+        if root.is_file() {
+            files.push(root.clone());
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(root).follow_links(false) {
+            match entry {
+                Ok(e) if e.file_type().is_file() => files.push(e.into_path()),
+                Ok(_) => {}
+                Err(e) => eprintln!("warning: {e}"),
+            }
+        }
+    }
+    let total = files.len();
+
+    let mut index = if opts.no_index {
+        None
+    } else {
+        match LocalIndex::open() {
+            Ok(ix) => Some(ix),
+            Err(e) => {
+                eprintln!("warning: local index unavailable ({e}); hashing everything");
+                None
+            }
+        }
+    };
+    let mut cached: HashMap<String, CachedEntry> = HashMap::new();
+    if let Some(ix) = &index {
+        for root in paths {
+            match ix.load_under(root) {
+                Ok(map) => cached.extend(map),
+                Err(e) => eprintln!("warning: index read failed for {}: {e}", root.display()),
+            }
+        }
+    }
+    eprintln!("scanning {total} files ({} in index)…", cached.len());
+
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let results: Mutex<Vec<FileResult>> = Mutex::new(Vec::with_capacity(total));
+    let skipped: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let cached_ref = &cached;
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let mut buf = vec![0u8; 1 << 20];
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= total {
+                        break;
+                    }
+                    match examine(&files[i], cached_ref, opts.rehash, &mut buf) {
+                        Ok(Some(mut r)) => {
+                            let sha1_hex = hex_upper(&r.sha1);
+                            let sha256_hex = hex_lower(&r.sha256);
+                            for f in filters {
+                                let key: &[u8] = match f.scheme {
+                                    Scheme::Sha1 => sha1_hex.as_bytes(),
+                                    Scheme::Sha256 => sha256_hex.as_bytes(),
+                                    _ => continue,
+                                };
+                                if f.bloom.check(key) {
+                                    r.matched.push(f.name.clone());
+                                }
+                            }
+                            results.lock().unwrap().push(r);
+                        }
+                        Ok(None) => {
+                            skipped
+                                .lock()
+                                .unwrap()
+                                .push(files[i].to_string_lossy().into_owned());
+                        }
+                        Err(e) => eprintln!("warning: {}: {e}", files[i].display()),
+                    }
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if d % 100_000 == 0 {
+                        eprintln!("  … {d}/{total}");
+                    }
+                }
+            });
+        }
+    });
+
+    let mut results = results.into_inner().unwrap();
+    results.sort_by(|a, b| a.path.cmp(&b.path));
+    let skipped = skipped.into_inner().unwrap();
+
+    // Persist: fresh hashes in, vanished paths out.
+    let reused = results.iter().filter(|r| r.from_index).count();
+    if let Some(ix) = &mut index {
+        let fresh: Vec<(String, u64, i64, [u8; 20], [u8; 32])> = results
+            .iter()
+            .filter(|r| !r.from_index)
+            .map(|r| {
+                (
+                    r.path.to_string_lossy().into_owned(),
+                    r.size,
+                    r.mtime_ns,
+                    r.sha1,
+                    r.sha256,
+                )
+            })
+            .collect();
+        let seen: HashSet<String> = results
+            .iter()
+            .map(|r| r.path.to_string_lossy().into_owned())
+            .collect();
+        let mut stale: Vec<String> = cached
+            .keys()
+            .filter(|p| !seen.contains(p.as_str()))
+            .cloned()
+            .collect();
+        stale.extend(skipped);
+        if let Err(e) = ix.commit_scan(&fresh, &stale) {
+            eprintln!("warning: index update failed: {e}");
+        }
+    }
+
+    let mut known = 0usize;
+    let mut known_bytes = 0u64;
+    let mut total_bytes = 0u64;
+    let mut per_filter: std::collections::BTreeMap<&str, usize> = Default::default();
+    for r in &results {
+        total_bytes += r.size;
+        if !r.matched.is_empty() {
+            known += 1;
+            known_bytes += r.size;
+            for m in &r.matched {
+                *per_filter.entry(m.as_str()).or_default() += 1;
+            }
+        }
+        let show = match opts.list {
+            ListMode::None => false,
+            ListMode::All => true,
+            ListMode::Known => !r.matched.is_empty(),
+            ListMode::Unknown => r.matched.is_empty(),
+        };
+        if show {
+            if opts.json {
+                println!(
+                    "{}",
+                    json!({
+                        "path": r.path.display().to_string(),
+                        "size": r.size,
+                        "sha1": hex_lower(&r.sha1),
+                        "sha256": hex_lower(&r.sha256),
+                        "known": !r.matched.is_empty(),
+                        "filters": r.matched,
+                    })
+                );
+            } else {
+                let tag = if r.matched.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    r.matched.join(",")
+                };
+                println!("{:<12} {}", tag, r.path.display());
+            }
+        }
+    }
+
+    let scanned = results.len();
+    let summary = json!({
+        "files": scanned,
+        "bytes": total_bytes,
+        "known": known,
+        "known_bytes": known_bytes,
+        "unknown": scanned - known,
+        "hashed": scanned - reused,
+        "from_index": reused,
+        "per_filter": per_filter.iter().map(|(k, v)| (k.to_string(), v)).collect::<std::collections::BTreeMap<_,_>>(),
+        "filters_loaded": filters.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
+    });
+    if opts.json {
+        println!("{summary}");
+    } else {
+        eprintln!();
+        println!(
+            "{scanned} files ({}) — {known} known ({}), {} unknown",
+            human(total_bytes),
+            human(known_bytes),
+            scanned - known
+        );
+        for (f, n) in &per_filter {
+            println!("  {f}: {n} files");
+        }
+        println!(
+            "  hashed {} files, reused {reused} from local index",
+            scanned - reused
+        );
+        if filters.is_empty() {
+            println!("  (no filters installed — run `hdx filters fetch` first; every file reports unknown)");
+        }
+        println!("  note: filter matches are probabilistic (small false-positive rate); confirm important ones with `hdx <hash>`");
+    }
+    Ok(())
+}
+
+/// Stat the file; reuse the indexed digests when size+mtime match, else
+/// read and hash. Returns None for empty files (trivially "known").
+fn examine(
+    path: &Path,
+    cached: &HashMap<String, CachedEntry>,
+    rehash: bool,
+    buf: &mut [u8],
+) -> Result<Option<FileResult>> {
+    let meta = std::fs::metadata(path)?;
+    let size = meta.len();
+    if size == 0 {
+        return Ok(None);
+    }
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+
+    if !rehash {
+        if let Some(entry) = cached.get(path.to_string_lossy().as_ref()) {
+            if entry.size == size && entry.mtime_ns == mtime_ns {
+                return Ok(Some(FileResult {
+                    path: path.to_path_buf(),
+                    size,
+                    mtime_ns,
+                    sha1: entry.sha1,
+                    sha256: entry.sha256,
+                    from_index: true,
+                    matched: Vec::new(),
+                }));
+            }
+        }
+    }
+
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut sha1 = sha1::Sha1::new();
+    let mut sha256 = sha2::Sha256::new();
+    loop {
+        let n = reader.read(buf)?;
+        if n == 0 {
+            break;
+        }
+        sha1.update(&buf[..n]);
+        sha256.update(&buf[..n]);
+    }
+    Ok(Some(FileResult {
+        path: path.to_path_buf(),
+        size,
+        mtime_ns,
+        sha1: sha1.finalize().into(),
+        sha256: sha256.finalize().into(),
+        from_index: false,
+        matched: Vec::new(),
+    }))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_upper(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    format!("{v:.1} {}", UNITS[u])
+}

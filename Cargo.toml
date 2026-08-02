@@ -1,0 +1,35 @@
+[package]
+name = "hashdex"
+version = "0.1.0"
+edition = "2021"
+description = "hdx — resolve any hash against the indexes the world already maintains"
+license = "MIT"
+repository = "https://github.com/davidar/hashdex"
+readme = "README.md"
+keywords = ["hash", "sha256", "bloom-filter", "provenance", "forensics"]
+categories = ["command-line-utilities", "filesystem"]
+
+[[bin]]
+name = "hdx"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+data-encoding = "2"
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+blake2 = "0.10"
+futures = "0.3"
+dirs = "5"
+walkdir = "2"
+memmap2 = "0.9"
+
+[profile.release]
+lto = true

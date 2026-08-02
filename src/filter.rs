@@ -1,0 +1,243 @@
+use crate::coord::Scheme;
+use anyhow::{bail, Context, Result};
+use std::path::{Path, PathBuf};
+
+/// Reader for the DCSO/hashlookup bloom filter format (the format CIRCL
+/// publishes hashlookup-full.bloom in).
+///
+/// Layout, all little-endian u64: version(=1), n (capacity), p (fpp as
+/// f64 bits), k (hash count), m (bit count), N (elements), then
+/// ceil(m/64) u64 words of bit array, then arbitrary trailing data.
+///
+/// Membership hashing (ported from DCSO/bloom, Go semantics preserved):
+///   h = FNV-1 64(value) % M            with M = 2^64 - 87
+///   repeat k times: h = (h *wrap* g) % M,  bit = h % m
+///   with g = 18446744073709550147.
+/// The multiply wraps mod 2^64 before the % M, because that is what Go's
+/// uint64 arithmetic does in the reference implementation.
+///
+/// CIRCL inserts SHA-1 digests as UPPERCASE HEX STRINGS.
+pub struct Bloom {
+    k: u64,
+    m: u64,
+    mmap: memmap2::Mmap,
+    bits_offset: usize,
+    pub n_elements: u64,
+}
+
+const HEADER_LEN: usize = 48;
+const MOD: u64 = 18_446_744_073_709_551_529; // 2^64 - 87
+const G: u64 = 18_446_744_073_709_550_147;
+
+impl Bloom {
+    pub fn open(path: &Path) -> Result<Bloom> {
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("open bloom filter {}", path.display()))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        // Probe positions are uniformly random by construction; default
+        // readahead turns every 8-byte probe into a ~128 KiB read and
+        // saturates the disk on filters bigger than RAM (the 70 GB SWH
+        // filter made scans ~200x slower without this).
+        let _ = mmap.advise(memmap2::Advice::Random);
+        if mmap.len() < HEADER_LEN {
+            bail!("bloom filter too short: {}", path.display());
+        }
+        let u64_at = |i: usize| -> u64 {
+            u64::from_le_bytes(mmap[i * 8..i * 8 + 8].try_into().unwrap())
+        };
+        let version = u64_at(0);
+        if version & 0xff != 1 {
+            bail!("unsupported bloom filter version {version}");
+        }
+        let k = u64_at(3);
+        let m = u64_at(4);
+        let n_elements = u64_at(5);
+        let words = m.div_ceil(64) as usize;
+        if mmap.len() < HEADER_LEN + words * 8 {
+            bail!(
+                "bloom filter truncated: header says {} bits but file has {} bytes",
+                m,
+                mmap.len()
+            );
+        }
+        Ok(Bloom {
+            k,
+            m,
+            mmap,
+            bits_offset: HEADER_LEN,
+            n_elements,
+        })
+    }
+
+    pub fn check(&self, value: &[u8]) -> bool {
+        let mut h = fnv1_64(value) % MOD;
+        for _ in 0..self.k {
+            h = h.wrapping_mul(G) % MOD;
+            let bit = h % self.m;
+            let word = (bit >> 6) as usize;
+            let off = self.bits_offset + word * 8;
+            let w = u64::from_le_bytes(self.mmap[off..off + 8].try_into().unwrap());
+            if w & (1u64 << (bit & 63)) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// In-memory bloom filter under construction, written out in the same
+/// DCSO format `Bloom::open` reads. Same hashing as `Bloom::check` —
+/// keys inserted here are found there, bit-for-bit.
+pub struct BloomBuilder {
+    k: u64,
+    m: u64,
+    n_capacity: u64,
+    p: f64,
+    n_elements: u64,
+    bits: Vec<u64>,
+}
+
+impl BloomBuilder {
+    /// Size for `n` expected elements at false-positive rate `p`.
+    pub fn new(n: u64, p: f64) -> Result<BloomBuilder> {
+        if n == 0 || !(p > 0.0 && p < 1.0) {
+            bail!("bloom: need n > 0 and 0 < p < 1 (got n={n}, p={p})");
+        }
+        let ln2 = std::f64::consts::LN_2;
+        let m = ((n as f64) * (-p.ln()) / (ln2 * ln2)).ceil() as u64;
+        let k = ((m as f64 / n as f64) * ln2).round().max(1.0) as u64;
+        let words = m.div_ceil(64) as usize;
+        Ok(BloomBuilder {
+            k,
+            m,
+            n_capacity: n,
+            p,
+            n_elements: 0,
+            bits: vec![0u64; words],
+        })
+    }
+
+    pub fn add(&mut self, value: &[u8]) {
+        let mut h = fnv1_64(value) % MOD;
+        for _ in 0..self.k {
+            h = h.wrapping_mul(G) % MOD;
+            let bit = h % self.m;
+            self.bits[(bit >> 6) as usize] |= 1u64 << (bit & 63);
+        }
+        self.n_elements += 1;
+    }
+
+    pub fn size_bytes(&self) -> usize {
+        HEADER_LEN + self.bits.len() * 8
+    }
+
+    pub fn write(&self, path: &Path) -> Result<()> {
+        use std::io::Write;
+        let file = std::fs::File::create(path)
+            .with_context(|| format!("create bloom filter {}", path.display()))?;
+        let mut w = std::io::BufWriter::new(file);
+        for v in [
+            1u64,
+            self.n_capacity,
+            self.p.to_bits(),
+            self.k,
+            self.m,
+            self.n_elements,
+        ] {
+            w.write_all(&v.to_le_bytes())?;
+        }
+        for word in &self.bits {
+            w.write_all(&word.to_le_bytes())?;
+        }
+        w.flush()?;
+        Ok(())
+    }
+}
+
+fn fnv1_64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h = h.wrapping_mul(0x100000001b3);
+        h ^= b as u64;
+    }
+    h
+}
+
+/// A named membership filter bound to the scheme it keys on.
+pub struct NamedFilter {
+    pub name: String,
+    pub scheme: Scheme,
+    pub bloom: Bloom,
+}
+
+pub fn filters_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("hashdex")
+        .join("filters")
+}
+
+/// Load every installed filter. Convention: `<name>.<scheme>.bloom`.
+pub fn load_all() -> Result<Vec<NamedFilter>> {
+    let dir = filters_dir();
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(out);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let fname = entry.file_name().to_string_lossy().to_string();
+        let parts: Vec<&str> = fname.split('.').collect();
+        if parts.len() != 3 || parts[2] != "bloom" {
+            continue;
+        }
+        let scheme = match parts[1] {
+            "md5" => Scheme::Md5,
+            "sha1" => Scheme::Sha1,
+            "sha256" => Scheme::Sha256,
+            _ => continue,
+        };
+        match Bloom::open(&path) {
+            Ok(bloom) => out.push(NamedFilter {
+                name: parts[0].to_string(),
+                scheme,
+                bloom,
+            }),
+            Err(e) => eprintln!("warning: skipping filter {fname}: {e}"),
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_roundtrip() {
+        let mut b = BloomBuilder::new(1000, 0.0001).unwrap();
+        let keys: Vec<String> = (0..500).map(|i| format!("KEY{i:04}")).collect();
+        for k in &keys {
+            b.add(k.as_bytes());
+        }
+        let dir = std::env::temp_dir().join(format!("hdx-bloom-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.bloom");
+        b.write(&path).unwrap();
+
+        let bloom = Bloom::open(&path).unwrap();
+        assert_eq!(bloom.n_elements, 500);
+        for k in &keys {
+            assert!(bloom.check(k.as_bytes()), "member {k} must be found");
+        }
+        let mut fp = 0;
+        for i in 0..10_000 {
+            if bloom.check(format!("ABSENT{i:05}").as_bytes()) {
+                fp += 1;
+            }
+        }
+        assert!(fp <= 5, "false-positive rate wildly off: {fp}/10000");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

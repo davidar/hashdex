@@ -1,0 +1,413 @@
+# hashdex — bulk source inventory
+
+*The verified inventory behind the design's federate-first rule: where
+do URL→hash dumps already exist, so we can invert them ourselves
+without ever fetching content? Every claim marked "verified" was
+checked by direct HTTP probe or document fetch (baseline sweep
+2026-08-01); UNVERIFIED flags are honest gaps, not oversights.*
+
+**Admission rule for this list:** ingest cost must scale with metadata,
+never with content, and new-algorithm support must never imply re-fetch.
+Sources that would make us the hasher of record are excluded by
+construction.
+
+**Legend:** 🔀 = multi-hash rows (one row carries ≥2 digest algorithms for
+the same bytes → free cross-algorithm crosswalk edges, no content needed).
+🪤 = wrapper-hash trap (digest is not of the raw bytes; must be modeled as
+its own scheme).
+
+---
+
+## Tier 0 — aggregators (one ingest, many ecosystems)
+
+### deps.dev BigQuery (Google Open Source Insights) 🔀
+- `bigquery-public-data.deps_dev_v1` — npm, Go, Maven, PyPI, Cargo, NuGet.
+- Dedicated `PackageVersionHashes` table + `Hashes` array on
+  `PackageVersions` (npm sha1+sha512; Maven sha1; PyPI sha256; per-system
+  coverage varies). ⚠️ Go rows are dirhash H1 (see Go 🪤).
+- Also `PackageVersions.Attestations` pre-joins Rekor attestations.
+- License CC-BY 4.0. Snapshot model, ~weekly (UNVERIFIED cadence).
+- REST API: `GetVersion` returns no hashes, **but `GET /v3/query`
+  accepts `hash.type` (MD5/SHA1/SHA256/SHA512) + `hash.value`
+  (base64) and answers inverse lookups live** across npm, Cargo,
+  Maven, NuGet, PyPI, RubyGems (verified 2026-08-01; ≤1000 results,
+  one artifact may map to many versions). A free, Google-operated
+  inverted index over six registries — federate it, don't ingest it.
+  BigQuery remains the bulk path.
+- Related: `digest.ecosyste.ms` is an on-demand tarball-URL hasher —
+  not an index, but a third-party witness/edge-minting service.
+
+### ecosyste.ms open data
+- Full PostgreSQL dumps: `https://packages.ecosyste.ms/open-data` — latest
+  `packages-2026-02-05.tar.gz`, 63.7 GB, CC-BY-SA 4.0. 70+ registries,
+  version rows keep upstream hash fields (npm shasum+integrity etc.).
+- Irregular cadence (2023-08 … 2026-02) — use as long-tail backfill,
+  direct feeds for freshness. Live API works with a proper User-Agent.
+
+### Rekor BigQuery (Google) — ready-made inverted index
+- `bigquery-public-data.rekor` (announced 2025-10-15). **`IndexKeys`
+  table: `sha256:<digest>` (or email) → EntryUUID** — an inverted hash
+  index over ~2.3B signing events, maintained for us.
+- `Entries`, `Identities` (Fulcio OIDs: issuer, source repo, owner),
+  `Artifacts` (in-toto bodies: subject name + digest).
+- Live updates: Pub/Sub topic `new-entry` in GCP project `project-rekor`.
+- npm provenance, PyPI PEP-740, Homebrew attestations all flow through
+  Rekor → this one dataset covers them in bulk; per-registry attestation
+  endpoints become verification-only.
+
+### CIRCL hashlookup 🔀
+- Aggregates NSRL + Windows builds + Ubuntu/CentOS/Fedora/Kali/OpenSUSE/
+  OpenBSD + CDNJS + Snap store. CC-BY 4.0, open-source server.
+- REST + DNS lookup (md5/sha1/sha256/sha512); bulk Bloom filter
+  `https://cra.circl.lu/hashlookup/hashlookup-full.bloom` (956 MB,
+  418M SHA-1 keys; anonymous direct fetch works but the host is slow
+  — we mirror it on HF).
+- Bloom = membership only; metadata via API. Published filter dated
+  Oct 2023; recent binaries miss.
+
+---
+
+## Tier 1 — software artifacts (the v1 scope fence)
+
+### Language registries
+
+| Source | Bulk path | Hashes | Scale | Cadence |
+|---|---|---|---|---|
+| **PyPI** 🔀 | `bigquery-public-data.pypi.distribution_metadata` | md5+sha256+blake2_256 | 20.4M files | real-time inserts |
+| **npm** 🔀 | `_changes` (gutted 2025-05: no `include_docs`) + per-packument fetch; or Tier-0 aggregators | sha1 (`shasum`) + sha512 (`integrity`, ≥~2017) | 4.25M pkgs / ~73M versions | real-time |
+| **crates.io** | `https://static.crates.io/db-dump.tar.gz` (1.65 GB) | sha256 only | 309k crates / ~1.9M versions | daily |
+| **Go sumdb** 🪤 | tlog tile crawl of `sum.golang.org` (~58.5M leaves, low GB) | H1 dirhash of *extracted* tree + hash of .mod — never matches raw-bytes corpora; own scheme | 58.5M module-versions | continuous |
+| **Maven Central** | Central Index `.index/nexus-maven-repository-index.gz` (3.15 GB, weekly) or deps.dev | sha1 (index); per-file .md5/.sha1 sidecars, .sha256/.sha512 newer uploads only | ~15M+ GAVs (UNVERIFIED) | weekly |
+| **RubyGems** | S3 `rubygems-dumps` weekly Postgres dump (648 MB) | sha256 (base64) in `versions` | ~185k gems / ~1.4M versions | weekly |
+| **NuGet** | catalog0 append-only log (22,882 pages, cursor crawl) | sha512 per .nupkg (leaf fetch required) | 472k pkgs / ~7–8M versions | real-time |
+| **conda** 🔀 | `repodata.json[.zst]` per channel/subdir | md5+sha256 both | conda-forge ~1.5M+ files (UNVERIFIED) | continuous |
+| **CPAN** 🔀 | rsync mirror → per-author `CHECKSUMS` files | md5+sha256, each for gz AND ungz (bonus edges) | ~45k dists (UNVERIFIED) | continuous |
+| **Hackage** 🔀 | `01-index.tar.gz` (137 MB, appended; range-request incremental) | TUF targets md5+sha256 (both-present UNVERIFIED) | 19.4k pkgs | continuous |
+| **Homebrew** | `formulae.brew.sh/api/formula.json` (31 MB) | sha256; bottle URL **is** `ghcr.io/...blobs/sha256:<digest>` | ~7.5k formulae × platforms + casks | multiple/day |
+| **CRAN** | `src/contrib/PACKAGES` | md5 only; archived versions unhashed — weak | 24.5k pkgs | continuous |
+| **Packagist** | — | `shasum` empty; GitHub zipballs = unstable bytes. Near-useless; `reference` gives git-commit edges only | 462k pkgs | — |
+
+Notes:
+- **PyPI's URL is derivable from the hash itself**:
+  `files.pythonhosted.org/packages/{b2[:2]}/{b2[2:4]}/{b2[4:]}/{filename}`
+  where `b2` = blake2_256 hex. Verified empirically. Same property as
+  Homebrew bottles. Hash→URL with zero inference.
+- PEP 691 simple JSON (sha256 only) + bandersnatch `release-files=false`
+  are the non-BigQuery PyPI paths.
+- npm packuments pre-2017 have sha1 only.
+
+### Linux distros / OS packages
+
+- **Ubuntu** 🔀 — **richest cross-algorithm source in the family**:
+  Packages/Sources stanzas carry **MD5+SHA1+SHA256+SHA512** (4-way, one
+  .xz index per suite/arch) + pool `Filename` → direct URL.
+  `old-releases.ubuntu.com` back to 2004. Launchpad API adds the full
+  publication history incl. **all PPAs** (`binaryFileUrls` → url+sha1+
+  sha256 per file) — API-only, paginated, no dump.
+- **Debian** 🔀 — current Packages: MD5+SHA256 (SHA1 dropped ~2016;
+  pre-2016 indexes via snapshot.d.o carry all three). `Filename` → pool
+  URL. **buildinfos.debian.net**: every buildd-built .deb since ~2016
+  with **MD5+SHA1+SHA256** (3-way); bulk enumerator
+  `buildinfo-pool.list` (307 MB, regenerated daily).
+- **snapshot.debian.org** — SHA1-addressed farm, 2005→present, ~6h
+  granularity. `/mr/file/<sha1>/info` is a per-hash inverted index
+  already; **no bulk dump** — the bulk path is harvesting timestamped
+  Packages/Sources indexes from `archive/debian/<timestamp>/`. Rate
+  limiting reportedly removed ~Aug 2024 (UNVERIFIED; crawl politely).
+  `metasnap.debian.net` time-bounds URL validity.
+- **Fedora** — repodata primary.xml: sha256 pkgid + location href
+  (76k pkgs in F44); archives.fedoraproject.org keeps EOL trees back to
+  Fedora Core. **Koji**: ~46.4M RPMs / 2.95M builds, every build ever
+  (incl. never-shipped); `getRPMChecksums` → md5+sha256 🔀 but
+  XMLRPC-per-RPM only, no dump.
+- **Arch** 🔀 — repo .db files (sha256 only today); **Arch Linux
+  Archive**: daily .db snapshots back to 2013, and 2013–~2022 DBs carry
+  **MD5+SHA256** → historical 2-way edges. Archive keeps every package
+  version + sig. Don't hammer: robots.txt, "not a regular mirror".
+- **Alpine** 🪤 — **trap, verified empirically**: APKINDEX `C:Q1…` is
+  the SHA-1 of the *control segment only*, not the whole .apk —
+  unusable for whole-file hash↔URL. Whole-file hashes need another
+  source (or apk v3 .adb, not yet served for stable branches).
+- **openSUSE** — Tumbleweed primary.xml uses **sha512** pkgid (52k
+  pkgs); `download.opensuse.org/history/` snapshots appear to be a
+  rolling ~30-day window (UNVERIFIED). OBS `/public` API: source files
+  MD5 per-request; binary listings carry no hashes.
+- **Nix / cache.nixos.org** 🪤(domain) — narinfo per store path:
+  `FileHash` (compressed NAR) + `NarHash` (uncompressed NAR), both
+  sha256 — a compressed↔uncompressed edge pair, but in the **NAR
+  domain**, not raw-file. Enumerate via `channels.nixos.org/<ch>/
+  store-paths.xz` (205k paths for 25.05); `WantMassQuery: 1` explicitly
+  blesses mass narinfo fetches. S3 bucket is requester-pays; >1B
+  objects, >600 TB; numtide/narwal promises published inventory dumps
+  "soon" (UNVERIFIED). Bonus: nixpkgs fixed-output derivations map
+  upstream source URL→SRI hash, greppable at repo scale.
+- **F-Droid** 🔀 — `index-v2.json` (54 MB, one GET): per APK **sha256 +
+  IPFS CIDv1** (a free cross-*namespace* edge) + source-tarball sha256;
+  `/archive/` index holds old versions.
+- **reproduce.debian.net** 🔀 — rebuilderd attestations: per rebuilt
+  .deb **sha256+sha512** + GOOD/BAD verdict + direct pool URL; bulk
+  package list in one request (~36k records/arch/release), attestation
+  fetch per build. This is the "rebuilt-identically-by" claim source
+  the design calls for, live. (Arch's equivalent exists but its API
+  was flaky/unverifiable.)
+
+### Security / forensic hash sets
+
+- **NSRL RDS (NIST)** 🔀 — public domain, anonymous S3
+  (`s3.amazonaws.com/rds.nsrl.nist.gov/RDS/...`). RDSv3 SQLite; full DBs
+  annually (2026.03.1: modern 133 GB + legacy 46 GB + ios 17 GB + android
+  16 GB zipped), quarterly SQL-text deltas (~2 GB); "minimal" variants
+  ~43 GB total. Every row: **crc32+md5+sha1+sha256** → file name/size →
+  package/version → OS → manufacturer. ~1.5B rows, ~209.5M distinct
+  sha256. Bonus: separate **SHA-1→SHA-256 mapping, 16.8M rows, 1.1 GB**;
+  NSRL-CAID; block-hash sets. Redistribution "free and encouraged".
+- **MalwareBazaar (abuse.ch)** 🔀 — hourly full CSV export (auth-key since
+  2025-06, free): sha256+sha1+md5+imphash+ssdeep+tlsh per row + malware
+  family. ~1.1M samples. ⚠️ License no longer clearly CC0 post-Spamhaus
+  (UNVERIFIED redistribution rights).
+- **URLhaus** — payload md5+sha256 → distributing URL, first/last seen.
+  ThreatFox exports cover trailing 6 months only.
+- **VirusShare** — md5-only, label-free chunk lists; membership flag only,
+  low value. MalShare/Hybrid-Analysis: daily feeds only, marginal.
+- **CISA MARs** — STIX JSON per report, public domain, tiny; enrichment
+  only.
+
+### Attestation / transparency logs
+
+- **Rekor v1** (`rekor.sigstore.dev`) — ~2.31B entries (verified via
+  `/api/v1/log`); still default log, 1-year notice promised before
+  shutdown. API-scale extraction infeasible → use Rekor BigQuery (Tier 0).
+  Entries = signing *events*, not unique artifacts; junk/test hashes
+  common (top IndexKey = a conformance-test file, 5.6M entries).
+- **Rekor v2** (tiled, GA 2025-10) — `log2025-1.rekor.sigstore.dev`,
+  47.7M entries, **cleanly bulk-clonable** via C2SP tlog-tiles
+  (`/tile/entries/<n>`, ~125 GB full). v2 dropped the search index —
+  hash lookup now *requires* a mirror like us. Discover shards via
+  Sigstore TUF root, don't hardcode.
+- **PyPI PEP-740** — per-file Integrity API; bulk via Rekor. (JSON API's
+  `provenance` field can be null where provenance exists — use Integrity
+  API.)
+- **npm provenance** — per-version attestations endpoint (subject digest =
+  sha512 matching `dist.integrity`); bulk via Rekor/deps.dev.
+- **Homebrew attestations** — per-digest GitHub API (auth, 5k/h);
+  enumerate digests from formula.json; also in Rekor.
+- **Pixel / Google system-APK binary transparency** — tiny logs, single
+  GET; VBMeta digest 🪤 (not the downloadable zip's hash).
+- **LVFS firmware transparency** (`fwupd.org/ftlog/lvfs/`) — firmware
+  archive hashes; small but high-value niche. Sigsum: sha256+pubkey only,
+  no metadata — skip.
+- **OpenTimestamps** — 🪤 **trap, excluded**: calendars are bulk-
+  downloadable (105 GB on archive.org, CC0, + live backup endpoints,
+  ~513M commitments) but commitments are nonce-blinded — original file
+  hashes unrecoverable. Verification resolver only, not an index source.
+
+### Containers / OCI
+
+- **No bulk dataset exists** (verified negative for a Docker Hub BigQuery
+  dataset). Digest→name is per-registry-API-only:
+  - Docker Hub: `HEAD /v2/<name>/manifests/<tag>` returns digest and
+    **does not count as a pull**; authenticated free account = unlimited.
+    Tags API gives tag→digest incl. per-arch. No global catalog — need
+    name lists first.
+  - Quay.io has an enumerable public-repo catalog; GHCR/GCR/ECR-public do
+    not.
+  - Academic seeds (Zenodo 2020 crawl 39.4 GB CC-BY; VUB MSR 2023) are
+    stale and digests rot as tags repush.
+- Defer: demand-driven probing fits the design better than a census here
+  (this is the one family where the census failure mode looms).
+
+---
+
+## Tier 2 — source code
+
+### Software Heritage graph dataset 🔀 — the crosswalk crown jewel
+- `s3://softwareheritage` — anonymous, free, **not** requester-pays
+  (verified). Latest full export 2026-06-04: 58.7B nodes / 1.1T edges;
+  ORC 33 TiB, compressed WebGraph 16 TiB. ~quarterly.
+- `content` table: **sha1 + sha1_git + sha256 + blake2s256** per row —
+  4-way crosswalk edges for **29.3B blobs**, free.
+- **Content→origin is precomputed**: `derived_datasets/<v>/contents/`
+  Parquet — id, popular filename, first-occurrence origin/revision/
+  timestamp. 2025-10-08 version: 313 GiB, ~23B rows (verified via live
+  Parquet footer). ⚠️ 2026-06-04 copy incomplete as of 2026-08-01 — use
+  2025-10-08. Node-id↔SWHID via `derived_datasets/<v>/nodes/` (1.8 TiB).
+- Metadata-scale recipe: contents parquet (313 GiB) + nodes mapping +
+  column-pruned ORC `content` hash columns + `origin` table (437M URLs).
+  No 33 TiB download, no trillion-edge join. Athena-queryable in place
+  (~$5/TiB scanned).
+- REST API: 120 req/h anon / 1200 auth — useless at scale; dataset is the
+  only path. License CC-BY 4.0 (graph) + bulk-access ToU + ethical
+  charter; hash→origin indexing squarely within intended use.
+- Caveat: an SWH "URL" is origin repo + path + ref, not a raw-bytes HTTP
+  URL (forge raw URLs often derivable; sha1_git = git object id joins
+  directly against git-native corpora).
+
+---
+
+## Tier 3 — the web
+
+**Scope policy: stable static files only.** The
+index wants hashes where two people could plausibly hold identical copies
+of the same bytes; per-visit dynamic content is noise. Two filters, both
+computable from index metadata alone:
+
+1. **MIME cut**: drop `text/html` &co. by default (measured on
+   CC-MAIN-2026-30: HTML+XHTML ≈ **99.2%** of captures, not the ~70%
+   folklore — CC crawls pages, never subresources, so there are almost
+   no js/css/images to keep; the surviving ~0.8% is documents, 74% PDF);
+   keep `application/*`, images, audio/video, fonts, archives, wasm.
+   Also drop `content_truncated IS NOT NULL` (~9% of PDFs): CC caps
+   payloads ~1 MiB and digests the truncated bytes — poison keys.
+2. **Recurrence rescue**: admit *any* MIME type whose digest recurs —
+   same digest at one URL across ≥2 crawls, or at ≥2 URLs. Recurrence is
+   demonstrated stability, and it rescues genuinely-static HTML (mirrored
+   RFCs, docs) that the MIME cut would wrongly kill.
+
+Corollary: **full crawl history is not retained, only scanned.** Old
+crawls are mostly dead URLs, worthless as coverage — but they're cheap
+recurrence *evidence* (Athena over CC's parquet in place). Ingest scans
+history; the index keeps only what history stabilizes.
+
+*(Shared convention: CC, Wayback, Arquivo.pt, EOT, Archive-It all use
+SHA-1 of the WARC payload, base32 — the whole family joins on one key.
+Wikimedia is SHA-1 base36; IA files are md5/sha1 hex. SHA-256+ edges for
+web content come only from elsewhere — e.g. SWH for anything that's also
+in a repo. File-hosting sources — IA items, Wikimedia uploads — are
+versioned static files by construction and skip the stability filter.)*
+
+- **Common Crawl** — index-only download: CDXJ
+  `s3://commoncrawl/cc-index/collections/CC-MAIN-*/indexes/` (300 shards,
+  ~245 GB gz/crawl) or Parquet `cc-index/table/` (~300 GB/crawl),
+  Athena-queryable in place. `digest` = payload SHA-1 base32, single
+  algorithm (no SHA-256 as of CC-MAIN-2026-30; verified). ~2.1B pages/
+  crawl, every 4–5 weeks, back to 2013 (~100 crawls). Free HTTPS, no AWS
+  account needed. Gotchas: pre-2025-03 payloads truncated at 1 MB (digest
+  is of truncated bytes); `robotstxt`/`crawldiagnostics` subsets mixed
+  into CDX — filter by status; no revisit records (good: every capture
+  carries a full digest).
+- **Internet Archive / Wayback** — **no bulk CDX, period** (~1T captures;
+  API-only, rate-limited; ARCH researcher service is paid/contract).
+  Wayback CDX has `warc/revisit` dedup records. Per-item route: 124.29M
+  public items (verified via Scrape API), each `_files.xml` /
+  Metadata API carries **md5+sha1+crc32 per file** 🔀 with deterministic
+  URLs — O(items) polite sweep ≈ months, or lazy/demand-driven.
+  **Archive Team census** (2015–2017, on archive.org): bulk
+  URL→(md5,sha1) for ~19M items — stale but real; no newer census found.
+- **Fatcat / IA Scholar** 🔀 — the scholarly-PDF jackpot: `archive.org/details/fatcat_snapshots_and_exports`,
+  item `fatcat_bulk_exports_2024-02-18` contains
+  `file_hashes.tsv.gz` (14.23 GiB) — schema
+  `file_ident, release_ident, sha1, sha256, md5` (3-way,
+  single-witness → edge-minting legal), **122.3M unique sha1 /
+  122.2M sha256** measured on ingest; plus
+  `file_export.json.gz` (23 GiB, adds URLs + mimetype + DOI-linked
+  release ids) and `release_extid.tsv.gz` (10.7 GiB, DOI/PMID/arXiv
+  crosswalk). Free HTTPS download, no auth. ⚠️ Fatcat is frozen —
+  2024-02-18 is the **last** export (editing paused after IA
+  cutbacks); treat as one-shot corpus. Metadata license CC0 per
+  fatcat guide (UNVERIFIED — guide.fatcat.wiki unreachable).
+  Ops note: IA item torrents are web-seeded by the same datanodes as
+  HTTP (no external seeders for datasets like this) — for the
+  multi-hundred-GB items (release_export_expanded: 216 GiB), parallel
+  HTTP ranges (`aria2c -x16`) beat both single-stream curl and
+  torrents; single-stream measured ~12 MB/s.
+- **Scholarly-PDF dead ends & maybes**:
+  **arXiv** S3/GCS manifests carry md5 per 500 MB *tar chunk* only,
+  no per-PDF hashes (+ requester-pays $$, + PDFs regenerate/stamp so
+  bytes drift) — content-scaled, excluded. **S2ORC / Semantic
+  Scholar**: current API-gated dataset (ODC-By) documents no pdf
+  hash field; v1's `pdf_hash` is deprecated/gone. **CiteSeerX**:
+  effectively dead, never published dumps. **CORE** (core.ac.uk):
+  300 GB+ dataset behind registration; ResourceSync metadata shows
+  `rs:md hash="md5:…"` per resource — per-file md5 plausible,
+  UNVERIFIED. **Zenodo**: per-file md5 in record API; monthly
+  `/api/exporter` metadata dumps exist but whether file checksums
+  are in the export JSON is UNVERIFIED.
+- **Arquivo.pt** — **entire index published openly**:
+  `https://arquivo.pt/datasets/cdxj/` — ~216 plain CDXJ files,
+  **~12.4 TiB total**, >21B captures. SHA-1 base32. Rate limits with
+  permanent-block teeth; citation requested.
+- **End of Term archive** — `s3://eotarchive/` anonymous, **CC0**:
+  CDXJ + Parquet indexes per election cycle (EOT-2024: 227 GiB CDXJ).
+  US .gov every 4 years.
+- **Wikimedia** 🖼 — `commonswiki-latest-image.sql.gz` (18.1 GB,
+  2×/month): 145.3M files, `img_sha1` (base36) + filename; upload URL
+  derivable via MD5-of-filename path scheme. Zero content fetches.
+  ⚠️ Schema migration `image`→`filerevision` in flight (T28741); dump
+  still ships `image` as of July 2026.
+- **HTTP Archive BigQuery** — **negative**: no digest column in the
+  schema; hashing response bodies ourselves would violate the admission
+  rule. Excluded.
+- National archives (UK etc.): closed/on-site CDX; nothing bulk-public
+  found.
+
+---
+
+## Sizing and hosting (2026-08 estimates)
+
+| Tier | Rows (order) | Compact sorted index |
+|---|---|---|
+| Software artifacts (registries+distros+NSRL+Rekor) | ~1–2B | ~100–300 GB |
+| Source (SWH contents+origins) | ~25B | ~1.5–3 TB |
+| Web, static-stable subset (CC + Arquivo + EOT + Wikimedia + IA files) | ~2–5B | ~200–500 GB |
+
+Assumes ~50–80 B/row zstd in digest-sorted columnar form; the URL column
+dominates (sorted-by-digest URLs compress poorly). The static-stable
+policy above cuts the web tier ~10×: ~300–500M static-MIME rows per CC
+crawl, deduped across crawls by digest, plus recurrence-admitted
+stragglers. Full-history retention (would have been 10–30 TB) is
+dropped by policy — the whole index now fits in ~1–3 TB.
+
+Cost levers, in order:
+1. **Query big sources in place.** CC-index and SWH already sit on AWS
+   Open Data; Athena at $5/TB-scanned makes the entire historical CC
+   extract tens of dollars of one-time query, not 25 TB through our NIC.
+   The only real AWS toll is egressing the compacted result (~$90/TB),
+   once per source. Rekor/PyPI/deps.dev live in BigQuery (1 TB/month
+   free tier).
+2. **Serve static, not a database.** Digest-sorted, prefix-sharded files
+   on object storage; clients use HTTP range requests (Go-sumdb / HIBP
+   model). Zero query compute, and prefix ranges give k-anonymity for
+   free — closes the query-privacy open question. R2 (zero egress,
+   $15/TB-mo): software tier ≈ $3/mo, current-web ≈ $50/mo, full history
+   ≈ $200–450/mo. Hetzner box (~€50–110/mo) whenever a live resolver is
+   wanted.
+3. **Dumps ride free open-data hosting.** Internet Archive hosts open
+   datasets gratis (the census precedent), Hugging Face hosts public
+   datasets into TB range (verify current caps), AWS Open Data /
+   Source Cooperative sponsorship is the endgame (CC and SWH's own
+   route). Canonical dumps on free hosts; the landlord serves only the
+   compact query index. Torrents as costless mirror channel.
+
+Failure mode to avoid: a fat always-on database over 300B rows. Nothing
+in the query pattern (point lookups by digest prefix) needs one.
+
+---
+
+## Cross-cutting findings
+
+1. **Multi-hash rows mint crosswalk edges without bytes.** SWH (4-way ×
+   29.3B), **Ubuntu Packages (4-way, incl. sha512)**, NSRL (4-way × 1.5B
+   rows), PyPI (3-way × 20.4M), Debian buildinfo (3-way), npm, conda,
+   CPAN (gz+ungz pairs), Hackage, IA files.xml, F-Droid (sha256+IPFS
+   CID), NIST's dedicated sha1→sha256 table, MalwareBazaar (incl. fuzzy
+   hashes). The original design notes
+   assumed crosswalk edges require holding content — for whole-file
+   coordinates the dumps already carry them. Hash-archive's re-fetch
+   problem never existed for this class of edge.
+2. **Sometimes the hash IS the URL** (PyPI blake2 path, Homebrew ghcr
+   blobs, static.crates.io by name-version): those sources give
+   availability claims by construction.
+3. **Wrapper traps confirmed in the wild**: Go H1 dirhash, VBMeta
+   digests, OTS blinded commitments, Packagist unstable zipballs, Alpine
+   APKINDEX (control-segment-only SHA-1), Nix NAR-domain hashes. Each is
+   either its own crosswalk scheme or excluded. The lesson generalizes:
+   **never assume a hash in the wild is of the raw bytes — verify the
+   preimage definition per source before ingest.**
+4. **The web-archive family shares one join key** (SHA-1 base32 payload
+   digest) — CC, Wayback, Arquivo, EOT, Archive-It interoperate
+   directly; it's also the family stuck hardest on SHA-1, which is where
+   the collision-safe identity model earns its keep.
+5. **Licenses are mostly friendly**: public domain (NSRL, CISA, EOT),
+   CC-BY (deps.dev, SWH, CIRCL), CC-BY-SA (ecosyste.ms), CC0 (OTS dumps).
+   Watch: abuse.ch post-Spamhaus ambiguity; IA ToS for the item-metadata
+   sweep; Arquivo.pt rate limits.
