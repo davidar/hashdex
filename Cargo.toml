@@ -17,7 +17,7 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "stream", "blocking"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -31,6 +31,8 @@ dirs = "5"
 walkdir = "2"
 memmap2 = "0.9"
 flate2 = "1"
+parquet = { version = "59.1.0", default-features = false, features = ["zstd"] }
+bytes = "1.12.1"
 
 [profile.release]
 lto = true

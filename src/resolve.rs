@@ -24,6 +24,10 @@ pub struct Options {
     pub no_cache: bool,
     pub offline: bool,
     pub timeout_secs: u64,
+    /// Restrict network probes to these backends (None = all). Scan's
+    /// --online sets this so each digest only visits backends whose
+    /// membership filter matched.
+    pub only: Option<std::collections::HashSet<&'static str>>,
 }
 
 /// Resolution order (DESIGN.md): network backends are asked about the
@@ -46,6 +50,11 @@ pub async fn resolve(client: &Client, coord: &Coord, opts: &Options) -> Result<R
         for backend in backends::all() {
             if !(backend.supports)(coord.scheme) {
                 continue;
+            }
+            if let Some(only) = &opts.only {
+                if !only.contains(backend.name) {
+                    continue;
+                }
             }
             if !opts.refresh {
                 if let Some(cache) = &cache {

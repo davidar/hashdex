@@ -51,8 +51,9 @@ struct Cli {
     #[arg(long, global = true)]
     offline: bool,
 
-    /// Per-backend timeout in seconds
-    #[arg(long, global = true, default_value_t = 15)]
+    /// Per-backend timeout in seconds (fatcat's binary search over
+    /// remote parquet pages legitimately takes ~10-20s when cold)
+    #[arg(long, global = true, default_value_t = 45)]
     timeout: u64,
 
     /// Emit JSON instead of a table
@@ -90,6 +91,13 @@ enum Command {
         /// matched (full attribution; slower with bigger-than-RAM filters)
         #[arg(long)]
         probe_all: bool,
+        /// With --resolve: also probe network backends for files whose
+        /// membership filter matched (demand-driven, cached forever).
+        /// Optionally limit to a comma-separated backend list, e.g.
+        /// --online fatcat,circl
+        #[arg(long, requires = "resolve", value_name = "BACKENDS",
+              num_args = 0..=1, default_missing_value = "")]
+        online: Option<String>,
     },
     /// Find local files by digest (from the index hdx scan maintains)
     Locate {
@@ -163,6 +171,7 @@ async fn main() -> Result<()> {
         no_cache: cli.no_cache,
         offline: cli.offline,
         timeout_secs: cli.timeout,
+        only: None,
     };
     let client = reqwest::Client::builder()
         .user_agent(format!("hashdex-hdx/{}", env!("CARGO_PKG_VERSION")))
@@ -176,17 +185,21 @@ async fn main() -> Result<()> {
                 rehash,
                 resolve,
                 probe_all,
+                online,
             }),
             _,
         ) => {
             if paths.is_empty() {
                 anyhow::bail!("hdx scan: no paths given");
             }
+            if online.is_some() && cli.offline {
+                eprintln!("note: --offline wins over --online; skipping network probes");
+            }
             let filters = filter::load_all()?;
             if filters.is_empty() {
                 eprintln!("note: no filters installed — run `hdx filters fetch` first");
             }
-            let opts = scan_cmd::ScanOptions {
+            let sopts = scan_cmd::ScanOptions {
                 list: match list.as_deref() {
                     Some("unknown") => scan_cmd::ListMode::Unknown,
                     Some("known") => scan_cmd::ListMode::Known,
@@ -199,8 +212,17 @@ async fn main() -> Result<()> {
                 rehash: *rehash,
                 resolve: *resolve,
                 probe_all: *probe_all,
+                online: match (online, cli.offline) {
+                    (Some(list), false) => Some(
+                        list.split(',')
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                    ),
+                    _ => None,
+                },
             };
-            scan_cmd::scan(paths, &filters, &opts)?;
+            scan_cmd::scan(paths, &filters, &sopts, &client, &opts).await?;
         }
         (Some(Command::Locate { hash }), _) => {
             let coord = Coord::parse(hash)?;

@@ -544,3 +544,15 @@ fn scan_reports_unreadable_at_end() {
         stderr(&out)
     );
 }
+
+#[test]
+fn scan_online_requires_resolve() {
+    let env = TestEnv::new("onlinearg");
+    let out = env.hdx(&["scan", env.work().to_str().unwrap(), "--online"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("--resolve"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}

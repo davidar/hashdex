@@ -23,7 +23,19 @@ pub struct ScanOptions {
     /// Probe every filter even when a smaller one already matched
     /// (full attribution at the cost of big-filter page faults).
     pub probe_all: bool,
+    /// With resolve: probe network backends for filter-matched files
+    /// before the walk (demand-driven; hits cached forever). Some =
+    /// enabled; a non-empty list restricts which backends (accepts
+    /// filter or backend names).
+    pub online: Option<Vec<String>>,
 }
+
+/// Per-backend probe ceiling per scan run: a batch resolve must not
+/// turn into a hammering of somebody's public API. Narrow the scan
+/// path or the --online backend list instead of raising this.
+const PROBE_CAP: usize = 1000;
+/// SWH's anonymous quota (120/h) gets a stricter ceiling.
+const SWH_ANON_CAP: usize = 100;
 
 /// Filters at least this big are probed only for files no smaller filter
 /// recognized: each probe of a bigger-than-RAM mmap is a random page
@@ -55,7 +67,13 @@ struct FileResult {
 /// Hashes persist in the local index (updatedb-style): unchanged files
 /// (same size + mtime) are not re-read on later scans, and `hdx locate`
 /// can find files by digest.
-pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> Result<()> {
+pub async fn scan(
+    paths: &[PathBuf],
+    filters: &[NamedFilter],
+    opts: &ScanOptions,
+    client: &reqwest::Client,
+    ropts: &crate::resolve::Options,
+) -> Result<()> {
     // Collect the file list first so workers can chew through it by index.
     // hdx's own cache (dumps, extracts, filters, local.db) is excluded —
     // it would pollute the known/unknown metrics with our own artifacts —
@@ -231,8 +249,16 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
         }
     }
 
-    // Local-only resolution context for --resolve: inverted indexes +
-    // the observation store, zero network (that's `hdx <hash>`'s job).
+    // --online: demand-driven network probes for matched digests, each
+    // visiting only the backends whose filter fired. Runs before the
+    // walk so fresh findings are in the observation store when the
+    // per-file resolution below sweeps it.
+    if let (true, Some(selection)) = (opts.resolve, &opts.online) {
+        online_probe(&results, filters, selection, client, ropts).await;
+    }
+
+    // Local resolution context for --resolve: inverted indexes + the
+    // observation store (which --online may have just enriched).
     let resolver = if opts.resolve {
         let indexes = crate::inverted::open_all().unwrap_or_default();
         let cache = if opts.no_index {
@@ -307,6 +333,9 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
                             continue;
                         };
                         println!("             {:<12} {}", e.finding.backend, claim.statement);
+                        if let Some(url) = &claim.url {
+                            println!("             {:<12} → {url}", "");
+                        }
                     }
                     if evidence.len() > SHOWN {
                         println!("             … and {} more claims", evidence.len() - SHOWN);
@@ -374,6 +403,138 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
         }
     }
     Ok(())
+}
+
+/// Which network backend answers for a membership filter's source.
+/// Filters without a backend (steam, fedora, …) resolve offline only.
+fn backend_for_filter(name: &str) -> Option<&'static str> {
+    match name {
+        "fatcat" => Some(crate::backends::fatcat::NAME),
+        "circl" => Some(crate::backends::circl::NAME),
+        "depsdev" => Some(crate::backends::depsdev::NAME),
+        "rekor" => Some(crate::backends::rekor::NAME),
+        "swh" => Some(crate::backends::swh::NAME),
+        _ => None,
+    }
+}
+
+/// Probe each matched digest against exactly the backends whose filter
+/// fired: the bloom hit is the demand that justifies the single probe
+/// (DESIGN.md admission rule). Hits land in the durable cache, so
+/// reruns only pay for digests never probed before.
+async fn online_probe(
+    results: &[FileResult],
+    filters: &[NamedFilter],
+    selection: &[String],
+    client: &reqwest::Client,
+    ropts: &crate::resolve::Options,
+) {
+    use futures::StreamExt;
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    let selected = |filter: &str, backend: &str| {
+        selection.is_empty() || selection.iter().any(|s| s == filter || s == backend)
+    };
+    let mut probes: HashMap<crate::coord::Coord, HashSet<&'static str>> = HashMap::new();
+    for r in results {
+        if r.matched.is_empty() {
+            continue;
+        }
+        for f in filters {
+            if !r.matched.iter().any(|m| m == &f.name) {
+                continue;
+            }
+            let Some(backend) = backend_for_filter(&f.name) else {
+                continue;
+            };
+            if !selected(&f.name, backend) {
+                continue;
+            }
+            let digest = match f.scheme {
+                Scheme::Sha1 => r.sha1.to_vec(),
+                Scheme::Sha256 => r.sha256.to_vec(),
+                _ => continue,
+            };
+            probes
+                .entry(crate::coord::Coord {
+                    scheme: f.scheme,
+                    digest,
+                })
+                .or_default()
+                .insert(backend);
+        }
+    }
+
+    // A batch scan must not hammer public APIs: any backend that would
+    // exceed its ceiling is skipped whole (partial probing would read as
+    // complete coverage). SWH's anonymous quota is 120 req/h.
+    let swh = crate::backends::swh::NAME;
+    let mut per_backend: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for set in probes.values() {
+        for b in set {
+            *per_backend.entry(b).or_default() += 1;
+        }
+    }
+    for (backend, n) in per_backend {
+        let cap = if backend == swh && std::env::var("SWH_TOKEN").is_err() {
+            SWH_ANON_CAP
+        } else {
+            PROBE_CAP
+        };
+        if n > cap {
+            eprintln!(
+                "note: skipping {n} {backend} probes (per-scan ceiling {cap}; narrow the path or use --online with a backend list)"
+            );
+            for set in probes.values_mut() {
+                set.remove(backend);
+            }
+        }
+    }
+    probes.retain(|_, set| !set.is_empty());
+    if probes.is_empty() {
+        return;
+    }
+
+    let total = probes.len();
+    eprintln!("probing {total} matched digests online…");
+    let done = AtomicUsize::new(0);
+    let errors: Mutex<std::collections::BTreeMap<String, usize>> = Mutex::new(Default::default());
+    futures::stream::iter(probes.into_iter().map(|(coord, only)| {
+        let popts = crate::resolve::Options {
+            refresh: ropts.refresh,
+            no_cache: ropts.no_cache,
+            offline: false,
+            timeout_secs: ropts.timeout_secs,
+            only: Some(only),
+        };
+        let (done, errors) = (&done, &errors);
+        async move {
+            match crate::resolve::resolve(client, &coord, &popts).await {
+                Ok(res) => {
+                    for (backend, _) in res.errors {
+                        *errors
+                            .lock()
+                            .unwrap()
+                            .entry(backend.to_string())
+                            .or_default() += 1;
+                    }
+                }
+                Err(e) => {
+                    *errors.lock().unwrap().entry(e.to_string()).or_default() += 1;
+                }
+            }
+            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if d.is_multiple_of(50) {
+                eprintln!("  … probed {d}/{total}");
+            }
+        }
+    }))
+    .buffer_unordered(6)
+    .collect::<Vec<()>>()
+    .await;
+    for (what, n) in errors.lock().unwrap().iter() {
+        eprintln!("warning: {n} probes failed: {what} (errors are not cached; rerun retries)");
+    }
 }
 
 /// Stat the file; reuse the indexed digests when size+mtime match, else
