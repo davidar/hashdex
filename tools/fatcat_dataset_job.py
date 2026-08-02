@@ -377,6 +377,13 @@ def build_final(work: Path, out: Path, threads: int):
     (out / "maps").mkdir(parents=True, exist_ok=True)
 
     rel_cols = ", ".join(k for k in RELEASES_SCHEMA if k != "release_ident")
+    # Join once into an unsorted intermediate (order-free, parallel),
+    # then sorted single-file COPYs per sha256 nibble: FILE_SIZE_BYTES
+    # multi-file rotation does NOT preserve ORDER BY across the emitted
+    # files (reproduced on duckdb 1.5.5; that's how the first publish
+    # shipped interleaved), while single-file COPY does.
+    joined = work / "joined"
+    joined.mkdir(parents=True, exist_ok=True)
     con.execute(
         f"""
         COPY (
@@ -388,12 +395,21 @@ def build_final(work: Path, out: Path, threads: int):
             )
             SELECT f.*, {rel_cols}
             FROM f LEFT JOIN read_parquet('{rel_glob}') r USING (release_ident)
-            ORDER BY f.sha256
-        ) TO '{out / "data"}'
-        (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 262144,
-         FILE_SIZE_BYTES '1GB', FILENAME_PATTERN 'files-{{i}}')
+        ) TO '{joined}'
+        (FORMAT parquet, COMPRESSION zstd, FILE_SIZE_BYTES '1GB')
         """
     )
+    buckets = [(nib, f"sha256 LIKE '{nib}%'") for nib in "0123456789abcdef"]
+    buckets.append(("znull", "sha256 IS NULL"))  # ORDER BY is NULLS LAST
+    for tag, cond in buckets:
+        con.execute(
+            f"""
+            COPY (SELECT * FROM read_parquet('{joined}/*.parquet')
+                  WHERE {cond} ORDER BY sha256)
+            TO '{out / "data" / f"files-{tag}.parquet"}'
+            (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 262144)
+            """
+        )
     for scheme in ("sha1", "md5"):
         con.execute(
             f"""
@@ -426,6 +442,9 @@ def verify_sorted(con, glob, key):
             WHERE path_in_schema = '{key}'
             ORDER BY stats_min_value"""
     ).fetchall()
+    # The znull bucket's row groups carry no key stats (all-NULL sha256);
+    # they hold no lookup targets, so sortedness doesn't apply to them.
+    rows = [r for r in rows if r[0] is not None and r[1] is not None]
     overlaps = sum(1 for i in range(1, len(rows)) if rows[i][0] < rows[i - 1][1])
     if not rows or overlaps:
         raise RuntimeError(f"{glob} not globally sorted by {key}: {overlaps} overlapping row groups")

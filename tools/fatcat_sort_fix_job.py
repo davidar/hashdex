@@ -107,21 +107,18 @@ def main():
     buckets.append(("znull", "sha256 IS NULL"))
     for i, (tag, cond) in enumerate(buckets):
         print(f"[sort] bucket {tag} ({i + 1}/{len(buckets)})…", flush=True)
-        # Fresh dir per COPY (DuckDB refuses non-empty targets), then
-        # move into place; filenames are unique across buckets.
-        stage = work / f"stage-{tag}"
+        # ONE file per bucket. FILE_SIZE_BYTES multi-file rotation does
+        # not preserve ORDER BY across (or within) the emitted files —
+        # reproduced on duckdb 1.5.5 regardless of
+        # preserve_insertion_order; single-file COPY does.
         con.execute(
             f"""
             COPY (SELECT * FROM read_parquet('{src}')
                   WHERE {cond} ORDER BY sha256)
-            TO '{stage}'
-            (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 262144,
-             FILE_SIZE_BYTES '1GB', FILENAME_PATTERN 'files-{tag}-{{i}}')
+            TO '{out / f"files-{tag}.parquet"}'
+            (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 262144)
             """
         )
-        for f in sorted(stage.iterdir()):
-            f.rename(out / f.name)
-        stage.rmdir()
     print(f"[sort] done in {(time.time()-t0)/60:.1f} min", flush=True)
 
     print("[verify] footer disjointness…", flush=True)
