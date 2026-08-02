@@ -1,8 +1,14 @@
+use crate::cache::Cache;
 use crate::coord::{Coord, Scheme};
+use crate::finding::{Claim, Finding};
 use anyhow::{Context, Result};
 use sha2::Digest;
 use std::io::Read;
 use std::path::Path;
+
+/// The attestor name for locally minted coordinates: the one case where
+/// hashdex legitimately vouches for bytes, because the user held them.
+pub const LOCAL_ATTESTOR: &str = "local-hash";
 
 /// Compute every whole-file coordinate we know how to mint, in one streaming
 /// pass. This is the user hashing their *own* bytes — the allowed exception
@@ -44,4 +50,23 @@ pub fn compute(path: &Path) -> Result<Vec<Coord>> {
         Coord::new(Scheme::Blake2s256, blake2s.finalize().to_vec())?,
         Coord::new(Scheme::Sha1Git, sha1_git.finalize().to_vec())?,
     ])
+}
+
+/// Record the six-scheme row as an observation keyed on the sha256
+/// coordinate. Single witness (this machine), multiple digests: a
+/// crosswalk edge the walk can traverse — the only local source of
+/// sha1_git/blake2s256 links. Never leaves the machine.
+pub fn record(cache: &Cache, path: &Path, coords: &[Coord]) {
+    let Some(sha256) = coords.iter().find(|c| c.scheme == Scheme::Sha256) else {
+        return;
+    };
+    let finding = Finding {
+        backend: LOCAL_ATTESTOR.into(),
+        claims: vec![Claim::new(
+            format!("hashed locally: {}", path.display()),
+            None,
+        )],
+        coords: coords.iter().map(|c| c.to_string()).collect(),
+    };
+    cache.put(LOCAL_ATTESTOR, sha256, Some(&finding));
 }

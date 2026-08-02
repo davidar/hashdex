@@ -52,7 +52,7 @@ strict preference order:
    demand-driven probing only.**
 
 **Every federated answer is cached as a witness co-observation** —
-so the local ledger densifies along the demand curve, which is the
+so the local evidence store densifies along the demand curve, which is the
 original design ethos ("a hash gets richer the more people ask about
 it") made mechanical. The web tier is the one corpus nobody has
 inverted for anyone; that's where self-inversion is mandatory rather
@@ -87,7 +87,7 @@ through it):
 We are mapping immutability onto a mutable world. Everything divides
 by whether it can ever change meaning.
 
-### Layer 1 — the ledger (immutable, append-only)
+### Layer 1 — the evidence (source dumps + observation store)
 
 The single primitive is the **witness co-observation**:
 
@@ -120,9 +120,18 @@ F-Droid index), the signature rides along; unsigned shards (CDX,
 BigQuery datasets) are wrapped as "hashdex observed shard S publishing
 row R at time T" — accountability preserved, one hop removed.
 
-Layer 1 is what gets published as content-addressed dumps, what
-mirrors sync, what forks fork, and the only place trust machinery
-exists.
+Layer 1 is deliberately informal (decided 2026-08-02): it is the
+source dumps we already hold — content-addressed by their own
+digests — plus the durable observation store the CLI accumulates
+(federated answers; hits never expire). No record format, no
+commitment structure, no publishing machinery: hashdex collates
+external sources, it is not a foundational ledger, and those become
+worth designing only if the evidence layer itself ever becomes
+something others mirror. Nothing is lost by deferring — dumps plus a
+durable cache retain every fact, so a formal serialization stays a
+transcoding job, not an archaeology job. Attribution still originates
+here: evidence rows always name their attestor. What gets published
+is layer 2.
 
 **Edge-minting rule (strict):** only single-witness rows mint
 equivalence edges. Joining *different* sources on (URL, time) — CDX's
@@ -133,7 +142,9 @@ same" hint, never an identity edge. This corner must not be cut.
 ### Layer 2 — the views (mutable, derived, disposable)
 
 Views contain **no new facts** — each is recomputable from layer 1
-plus a policy, so none needs signatures, dumps, or trust:
+plus a policy, so none needs signatures or trust. These are the
+product, and what we publish (membership filters, digest-sorted
+coordinate shards, cluster indexes):
 
 - **Identity clusters**: equivalence closure over co-observations,
   under the current closure policy (below).
@@ -260,12 +271,14 @@ Design consequences:
   alongside the dumps. Mirrors honoring it inherit safe-harbor
   hygiene; forks ignoring it own their own exposure, exactly where
   responsibility should sit.
-- **Dump format requirement (decide before the first dump ships):**
-  separate the commitment structure from claim bodies (Rekor-style),
-  so a body can be physically dropped from future editions while
-  integrity chains survive. Suppression-only redaction won't satisfy
-  a GDPR/court-order removal; retrofitting physical redaction into an
-  ecosystem of immutable mirrors would be miserable.
+- **Publication-layer requirement:** anything published carrying
+  location claims must support *physical* removal, because
+  suppression-only redaction won't satisfy a GDPR/court-order
+  removal. Since we publish derived artifacts, this is nearly free:
+  views are disposable by construction, so redaction = drop the row,
+  rebuild the edition. (If a formal evidence dump ever ships,
+  Rekor-style commitment/body separation is the known answer —
+  decide it then, before that first dump.)
 
 ## Query architecture
 
@@ -298,27 +311,40 @@ hit at levels 2–3 is cached as a co-observation at level 1's edge):
    don't-hammer behavior, which is how a popular hashdex avoids
    becoming its charity backends' biggest load problem.
 1. **Local/self-inverted shards + overlay** — whatever we've
-   materialized.
+   materialized. Implemented as `hdx index`: per-source flat
+   sorted-mmap coordinate indexes — fixed-width witness rows sorted
+   by the primary digest, plus per-scheme digest→row files, 32-byte
+   "HDXI" header, mmap + binary search + `madvise(Random)` — built
+   from a forward dump by streaming external merge sort
+   (laptop-scale even at 122M rows).
 2. **Live federation adapters** — the verified inverted-index set
    (deps.dev query, CIRCL, SWH, snapshot.d.o, Rekor v1, opt-in VT).
 3. **Demand-driven probes** — select cases only, per the admission
    rule.
 
-**For self-inverted shards, precompute the closure, ship the
-evidence.** Batch union-find over co-observations under the *default*
-closure policy (strong digests only; hash-to-min converges in a few
-iterations because clusters are tiny). Two artifacts:
+**Closure is query-time policy, so locally it runs at query time.**
+The walk computes it live: fixpoint over the inverted indexes + the
+observation store (capped hops and evidence — the mega-cluster
+guard), then union-find welding only on shared identity-grade
+digests. Policy v1: identity-grade = {sha256, sha512, blake2s256};
+md5/sha1/sha1_git are lookup keys, never merge keys. Clusters
+containing the queried coordinate are *primary*; ones reached only
+across weak links render as related, not identity-verified; only
+clusters carrying a strong digest count as distinct contents; and a
+weak digest claimed by two such clusters is a surfaced collision.
+Since backends returning no crosswalk coordinates are common, their
+unanchored findings never count as distinct contents.
 
-- **Coordinate index**: (scheme, digest) → cluster ID(s) — plural for
-  weak digests, which is the collision case surfacing honestly — plus
-  unclustered "consistent with" observations.
-- **Cluster store**: cluster ID → coordinates, claims, supporting
-  co-observations.
-
-Full resolution = two point lookups. Because cluster records carry
-their raw evidence (a few KB), exotic lenses (different identity-grade
-or attestor policy) recompute client-side; the precomputed cluster is
-a cache of the default policy, not a betrayal of query-time policy.
+**For published cluster indexes (if/when they ship), precompute that
+same closure and ship the evidence.** Two artifacts: the
+**coordinate index** ((scheme, digest) → cluster ID(s), plural for
+weak digests — the collision case surfacing honestly) and the
+**cluster store** (cluster → coordinates, claims, supporting
+co-observations). Full resolution = two point lookups; because
+cluster records carry their raw evidence (a few KB), exotic lenses
+(different identity-grade or attestor policy) recompute client-side —
+the precomputed cluster is a cache of the default policy, not a
+betrayal of query-time policy.
 
 **Physical layout: the published dataset is the database.** Both
 artifacts are digest-prefix-partitioned, sorted parquet. The same
@@ -444,20 +470,12 @@ shards plus a workbench only while campaigns run.
    day one. Near-zero ingest. `hdx coords <file>` batch mode from day
    one: hash your own disk, map it back to the world (the
    mystery-PDF demo).
-   *Status: shipped, including the filter harvest well beyond the
-   original plan — membership filters are published for nine sources
-   (CIRCL mirror, Fedora/RPM Fusion/VS Code via RPM-header range-GETs,
-   deps.dev + Rekor BigQuery extracts, Software Heritage's 29.3B
-   contents, fatcat's 122M scholarly files, Common Crawl documents),
-   all installable with `hdx filters fetch`. The thesis measures
-   well: on a real dev machine the filter set identifies ~68% of
-   3.6M files as publicly known bytes, and the residue is largely
-   content that never left that machine. Remaining in this step:
-   `hdx scan --resolve`.*
-2. **Cache → ledger**: normalize the accumulated cache into the
-   co-observation record format; first content-addressed dump
-   published (includes the commitment/body-separation redaction
-   decision). The index's early shape is literally the demand curve.
+2. **Cache → evidence store + first inversions**: harden the cache
+   into the durable observation store (hits never expire, co-observed
+   coordinates indexed); build digest-sorted coordinate indexes from
+   dumps already held (fatcat first); the live walk resolves locally
+   before touching the network. The index's early shape is literally
+   the demand curve.
 3. **First self-inversions, gap-driven**: BigQuery extracts (Rekor
    IndexKeys, PyPI) + whichever long-tail forward-only sources
    lookups actually miss (conda, F-Droid, Homebrew, Hackage, CPAN,

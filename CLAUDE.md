@@ -16,9 +16,12 @@ already maintains, and scans disks against local membership filters.
 ```
 cargo build          # binary is target/debug/hdx
 cargo test
-hdx <hash>            # resolve (hex, base32, SRI, SWHID, scheme:hex)
+hdx <hash>            # resolve (hex, base32, SRI, SWHID, scheme:hex);
+                      #   local walk first, then network (--offline to skip)
 hdx coords <file>     # mint all six coordinates of local files
 hdx scan <dir>        # offline scan against installed filters
+hdx scan --resolve    # …plus offline citations from inverted indexes
+hdx index build fatcat <tsv.gz>   # self-invert a dump (sorted mmap index)
 hdx filters fetch     # install CIRCL bloom (~1 GB) into the cache dir
 ```
 

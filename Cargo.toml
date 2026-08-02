@@ -30,6 +30,7 @@ futures = "0.3"
 dirs = "5"
 walkdir = "2"
 memmap2 = "0.9"
+flate2 = "1"
 
 [profile.release]
 lto = true

@@ -42,10 +42,12 @@ metadata, full stop. See [DESIGN.md](DESIGN.md) for the whole argument;
 
 | | |
 |---|---|
-| `hdx <hash>` | resolve against live backends (hex, base32, SRI, SWHID, `scheme:hex`) |
-| `hdx coords <file> [--lookup]` | mint all six coordinates of a local file (md5, sha1, sha256, sha512, blake2s256, git blob) |
-| `hdx scan <paths> [--list unknown\|known\|all]` | offline scan against installed filters; hashes persist in a local index (updatedb-style), so rescans are stat-only |
+| `hdx <hash>` | resolve: local walk over inverted indexes + observation store, then live backends (hex, base32, SRI, SWHID, `scheme:hex`); `--offline` skips the network |
+| `hdx coords <file> [--lookup]` | mint all six coordinates of a local file (md5, sha1, sha256, sha512, blake2s256, git blob); recorded as a local crosswalk observation |
+| `hdx scan <paths> [--list unknown\|known\|all] [--resolve]` | offline scan against installed filters; `--resolve` adds citations from local indexes; hashes persist in a local index (updatedb-style), so rescans are stat-only |
 | `hdx locate <hash>` | find local files by digest (inverse of `hdx <hash>`) |
+| `hdx index build <source> <dump>` | self-invert a source dump (e.g. fatcat) into a sorted mmap coordinate index |
+| `hdx index list` | show installed inverted indexes |
 | `hdx filters fetch [names\|--all]` | download published membership filters (no args: list what's available) |
 | `hdx filters build <name> <scheme> <files>` | build a DCSO-format bloom from hex digest lines |
 | `hdx filters list` | show installed filters |

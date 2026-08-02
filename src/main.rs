@@ -5,9 +5,12 @@ mod coords_cmd;
 mod filter;
 mod filters_cmd;
 mod finding;
+mod index_cmd;
+mod inverted;
 mod local_index;
 mod resolve;
 mod scan_cmd;
+mod walk;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -43,6 +46,11 @@ struct Cli {
     #[arg(long, global = true)]
     no_cache: bool,
 
+    /// Never touch the network: resolve from local indexes and the
+    /// observation store only
+    #[arg(long, global = true)]
+    offline: bool,
+
     /// Per-backend timeout in seconds
     #[arg(long, global = true, default_value_t = 15)]
     timeout: u64,
@@ -74,17 +82,42 @@ enum Command {
         /// Rehash every file even if the local index has a fresh entry
         #[arg(long)]
         rehash: bool,
+        /// Resolve listed files against local indexes + observation
+        /// store (offline; implies --list all unless --list given)
+        #[arg(long)]
+        resolve: bool,
     },
     /// Find local files by digest (from the index hdx scan maintains)
     Locate {
         /// sha1 or sha256 hash (any common spelling)
         hash: String,
     },
+    /// Manage inverted coordinate indexes (self-inverted source dumps)
+    Index {
+        #[command(subcommand)]
+        action: IndexAction,
+    },
     /// Manage local membership filters
     Filters {
         #[command(subcommand)]
         action: FilterAction,
     },
+}
+
+#[derive(Subcommand)]
+enum IndexAction {
+    /// Build a source's index from its dump (e.g. fatcat file_hashes.tsv.gz)
+    Build {
+        /// Source name (see `hdx index build --help` errors for the list)
+        source: String,
+        /// The dump file (.tsv or .tsv.gz)
+        file: PathBuf,
+        /// In-RAM sort buffer per pass, in MiB
+        #[arg(long, default_value_t = 1024)]
+        chunk_mb: usize,
+    },
+    /// List installed indexes
+    List,
 }
 
 #[derive(Subcommand)]
@@ -124,6 +157,7 @@ async fn main() -> Result<()> {
     let opts = Options {
         refresh: cli.refresh,
         no_cache: cli.no_cache,
+        offline: cli.offline,
         timeout_secs: cli.timeout,
     };
     let client = reqwest::Client::builder()
@@ -136,6 +170,7 @@ async fn main() -> Result<()> {
                 paths,
                 list,
                 rehash,
+                resolve,
             }),
             _,
         ) => {
@@ -151,11 +186,13 @@ async fn main() -> Result<()> {
                     Some("unknown") => scan_cmd::ListMode::Unknown,
                     Some("known") => scan_cmd::ListMode::Known,
                     Some("all") => scan_cmd::ListMode::All,
+                    None if *resolve => scan_cmd::ListMode::All,
                     _ => scan_cmd::ListMode::None,
                 },
                 json: cli.json,
                 no_index: cli.no_cache,
                 rehash: *rehash,
+                resolve: *resolve,
             };
             scan_cmd::scan(paths, &filters, &opts)?;
         }
@@ -186,6 +223,14 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        (Some(Command::Index { action }), _) => match action {
+            IndexAction::Build {
+                source,
+                file,
+                chunk_mb,
+            } => index_cmd::build(source, file, *chunk_mb)?,
+            IndexAction::List => index_cmd::list()?,
+        },
         (Some(Command::Filters { action }), _) => match action {
             FilterAction::Fetch { names, all, from } => {
                 filters_cmd::fetch(&client, names, *all, from.as_deref()).await?
@@ -212,8 +257,19 @@ async fn main() -> Result<()> {
             if files.is_empty() {
                 anyhow::bail!("hdx coords: no files given");
             }
+            let record_cache = if cli.no_cache {
+                None
+            } else {
+                cache::Cache::open().ok()
+            };
             for path in files {
                 let coords = coords_cmd::compute(path)?;
+                // The six-scheme row is a witnessed co-observation of the
+                // user's own bytes — the only local source of
+                // sha1_git/blake2s256 crosswalk edges for the walk.
+                if let Some(cache) = &record_cache {
+                    coords_cmd::record(cache, path, &coords);
+                }
                 if cli.json {
                     let obj: serde_json::Value = serde_json::json!({
                         "file": path.display().to_string(),
@@ -246,7 +302,7 @@ async fn main() -> Result<()> {
             let coord = Coord::parse(hash)?;
             let res = resolve::resolve(&client, &coord, &opts).await?;
             render(&res, cli.json, false);
-            if res.findings.is_empty() {
+            if res.clusters.is_empty() {
                 std::process::exit(1);
             }
         }
@@ -261,7 +317,15 @@ fn render(res: &Resolution, json: bool, nested: bool) {
     if json {
         let obj = serde_json::json!({
             "coordinate": res.coord.to_string(),
-            "findings": res.findings,
+            "clusters": res.clusters.iter().map(|cl| serde_json::json!({
+                "coords": cl.coords.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+                "findings": cl.findings,
+                "primary": cl.primary,
+                "anchored": cl.anchored,
+            })).collect::<Vec<_>>(),
+            "findings": res.clusters.iter().flat_map(|cl| cl.findings.iter()).collect::<Vec<_>>(),
+            "collision": res.collision,
+            "truncated": res.truncated,
             "misses": res.misses,
             "errors": res.errors.iter()
                 .map(|(b, e)| serde_json::json!({"backend": b, "error": e}))
@@ -274,39 +338,80 @@ fn render(res: &Resolution, json: bool, nested: bool) {
     let indent = if nested { "  " } else { "" };
     println!("{indent}{}", res.coord);
 
-    if res.findings.is_empty() {
-        println!("{indent}  no results ({} backends asked)", res.misses.len());
-    }
-    for f in &res.findings {
-        for (i, claim) in f.claims.iter().enumerate() {
-            let label = if i == 0 { f.backend.as_str() } else { "" };
-            match &claim.url {
-                Some(url) => println!(
-                    "{indent}  {label:<20} {}\n{indent}  {:<20} → {url}",
-                    claim.statement, ""
-                ),
-                None => println!("{indent}  {label:<20} {}", claim.statement),
-            }
+    if res.clusters.is_empty() {
+        if res.offline {
+            println!("{indent}  no local results (offline — network backends not asked)");
+        } else {
+            println!("{indent}  no results ({} backends asked)", res.misses.len());
         }
     }
-
-    // Union of co-observed coordinates across findings: the crosswalk view.
-    let all: BTreeSet<String> = res
-        .findings
+    // Only anchored clusters (ones carrying an identity-grade digest)
+    // count as distinct contents. Unanchored evidence is just unwelded
+    // claims about the queried digest — several backends returning
+    // coords-less findings must not read as several contents.
+    let distinct = res
+        .clusters
         .iter()
-        .flat_map(|f| f.coords.iter().cloned())
-        .filter(|c| *c != res.coord.to_string())
-        .collect();
-    if !all.is_empty() {
+        .filter(|c| c.primary && c.anchored)
+        .count();
+    if distinct > 1 {
+        println!("{indent}  consistent with {distinct} distinct contents:");
+    }
+    if res.collision {
         println!(
-            "{indent}  {:<20} {}",
-            "coordinates",
-            all.into_iter()
-                .collect::<Vec<_>>()
-                .join("\n                       ")
+            "{indent}  warning: this {} digest is claimed by contents that differ on \
+             identity-grade digests (possible collision)",
+            res.coord.scheme.as_str()
         );
     }
 
+    let mut related_header = false;
+    let mut content_no = 0;
+    for cluster in &res.clusters {
+        if !cluster.primary && !related_header {
+            // Reached only through weak-digest links: worth showing,
+            // never presented as evidence about the queried bytes.
+            println!("{indent}  related via weak digests (not identity-verified):");
+            related_header = true;
+        }
+        if cluster.primary && cluster.anchored && distinct > 1 {
+            content_no += 1;
+            println!("{indent}  content #{content_no}");
+        }
+        for f in &cluster.findings {
+            for (i, claim) in f.claims.iter().enumerate() {
+                let label = if i == 0 { f.backend.as_str() } else { "" };
+                match &claim.url {
+                    Some(url) => println!(
+                        "{indent}  {label:<20} {}\n{indent}  {:<20} → {url}",
+                        claim.statement, ""
+                    ),
+                    None => println!("{indent}  {label:<20} {}", claim.statement),
+                }
+            }
+        }
+        // The cluster's crosswalk view: every coordinate except the
+        // queried one.
+        let all: BTreeSet<String> = cluster
+            .coords
+            .iter()
+            .map(|c| c.to_string())
+            .filter(|c| *c != res.coord.to_string())
+            .collect();
+        if !all.is_empty() {
+            println!(
+                "{indent}  {:<20} {}",
+                "coordinates",
+                all.into_iter()
+                    .collect::<Vec<_>>()
+                    .join("\n                       ")
+            );
+        }
+    }
+
+    if res.truncated {
+        println!("{indent}  (evidence truncated — mega-cluster cap hit)");
+    }
     if !res.misses.is_empty() {
         println!(
             "{indent}  {:<20} {}",

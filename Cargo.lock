@@ -498,6 +498,7 @@ dependencies = [
  "clap",
  "data-encoding",
  "dirs",
+ "flate2",
  "futures",
  "md-5",
  "memmap2",

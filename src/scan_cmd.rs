@@ -17,6 +17,9 @@ pub struct ScanOptions {
     pub no_index: bool,
     /// Rehash every file even if the index has a fresh entry.
     pub rehash: bool,
+    /// Resolve listed files through the local walk (inverted indexes +
+    /// observation store). Never touches the network.
+    pub resolve: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -170,6 +173,20 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
         }
     }
 
+    // Local-only resolution context for --resolve: inverted indexes +
+    // the observation store, zero network (that's `hdx <hash>`'s job).
+    let resolver = if opts.resolve {
+        let indexes = crate::inverted::open_all().unwrap_or_default();
+        let cache = if opts.no_index {
+            None
+        } else {
+            crate::cache::Cache::open().ok()
+        };
+        Some((indexes, cache))
+    } else {
+        None
+    };
+
     let mut known = 0usize;
     let mut known_bytes = 0u64;
     let mut total_bytes = 0u64;
@@ -190,18 +207,34 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
             ListMode::Unknown => r.matched.is_empty(),
         };
         if show {
+            let evidence = resolver.as_ref().map(|(indexes, cache)| {
+                let coord = crate::coord::Coord {
+                    scheme: Scheme::Sha256,
+                    digest: r.sha256.to_vec(),
+                };
+                crate::walk::walk(&coord, indexes, cache.as_ref())
+            });
             if opts.json {
-                println!(
-                    "{}",
-                    json!({
-                        "path": r.path.display().to_string(),
-                        "size": r.size,
-                        "sha1": hex_lower(&r.sha1),
-                        "sha256": hex_lower(&r.sha256),
-                        "known": !r.matched.is_empty(),
-                        "filters": r.matched,
-                    })
-                );
+                let mut obj = json!({
+                    "path": r.path.display().to_string(),
+                    "size": r.size,
+                    "sha1": hex_lower(&r.sha1),
+                    "sha256": hex_lower(&r.sha256),
+                    "known": !r.matched.is_empty(),
+                    "filters": r.matched,
+                });
+                if let Some(evidence) = &evidence {
+                    obj["resolved"] = evidence
+                        .iter()
+                        .map(|e| {
+                            json!({
+                                "backend": e.finding.backend,
+                                "claims": e.finding.claims,
+                            })
+                        })
+                        .collect();
+                }
+                println!("{obj}");
             } else {
                 let tag = if r.matched.is_empty() {
                     "unknown".to_string()
@@ -209,6 +242,18 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
                     r.matched.join(",")
                 };
                 println!("{:<12} {}", tag, r.path.display());
+                if let Some(evidence) = &evidence {
+                    const SHOWN: usize = 3;
+                    for e in evidence.iter().take(SHOWN) {
+                        let Some(claim) = e.finding.claims.first() else {
+                            continue;
+                        };
+                        println!("             {:<12} {}", e.finding.backend, claim.statement);
+                    }
+                    if evidence.len() > SHOWN {
+                        println!("             … and {} more claims", evidence.len() - SHOWN);
+                    }
+                }
             }
         }
     }

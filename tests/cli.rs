@@ -307,6 +307,149 @@ fn filters_build_rejects_bad_input() {
     assert!(stderr(&out).contains("no input files"));
 }
 
+const UUID_A: &str = "f9c009bd-bd72-4029-9bc7-75a1226f8adc";
+const UUID_B: &str = "7b63c2c4-e17b-4af4-888c-0f17f42a1f94";
+
+/// Build a tiny fatcat inverted index inside the env and return it.
+fn build_fatcat_index(env: &TestEnv, rows: &[(&str, &str, &str)]) {
+    let tsv: String = rows
+        .iter()
+        .map(|(sha1, sha256, md5)| format!("{UUID_A}\t{UUID_B}\t{sha1}\t{sha256}\t{md5}\n"))
+        .collect();
+    let path = env.root.join("fatcat.tsv");
+    std::fs::write(&path, tsv).unwrap();
+    let out = env.hdx(&["index", "build", "fatcat", path.to_str().unwrap()]);
+    assert!(out.status.success(), "index build failed: {}", stderr(&out));
+}
+
+#[test]
+fn index_build_and_offline_resolve() {
+    let env = TestEnv::new("index");
+    let out = env.hdx(&["index", "list"]);
+    assert!(stdout(&out).contains("no indexes installed"));
+
+    build_fatcat_index(&env, &[(ABC_SHA1, ABC_SHA256, ABC_MD5)]);
+    let out = env.hdx(&["index", "list"]);
+    assert!(out.status.success());
+    assert!(stdout(&out).contains("fatcat"));
+    assert!(stdout(&out).contains("1 rows"));
+
+    // resolve by each of the row's three schemes, fully offline
+    for hash in [
+        ABC_SHA256.to_string(),
+        format!("sha1:{ABC_SHA1}"),
+        format!("md5:{ABC_MD5}"),
+    ] {
+        let out = env.hdx(&["--offline", &hash]);
+        assert!(out.status.success(), "offline miss for {hash}");
+        let text = stdout(&out);
+        assert!(text.contains("fatcat"), "no attestor line in:\n{text}");
+        assert!(text.contains("https://fatcat.wiki/file/"));
+        // crosswalk: the other coordinates surface
+        assert!(text.contains(ABC_SHA1) || text.contains(ABC_MD5));
+    }
+
+    // unknown source name is rejected with the known list
+    let out = env.hdx(&["index", "build", "nope", "x.tsv"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("fatcat"));
+
+    // offline miss: exit 1, honest message
+    let absent = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    let out = env.hdx(&["--offline", absent]);
+    assert!(!out.status.success());
+    assert!(stdout(&out).contains("offline"));
+}
+
+/// The crosswalk demo: `hdx coords` records the six-scheme row of a
+/// local file (the only sha1_git edge source), so an offline SWHID
+/// query walks sha1_git → sha256 → the fatcat citation. Two hops, two
+/// witnesses, welded by a shared identity-grade digest.
+#[test]
+fn walk_crosses_sources_offline() {
+    let env = TestEnv::new("walk");
+    build_fatcat_index(&env, &[(ABC_SHA1, ABC_SHA256, ABC_MD5)]);
+    let file = env.write("abc.txt", b"abc");
+    let out = env.hdx(&["coords", file.to_str().unwrap()]);
+    assert!(out.status.success());
+
+    let out = env.hdx(&["--offline", &format!("swh:1:cnt:{ABC_SHA1GIT}")]);
+    assert!(
+        out.status.success(),
+        "SWHID did not resolve offline: {}",
+        stdout(&out)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("local-hash"),
+        "missing local witness:\n{text}"
+    );
+    assert!(
+        text.contains("fatcat"),
+        "walk did not reach fatcat:\n{text}"
+    );
+    assert!(
+        !text.contains("consistent with"),
+        "shared sha256 must weld into ONE cluster:\n{text}"
+    );
+}
+
+/// Two witness rows sharing only a weak digest must NOT weld: they
+/// render as distinct contents, with a collision warning since they
+/// disagree on identity-grade digests.
+#[test]
+fn weak_digest_ambiguity_is_honest() {
+    let env = TestEnv::new("collision");
+    let md5 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (sha256_1, sha256_2) = ("1".repeat(64), "2".repeat(64));
+    build_fatcat_index(
+        &env,
+        &[
+            (&"3".repeat(40), &sha256_1, md5),
+            (&"4".repeat(40), &sha256_2, md5),
+        ],
+    );
+    let out = env.hdx(&["--offline", &format!("md5:{md5}")]);
+    assert!(out.status.success());
+    let text = stdout(&out);
+    assert!(
+        text.contains("consistent with 2 distinct contents"),
+        "weak digest must not weld:\n{text}"
+    );
+    assert!(
+        text.contains("possible collision"),
+        "collision warning missing:\n{text}"
+    );
+    assert!(text.contains(&sha256_1) && text.contains(&sha256_2));
+
+    // a strong-digest query touching one row stays a single cluster
+    let out = env.hdx(&["--offline", &sha256_1]);
+    assert!(out.status.success());
+    assert!(!stdout(&out).contains("consistent with"));
+}
+
+#[test]
+fn scan_resolve_stays_offline() {
+    let env = TestEnv::new("scanresolve");
+    build_fatcat_index(&env, &[(ABC_SHA1, ABC_SHA256, ABC_MD5)]);
+    env.write("paper.pdf", b"abc");
+    let out = env.hdx(&["scan", env.work().to_str().unwrap(), "--resolve", "--json"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    let line = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["path"].as_str().is_some_and(|p| p.ends_with("paper.pdf")))
+        .expect("no per-file line");
+    let resolved = line["resolved"].as_array().expect("no resolved array");
+    assert_eq!(resolved[0]["backend"], "fatcat");
+
+    // text mode shows citation lines under the file
+    let out = env.hdx(&["scan", env.work().to_str().unwrap(), "--resolve"]);
+    let text = stdout(&out);
+    assert!(text.contains("scholarly file"), "no citation line:\n{text}");
+}
+
 #[test]
 fn fetch_registry_works_offline() {
     let env = TestEnv::new("fetch");
