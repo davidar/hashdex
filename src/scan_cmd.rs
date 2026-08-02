@@ -63,6 +63,10 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
     let own_cache = crate::cache::cache_dir();
     let mut excluded_own_cache = false;
     let mut files = Vec::new();
+    // Unreadable paths (permission denied, vanished mid-scan, …) are
+    // routine on real machines; collect them and report once at the end
+    // instead of spamming the terminal as they're hit.
+    let mut unreadable: Vec<String> = Vec::new();
     for root in paths {
         if root.is_file() {
             files.push(root.clone());
@@ -83,7 +87,7 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
             match entry {
                 Ok(e) if e.file_type().is_file() => files.push(e.into_path()),
                 Ok(_) => {}
-                Err(e) => eprintln!("warning: {e}"),
+                Err(e) => unreadable.push(e.to_string()),
             }
         }
     }
@@ -128,6 +132,7 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
     let big_skipped_files = AtomicUsize::new(0);
     let results: Mutex<Vec<FileResult>> = Mutex::new(Vec::with_capacity(total));
     let skipped: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let unreadable: Mutex<Vec<String>> = Mutex::new(unreadable);
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -176,7 +181,10 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
                                 .unwrap()
                                 .push(files[i].to_string_lossy().into_owned());
                         }
-                        Err(e) => eprintln!("warning: {}: {e}", files[i].display()),
+                        Err(e) => unreadable
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}: {e}", files[i].display())),
                     }
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     if d.is_multiple_of(100_000) {
@@ -190,6 +198,7 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
     let mut results = results.into_inner().unwrap();
     results.sort_by(|a, b| a.path.cmp(&b.path));
     let skipped = skipped.into_inner().unwrap();
+    let unreadable = unreadable.into_inner().unwrap();
 
     // Persist: fresh hashes in, vanished paths out.
     let reused = results.iter().filter(|r| r.from_index).count();
@@ -317,6 +326,7 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
         "hashed": scanned - reused,
         "from_index": reused,
         "big_filters_skipped_files": big_skipped_files.load(Ordering::Relaxed),
+        "unreadable": unreadable.len(),
         "per_filter": per_filter.iter().map(|(k, v)| (k.to_string(), v)).collect::<std::collections::BTreeMap<_,_>>(),
         "filters_loaded": filters.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
     });
@@ -344,10 +354,24 @@ pub fn scan(paths: &[PathBuf], filters: &[NamedFilter], opts: &ScanOptions) -> R
             "  hashed {} files, reused {reused} from local index",
             scanned - reused
         );
+        if !unreadable.is_empty() {
+            println!("  {} paths unreadable (not counted)", unreadable.len());
+        }
         if filters.is_empty() {
             println!("  (no filters installed — run `hdx filters fetch` first; every file reports unknown)");
         }
         println!("  note: filter matches are probabilistic (small false-positive rate); confirm important ones with `hdx <hash>`");
+    }
+    // Diagnostics for both output modes: stderr, so JSON stdout stays pure.
+    if !unreadable.is_empty() {
+        const SHOWN: usize = 5;
+        eprintln!("{} paths unreadable:", unreadable.len());
+        for u in unreadable.iter().take(SHOWN) {
+            eprintln!("  {u}");
+        }
+        if unreadable.len() > SHOWN {
+            eprintln!("  … and {} more", unreadable.len() - SHOWN);
+        }
     }
     Ok(())
 }

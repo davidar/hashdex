@@ -502,3 +502,37 @@ fn scan_excludes_own_cache_dir() {
     assert_eq!(summary["files"], 1, "explicit cache scan saw: {summary}");
     assert!(!stderr(&out).contains("excluding hashdex's own cache"));
 }
+
+/// Unreadable files are a summary state at the end of the scan, not a
+/// stream of warnings while it runs.
+#[test]
+#[cfg(unix)]
+fn scan_reports_unreadable_at_end() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = TestEnv::new("unreadable");
+    env.write("ok.txt", b"readable");
+    let locked = env.write("locked.txt", b"secret");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&locked).is_ok() {
+        // Running as root (CAP_DAC_OVERRIDE): chmod 000 can't make the
+        // file unreadable, so there is nothing to assert.
+        return;
+    }
+
+    let out = env.hdx(&["scan", env.work().to_str().unwrap(), "--json"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let summary = scan_summary(&out);
+    assert_eq!(summary["files"], 1, "{summary}");
+    assert_eq!(summary["unreadable"], 1, "{summary}");
+    // The path appears in the end-of-scan detail, not as a warning line.
+    assert!(
+        stderr(&out).contains("locked.txt"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("warning: "),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
