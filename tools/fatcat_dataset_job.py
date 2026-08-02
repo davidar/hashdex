@@ -365,7 +365,11 @@ def build_final(work: Path, out: Path, threads: int):
     con = duckdb.connect(str(work / "build.duckdb"))
     con.execute(f"SET threads = {threads}")
     con.execute(f"SET temp_directory = '{work / 'duckdb-tmp'}'")
-    con.execute("SET preserve_insertion_order = false")
+    # preserve_insertion_order stays at its default (true). Setting it
+    # false licenses DuckDB to reorder the WHOLE pipeline — including
+    # between the ORDER BY and the parallel multi-file COPY sink — and
+    # the first publish shipped 479/480 overlapping row groups that way.
+    # The sort order is the product; verify_sorted below enforces it.
 
     files_glob = str(work / "files_raw" / "*.parquet")
     rel_glob = str(work / "releases_slim" / "*.parquet")
@@ -402,8 +406,30 @@ def build_final(work: Path, out: Path, threads: int):
             (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 262144)
             """
         )
+    for glob, key in [
+        (f"{out}/data/*.parquet", "sha256"),
+        (f"{out}/maps/sha1.parquet", "sha1"),
+        (f"{out}/maps/md5.parquet", "md5"),
+    ]:
+        verify_sorted(con, glob, key)
     n = con.execute(f"SELECT count(*) FROM read_parquet('{out}/data/*.parquet')").fetchone()[0]
     print(f"final table: {n} rows", flush=True)
+
+
+def verify_sorted(con, glob, key):
+    """Row-group ranges must be globally disjoint — the sort order is
+    the product (range-read point lookups), and a content check can't
+    see it. Footers only, costs seconds."""
+    rows = con.execute(
+        f"""SELECT stats_min_value, stats_max_value
+            FROM parquet_metadata('{glob}')
+            WHERE path_in_schema = '{key}'
+            ORDER BY stats_min_value"""
+    ).fetchall()
+    overlaps = sum(1 for i in range(1, len(rows)) if rows[i][0] < rows[i - 1][1])
+    if not rows or overlaps:
+        raise RuntimeError(f"{glob} not globally sorted by {key}: {overlaps} overlapping row groups")
+    print(f"  verified sorted: {glob} ({len(rows)} row groups)", flush=True)
 
 
 CARD = """\
