@@ -440,6 +440,10 @@ async fn online_probe(
         if r.matched.is_empty() {
             continue;
         }
+        // One probe per (file, backend): when several of a backend's
+        // filters matched the same file (e.g. its sha1 and sha256
+        // blooms), the strongest scheme answers for all of them.
+        let mut best: HashMap<&'static str, Scheme> = HashMap::new();
         for f in filters {
             if !r.matched.iter().any(|m| m == &f.name) {
                 continue;
@@ -447,19 +451,21 @@ async fn online_probe(
             let Some(backend) = backend_for_filter(&f.name) else {
                 continue;
             };
-            if !selected(&f.name, backend) {
+            if !selected(&f.name, backend) || !matches!(f.scheme, Scheme::Sha1 | Scheme::Sha256) {
                 continue;
             }
-            let digest = match f.scheme {
+            let e = best.entry(backend).or_insert(f.scheme);
+            if f.scheme == Scheme::Sha256 {
+                *e = Scheme::Sha256;
+            }
+        }
+        for (backend, scheme) in best {
+            let digest = match scheme {
                 Scheme::Sha1 => r.sha1.to_vec(),
-                Scheme::Sha256 => r.sha256.to_vec(),
-                _ => continue,
+                _ => r.sha256.to_vec(),
             };
             probes
-                .entry(crate::coord::Coord {
-                    scheme: f.scheme,
-                    digest,
-                })
+                .entry(crate::coord::Coord { scheme, digest })
                 .or_default()
                 .insert(backend);
         }
