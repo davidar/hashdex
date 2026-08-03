@@ -164,57 +164,8 @@ pub async fn scan(
         .collect();
     let paths = &paths;
 
-    // Collect the file list first so workers can chew through it by index.
-    // hdx's own cache (dumps, extracts, filters, local.db) is excluded —
-    // it would pollute the known/unknown metrics with our own artifacts —
-    // unless a scan root points inside it explicitly.
     let own_cache = crate::cache::cache_dir();
     let ticker = &Ticker::new();
-    let mut excluded_own_cache = false;
-    let mut files = Vec::new();
-    // Unreadable paths (permission denied, vanished mid-scan, …) are
-    // routine on real machines; collect them and report once at the end
-    // instead of spamming the terminal as they're hit.
-    let mut unreadable: Vec<String> = Vec::new();
-    for root in paths {
-        if root.is_file() {
-            files.push(root.clone());
-            continue;
-        }
-        let prune_cache = !root.starts_with(&own_cache);
-        let walker = walkdir::WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| {
-                if prune_cache && e.path() == own_cache {
-                    excluded_own_cache = true;
-                    return false;
-                }
-                true
-            });
-        for entry in walker {
-            match entry {
-                Ok(e) if e.file_type().is_file() => {
-                    files.push(e.into_path());
-                    // The walk itself can take minutes on a big tree;
-                    // it must not look like a hang.
-                    ticker.update(500_000, files.len(), || {
-                        format!("walking… {} files found", files.len())
-                    });
-                }
-                Ok(_) => {}
-                Err(e) => unreadable.push(e.to_string()),
-            }
-        }
-    }
-    ticker.clear();
-    let total = files.len();
-    if excluded_own_cache {
-        eprintln!(
-            "excluding hashdex's own cache ({}); scan it explicitly to include it",
-            own_cache.display()
-        );
-    }
 
     let index = if opts.no_index {
         None
@@ -236,7 +187,7 @@ pub async fn scan(
             }
         }
     }
-    eprintln!("scanning {total} files ({} in index)…", cached.len());
+    eprintln!("scanning… ({} entries in index)", cached.len());
 
     // Probe cheapest-first so membership is usually settled before any
     // bigger-than-RAM filter would need a disk seek.
@@ -244,13 +195,21 @@ pub async fn scan(
     probe_order.sort_by_key(|f| f.bytes);
     let probe_order = &probe_order;
 
-    let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
+    let found = AtomicUsize::new(0);
+    let walk_done = std::sync::atomic::AtomicBool::new(false);
     let hashed_fresh = AtomicUsize::new(0);
     let big_skipped_files = AtomicUsize::new(0);
-    let results: Mutex<Vec<FileResult>> = Mutex::new(Vec::with_capacity(total));
+    let results: Mutex<Vec<FileResult>> = Mutex::new(Vec::new());
     let skipped: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let unreadable: Mutex<Vec<String>> = Mutex::new(unreadable);
+    // Unreadable paths (permission denied, vanished mid-scan, …) are
+    // routine on real machines; collect them and report once at the end
+    // instead of spamming the terminal as they're hit.
+    let unreadable: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    // Bounded: backpressure keeps the walker a few thousand paths
+    // ahead of the workers instead of materializing the whole tree.
+    let (walk_tx, walk_rx) = std::sync::mpsc::sync_channel::<PathBuf>(8192);
+    let walk_rx = Mutex::new(walk_rx);
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -258,6 +217,56 @@ pub async fn scan(
     let index_cell = Mutex::new(index);
 
     std::thread::scope(|scope| {
+        // ONE fused pass over the filesystem. The walker reads
+        // directory blocks and streams paths (hdx's own cache pruned —
+        // it would pollute the known/unknown metrics with our own
+        // artifacts — unless a scan root points inside it explicitly);
+        // workers stat, index-check, filter, and hash in parallel from
+        // the first path on. Recognized files cost one stat; only
+        // unrecognized content is read at all.
+        let (found, walk_done) = (&found, &walk_done);
+        let unreadable_ref = &unreadable;
+        scope.spawn(move || {
+            for root in paths {
+                if root.is_file() {
+                    found.fetch_add(1, Ordering::Relaxed);
+                    let _ = walk_tx.send(root.clone());
+                    continue;
+                }
+                let prune_cache = !root.starts_with(&own_cache);
+                let mut excluded = false;
+                let walker = walkdir::WalkDir::new(root)
+                    .follow_links(false)
+                    .into_iter()
+                    .filter_entry(|e| {
+                        if prune_cache && e.path() == own_cache {
+                            excluded = true;
+                            return false;
+                        }
+                        true
+                    });
+                for entry in walker {
+                    match entry {
+                        Ok(e) if e.file_type().is_file() => {
+                            found.fetch_add(1, Ordering::Relaxed);
+                            if walk_tx.send(e.into_path()).is_err() {
+                                return; // workers are gone
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => unreadable_ref.lock().unwrap().push(e.to_string()),
+                    }
+                }
+                if excluded {
+                    eprintln!(
+                        "excluding hashdex's own cache ({}); scan it explicitly to include it",
+                        own_cache.display()
+                    );
+                }
+            }
+            drop(walk_tx);
+            walk_done.store(true, Ordering::Release);
+        });
         // Incremental persistence: a killed scan keeps the hashing it
         // already paid for. Fresh hashes flush in batches as workers
         // produce them; stale-path deletion stays at the very end —
@@ -267,7 +276,8 @@ pub async fn scan(
             let mut last_flush = std::time::Instant::now();
             loop {
                 std::thread::park_timeout(std::time::Duration::from_millis(500));
-                let finished = done.load(Ordering::Relaxed) >= total;
+                let finished = walk_done.load(Ordering::Acquire)
+                    && done.load(Ordering::Relaxed) >= found.load(Ordering::Relaxed);
                 let pending = results.lock().unwrap().len() - flushed_upto;
                 if pending > 0
                     && (finished || pending >= 2000 || last_flush.elapsed().as_secs() >= 5)
@@ -300,11 +310,12 @@ pub async fn scan(
             scope.spawn(|| {
                 let mut buf = vec![0u8; 1 << 20];
                 loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= total {
-                        break;
-                    }
-                    match examine(&files[i], cached_ref, opts.rehash, &mut buf) {
+                    // Bind before matching: a `match recv()` scrutinee
+                    // would hold the receiver lock through the whole
+                    // file examination, serializing every worker.
+                    let path = walk_rx.lock().unwrap().recv();
+                    let Ok(path) = path else { break };
+                    match examine(&path, cached_ref, opts.rehash, &mut buf) {
                         Ok(Some(mut r)) => {
                             if !r.from_index {
                                 hashed_fresh.fetch_add(1, Ordering::Relaxed);
@@ -339,21 +350,24 @@ pub async fn scan(
                             skipped
                                 .lock()
                                 .unwrap()
-                                .push(files[i].to_string_lossy().into_owned());
+                                .push(path.to_string_lossy().into_owned());
                         }
                         Err(e) => unreadable
                             .lock()
                             .unwrap()
-                            .push(format!("{}: {e}", files[i].display())),
+                            .push(format!("{}: {e}", path.display())),
                     }
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     // Most files are index hits (stat + compare), not
                     // hashing — the label must not claim otherwise.
                     ticker.update(100_000, d, || {
-                        format!(
-                            "checking… {d}/{total} files ({} hashed fresh)",
-                            hashed_fresh.load(Ordering::Relaxed)
-                        )
+                        let f = found.load(Ordering::Relaxed);
+                        let fresh = hashed_fresh.load(Ordering::Relaxed);
+                        if walk_done.load(Ordering::Acquire) {
+                            format!("checking… {d}/{f} files ({fresh} hashed fresh)")
+                        } else {
+                            format!("checking… {d} of {f}+ found ({fresh} hashed fresh)")
+                        }
                     });
                 }
             });
