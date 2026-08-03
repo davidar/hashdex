@@ -72,31 +72,39 @@ enum Command {
         #[arg(long)]
         lookup: bool,
     },
-    /// Scan directories: hash every file and check membership filters
-    /// locally — which of these files are publicly known bytes?
+    /// Scan directories: hash every file, check membership filters,
+    /// and attribute what hdx can actually name (local indexes plus
+    /// range reads over published datasets; --no-resolve for the pure
+    /// membership census)
     Scan {
         /// Files or directories to scan
         paths: Vec<PathBuf>,
         /// Print per-file lines: unknown, known, or all
+        /// (default: files with an attribution)
         #[arg(long, value_parser = ["unknown", "known", "all"])]
         list: Option<String>,
         /// Rehash every file even if the local index has a fresh entry
         #[arg(long)]
         rehash: bool,
-        /// Resolve listed files against local indexes + observation
-        /// store (offline; implies --list all unless --list given)
+        /// Membership only — the classic bloom-filter census: no
+        /// resolution, no probes, fastest
         #[arg(long)]
-        resolve: bool,
+        no_resolve: bool,
+        /// Full citation blocks (URLs, several claims) instead of one
+        /// compact attribution line per file
+        #[arg(short, long)]
+        verbose: bool,
         /// Probe every filter even for files a smaller filter already
         /// matched (full attribution; slower with bigger-than-RAM filters)
         #[arg(long)]
         probe_all: bool,
-        /// With --resolve: also probe network backends for files whose
-        /// membership filter matched (demand-driven, cached forever).
-        /// Optionally limit to a comma-separated backend list, e.g.
-        /// --online fatcat,circl
-        #[arg(long, requires = "resolve", value_name = "BACKENDS",
-              num_args = 0..=1, default_missing_value = "")]
+        /// Also tell third-party APIs (circl, depsdev, rekor, swh)
+        /// about matched digests — dataset-transport backends like
+        /// fatcat are probed by default and disclose nothing.
+        /// Optionally restrict: --online=circl,swh
+        #[arg(long, value_name = "BACKENDS", num_args = 0..=1,
+              default_missing_value = "", require_equals = true,
+              conflicts_with = "no_resolve")]
         online: Option<String>,
     },
     /// Find local files by digest (from the index hdx scan maintains)
@@ -183,7 +191,8 @@ async fn main() -> Result<()> {
                 paths,
                 list,
                 rehash,
-                resolve,
+                no_resolve,
+                verbose,
                 probe_all,
                 online,
             }),
@@ -204,13 +213,14 @@ async fn main() -> Result<()> {
                     Some("unknown") => scan_cmd::ListMode::Unknown,
                     Some("known") => scan_cmd::ListMode::Known,
                     Some("all") => scan_cmd::ListMode::All,
-                    None if *resolve => scan_cmd::ListMode::All,
+                    None if !*no_resolve => scan_cmd::ListMode::Attributed,
                     _ => scan_cmd::ListMode::None,
                 },
                 json: cli.json,
                 no_index: cli.no_cache,
                 rehash: *rehash,
-                resolve: *resolve,
+                resolve: !*no_resolve,
+                verbose: *verbose,
                 probe_all: *probe_all,
                 online: match (online, cli.offline) {
                     (Some(list), false) => Some(

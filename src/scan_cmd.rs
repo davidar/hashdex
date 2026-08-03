@@ -17,18 +17,28 @@ pub struct ScanOptions {
     pub no_index: bool,
     /// Rehash every file even if the index has a fresh entry.
     pub rehash: bool,
-    /// Resolve listed files through the local walk (inverted indexes +
-    /// observation store). Never touches the network.
+    /// Resolve files through the local walk (inverted indexes +
+    /// observation store) plus dataset-transport probes. Off =
+    /// membership-only census (--no-resolve).
     pub resolve: bool,
+    /// Full citation blocks (URLs, several claims) instead of one
+    /// compact attribution line per file.
+    pub verbose: bool,
     /// Probe every filter even when a smaller one already matched
     /// (full attribution at the cost of big-filter page faults).
     pub probe_all: bool,
-    /// With resolve: probe network backends for filter-matched files
-    /// before the walk (demand-driven; hits cached forever). Some =
-    /// enabled; a non-empty list restricts which backends (accepts
-    /// filter or backend names).
+    /// Consent to tell third-party APIs about matched digests.
+    /// Dataset-transport backends (range reads over our own published
+    /// parquet — nobody is told anything) are probed whenever
+    /// resolving; this opt-in covers the rest. Empty list = all;
+    /// non-empty restricts (accepts filter or backend names).
     pub online: Option<Vec<String>>,
 }
+
+/// Backends that are range reads against published static datasets:
+/// probing them discloses digests to no one, so they need no --online
+/// consent.
+const DATASET_BACKENDS: &[&str] = &[crate::backends::fatcat::NAME];
 
 /// Per-backend probe ceiling per scan run: a batch resolve must not
 /// turn into a hammering of somebody's public API. Narrow the scan
@@ -48,6 +58,57 @@ pub enum ListMode {
     Unknown,
     Known,
     All,
+    /// Files with at least one actual claim — the default when
+    /// resolving: a whole-disk scan stays a summary plus the files hdx
+    /// can genuinely name, not millions of membership lines.
+    Attributed,
+}
+
+/// Single-line in-place progress on a tty (throttled), occasional
+/// plain lines otherwise. Results appearing all at once after minutes
+/// of silence is the failure mode this exists for.
+pub struct Ticker {
+    tty: bool,
+    start: std::time::Instant,
+    last_ms: std::sync::atomic::AtomicU64,
+}
+
+impl Ticker {
+    pub fn new() -> Ticker {
+        use std::io::IsTerminal;
+        Ticker {
+            tty: std::io::stderr().is_terminal(),
+            start: std::time::Instant::now(),
+            last_ms: 0.into(),
+        }
+    }
+
+    /// `every` paces the non-tty fallback lines; the tty path paces
+    /// itself by wall clock.
+    pub fn update(&self, every: usize, n: usize, msg: impl Fn() -> String) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.tty {
+            let now = self.start.elapsed().as_millis() as u64;
+            let last = self.last_ms.load(Relaxed);
+            if now.saturating_sub(last) >= 100
+                && self
+                    .last_ms
+                    .compare_exchange(last, now, Relaxed, Relaxed)
+                    .is_ok()
+            {
+                eprint!("\r\x1b[2K  {}", msg());
+            }
+        } else if n > 0 && n.is_multiple_of(every) {
+            eprintln!("  … {}", msg());
+        }
+    }
+
+    /// Clear the in-place line before real output takes the terminal.
+    pub fn clear(&self) {
+        if self.tty {
+            eprint!("\r\x1b[2K");
+        }
+    }
 }
 
 struct FileResult {
@@ -145,6 +206,7 @@ pub async fn scan(
     probe_order.sort_by_key(|f| f.bytes);
     let probe_order = &probe_order;
 
+    let ticker = &Ticker::new();
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let big_skipped_files = AtomicUsize::new(0);
@@ -205,13 +267,12 @@ pub async fn scan(
                             .push(format!("{}: {e}", files[i].display())),
                     }
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if d.is_multiple_of(100_000) {
-                        eprintln!("  … {d}/{total}");
-                    }
+                    ticker.update(100_000, d, || format!("hashing… {d}/{total} files"));
                 }
             });
         }
     });
+    ticker.clear();
 
     let mut results = results.into_inner().unwrap();
     results.sort_by(|a, b| a.path.cmp(&b.path));
@@ -249,12 +310,21 @@ pub async fn scan(
         }
     }
 
-    // --online: demand-driven network probes for matched digests, each
-    // visiting only the backends whose filter fired. Runs before the
-    // walk so fresh findings are in the observation store when the
+    // Demand-driven network probes for matched digests, each visiting
+    // only the backends whose filter fired: dataset-transport backends
+    // by default, third-party APIs with --online consent. Runs before
+    // the walk so fresh findings are in the observation store when the
     // per-file resolution below sweeps it.
-    if let (true, Some(selection)) = (opts.resolve, &opts.online) {
-        online_probe(&results, filters, selection, client, ropts).await;
+    if opts.resolve && !ropts.offline {
+        online_probe(
+            &results,
+            filters,
+            opts.online.as_deref(),
+            client,
+            ropts,
+            ticker,
+        )
+        .await;
     }
 
     // Local resolution context for --resolve: inverted indexes + the
@@ -272,10 +342,14 @@ pub async fn scan(
     };
 
     let mut known = 0usize;
+    let mut attributed = 0usize;
     let mut known_bytes = 0u64;
     let mut total_bytes = 0u64;
     let mut per_filter: std::collections::BTreeMap<&str, usize> = Default::default();
-    for r in &results {
+    for (i, r) in results.iter().enumerate() {
+        ticker.update(100_000, i, || {
+            format!("resolving locally… {i}/{} files", results.len())
+        });
         total_bytes += r.size;
         if !r.matched.is_empty() {
             known += 1;
@@ -284,20 +358,30 @@ pub async fn scan(
                 *per_filter.entry(m.as_str()).or_default() += 1;
             }
         }
+        // Attributed listing needs the evidence to decide visibility,
+        // so the walk runs for every file whenever we resolve.
+        let evidence = resolver.as_ref().map(|(indexes, cache)| {
+            let coord = crate::coord::Coord {
+                scheme: Scheme::Sha256,
+                digest: r.sha256.to_vec(),
+            };
+            crate::walk::walk(&coord, indexes, cache.as_ref())
+        });
+        let has_claims = evidence
+            .as_ref()
+            .is_some_and(|ev| ev.iter().any(|e| !e.finding.claims.is_empty()));
+        if has_claims {
+            attributed += 1;
+        }
         let show = match opts.list {
             ListMode::None => false,
             ListMode::All => true,
             ListMode::Known => !r.matched.is_empty(),
             ListMode::Unknown => r.matched.is_empty(),
+            ListMode::Attributed => has_claims,
         };
         if show {
-            let evidence = resolver.as_ref().map(|(indexes, cache)| {
-                let coord = crate::coord::Coord {
-                    scheme: Scheme::Sha256,
-                    digest: r.sha256.to_vec(),
-                };
-                crate::walk::walk(&coord, indexes, cache.as_ref())
-            });
+            ticker.clear();
             if opts.json {
                 let mut obj = json!({
                     "path": r.path.display().to_string(),
@@ -327,26 +411,43 @@ pub async fn scan(
                 };
                 println!("{:<12} {}", tag, r.path.display());
                 if let Some(evidence) = &evidence {
-                    const SHOWN: usize = 3;
-                    for e in evidence.iter().take(SHOWN) {
-                        let Some(claim) = e.finding.claims.first() else {
-                            continue;
-                        };
-                        println!("             {:<12} {}", e.finding.backend, claim.statement);
-                        if let Some(url) = &claim.url {
-                            println!("             {:<12} → {url}", "");
+                    if opts.verbose {
+                        const SHOWN: usize = 3;
+                        for e in evidence.iter().take(SHOWN) {
+                            let Some(claim) = e.finding.claims.first() else {
+                                continue;
+                            };
+                            println!("             {:<12} {}", e.finding.backend, claim.statement);
+                            if let Some(url) = &claim.url {
+                                println!("             {:<12} → {url}", "");
+                            }
                         }
-                    }
-                    if evidence.len() > SHOWN {
-                        println!("             … and {} more claims", evidence.len() - SHOWN);
+                        if evidence.len() > SHOWN {
+                            println!("             … and {} more claims", evidence.len() - SHOWN);
+                        }
+                    } else if let Some((backend, claim)) = evidence
+                        .iter()
+                        .flat_map(|e| {
+                            e.finding
+                                .claims
+                                .iter()
+                                .map(move |c| (&e.finding.backend, c))
+                        })
+                        .max_by_key(|(_, c)| (c.url.is_some(), c.statement.len()))
+                    {
+                        // Compact default: the most informative single
+                        // claim (URL-bearing beats bare join keys), no
+                        // URL printed. -v for the full blocks.
+                        println!("             {:<12} {}", backend, claim.statement);
                     }
                 }
             }
         }
     }
 
+    ticker.clear();
     let scanned = results.len();
-    let summary = json!({
+    let mut summary = json!({
         "files": scanned,
         "bytes": total_bytes,
         "known": known,
@@ -359,12 +460,20 @@ pub async fn scan(
         "per_filter": per_filter.iter().map(|(k, v)| (k.to_string(), v)).collect::<std::collections::BTreeMap<_,_>>(),
         "filters_loaded": filters.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
     });
+    if resolver.is_some() {
+        summary["attributed"] = json!(attributed);
+    }
     if opts.json {
         println!("{summary}");
     } else {
         eprintln!();
+        let attribution = if resolver.is_some() {
+            format!(", {attributed} attributed")
+        } else {
+            String::new()
+        };
         println!(
-            "{scanned} files ({}) — {known} known ({}), {} unknown",
+            "{scanned} files ({}) — {known} known ({}){attribution}, {} unknown",
             human(total_bytes),
             human(known_bytes),
             scanned - known
@@ -425,15 +534,23 @@ fn backend_for_filter(name: &str) -> Option<&'static str> {
 async fn online_probe(
     results: &[FileResult],
     filters: &[NamedFilter],
-    selection: &[String],
+    selection: Option<&[String]>,
     client: &reqwest::Client,
     ropts: &crate::resolve::Options,
+    ticker: &Ticker,
 ) {
     use futures::StreamExt;
     use std::collections::{BTreeMap, HashMap, HashSet};
 
+    // Dataset transports need no consent; --online grants the APIs
+    // (bare = all of them, a list restricts by filter or backend name).
     let selected = |filter: &str, backend: &str| {
-        selection.is_empty() || selection.iter().any(|s| s == filter || s == backend)
+        DATASET_BACKENDS.contains(&backend)
+            || match selection {
+                None => false,
+                Some([]) => true,
+                Some(list) => list.iter().any(|s| s == filter || s == backend),
+            }
     };
     let mut probes: HashMap<crate::coord::Coord, HashSet<&'static str>> = HashMap::new();
     for r in results {
@@ -554,14 +671,13 @@ async fn online_probe(
                 }
             }
             let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if d.is_multiple_of(50) {
-                eprintln!("  … probed {d}/{total}");
-            }
+            ticker.update(50, d, || format!("probing online… {d}/{total} digests"));
         }
     }))
     .buffer_unordered(width)
     .collect::<Vec<()>>()
     .await;
+    ticker.clear();
     for (what, n) in errors.lock().unwrap().iter() {
         eprintln!("warning: {n} probes failed: {what} (errors are not cached; rerun retries)");
     }

@@ -436,26 +436,38 @@ fn weak_digest_ambiguity_is_honest() {
     assert!(!stdout(&out).contains("consistent with"));
 }
 
+/// Scan resolves by default now: attributed files list themselves with
+/// a compact claim line, and (with no network-mapped filters installed)
+/// nothing touches the network.
 #[test]
-fn scan_resolve_stays_offline() {
+fn scan_resolves_by_default() {
     let env = TestEnv::new("scanresolve");
     build_fatcat_index(&env, &[(ABC_SHA1, ABC_SHA256, ABC_MD5)]);
     env.write("paper.pdf", b"abc");
-    let out = env.hdx(&["scan", env.work().to_str().unwrap(), "--resolve", "--json"]);
+    let out = env.hdx(&["scan", env.work().to_str().unwrap(), "--json"]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let text = stdout(&out);
     let line = text
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|v| v["path"].as_str().is_some_and(|p| p.ends_with("paper.pdf")))
-        .expect("no per-file line");
+        .expect("no per-file line (Attributed listing should include it)");
     let resolved = line["resolved"].as_array().expect("no resolved array");
     assert_eq!(resolved[0]["backend"], "fatcat");
+    let summary = scan_summary(&out);
+    assert_eq!(summary["attributed"], 1);
 
-    // text mode shows citation lines under the file
-    let out = env.hdx(&["scan", env.work().to_str().unwrap(), "--resolve"]);
+    // Text mode: one compact claim line per attributed file by default.
+    let out = env.hdx(&["scan", env.work().to_str().unwrap()]);
     let text = stdout(&out);
-    assert!(text.contains("scholarly file"), "no citation line:\n{text}");
+    assert!(text.contains("scholarly file"), "no claim line:\n{text}");
+    assert!(text.contains("attributed"), "no attributed count:\n{text}");
+
+    // --no-resolve is the classic census: summary only, no claims.
+    let out = env.hdx(&["scan", env.work().to_str().unwrap(), "--no-resolve"]);
+    let text = stdout(&out);
+    assert!(!text.contains("scholarly file"), "census resolved:\n{text}");
+    assert!(!text.contains("attributed"), "census attributed:\n{text}");
 }
 
 #[test]
@@ -546,12 +558,17 @@ fn scan_reports_unreadable_at_end() {
 }
 
 #[test]
-fn scan_online_requires_resolve() {
+fn scan_online_conflicts_with_no_resolve() {
     let env = TestEnv::new("onlinearg");
-    let out = env.hdx(&["scan", env.work().to_str().unwrap(), "--online"]);
+    let out = env.hdx(&[
+        "scan",
+        env.work().to_str().unwrap(),
+        "--no-resolve",
+        "--online",
+    ]);
     assert!(!out.status.success());
     assert!(
-        stderr(&out).contains("--resolve"),
+        stderr(&out).contains("no-resolve"),
         "stderr: {}",
         stderr(&out)
     );
