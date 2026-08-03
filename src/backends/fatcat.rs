@@ -9,9 +9,11 @@ use parquet::file::reader::{ChunkReader, Length};
 use parquet::file::serialized_reader::SerializedPageReader;
 use parquet::file::statistics::Statistics;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
 pub const NAME: &str = "fatcat";
 
@@ -26,7 +28,15 @@ pub const NAME: &str = "fatcat";
 /// scanned with early exit; the handful of claim columns are then
 /// page-skipped to the matching rows. No server-side query layer —
 /// the sorted layout IS the index.
-const DATASET_URL: &str = "https://huggingface.co/datasets/david-ar/fatcat-files/resolve/main";
+///
+/// URLs are pinned to a repo revision (Hub API, refreshed hourly), so
+/// every byte range is immutable and fetched ranges persist on disk
+/// across invocations with no validation traffic. A stale pin is safe:
+/// old revisions stay fetchable, they're just up to an hour behind.
+const DATASET_BASE: &str = "https://huggingface.co/datasets/david-ar/fatcat-files/resolve";
+const REVISION_API: &str =
+    "https://huggingface.co/api/datasets/david-ar/fatcat-files/revision/main";
+const REVISION_TTL: Duration = Duration::from_secs(3600);
 const SHOWN: usize = 5;
 /// Releases read per digest (claims render at most SHOWN; the rest is
 /// only counted). Bounds pathological many-release files.
@@ -53,11 +63,142 @@ struct RemoteInner {
     /// Cleared wholesale past CACHE_MAX so batch scans stay bounded —
     /// the footer is already parsed, so eviction only costs refetches.
     cache: Mutex<BTreeMap<u64, Bytes>>,
+    /// Revision-pinned blobs surviving across invocations (None when
+    /// the revision is unknown — then nothing on disk can be trusted).
+    disk: Option<DiskCache>,
+    /// Range starts currently being fetched: concurrent probes landing
+    /// in the same row group wait for one fetch instead of duplicating
+    /// a multi-megabyte request.
+    inflight: Mutex<HashSet<u64>>,
+    inflight_done: Condvar,
 }
 
 /// Per-file cap on cached range bytes (17 data files + 2 maps can be
 /// open at once in a scan).
 const CACHE_MAX: usize = 96 << 20;
+/// Per-file cap on persisted range bytes; oldest blobs go first.
+const DISK_MAX: u64 = 64 << 20;
+
+fn http_cache_root() -> PathBuf {
+    crate::cache::cache_dir().join("fatcat").join("http")
+}
+
+/// The pinned repo revision: the on-disk pin when fresh, else the Hub
+/// API (pruning caches of older revisions), else the stale pin —
+/// offline reuse is exactly what pinning makes safe. None only on a
+/// first run that can't reach the Hub.
+fn pinned_revision() -> Option<String> {
+    let root = http_cache_root();
+    let pin = root.join("revision");
+    let stale = || {
+        std::fs::read_to_string(&pin)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let age = std::fs::metadata(&pin)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok());
+    if age.is_some_and(|a| a < REVISION_TTL) {
+        if let Some(sha) = stale() {
+            return Some(sha);
+        }
+    }
+    let fetched: Result<String> = (|| {
+        let v: Value = http()
+            .get(REVISION_API)
+            .send()?
+            .error_for_status()?
+            .json()?;
+        Ok(v["sha"]
+            .as_str()
+            .context("no sha in revision response")?
+            .to_string())
+    })();
+    match fetched {
+        Ok(sha) => {
+            // A new revision orphans every blob pinned to older ones.
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                for e in entries.flatten() {
+                    if e.file_name().to_str() != Some(&sha) && e.path().is_dir() {
+                        let _ = std::fs::remove_dir_all(e.path());
+                    }
+                }
+            }
+            let _ = std::fs::create_dir_all(&root);
+            let _ = std::fs::write(&pin, &sha);
+            Some(sha)
+        }
+        Err(_) => stale(),
+    }
+}
+
+/// On-disk range blobs for one remote file at one revision. Blob files
+/// are named `<start>-<len>`; the map mirrors the directory listing.
+struct DiskCache {
+    dir: PathBuf,
+    ranges: Mutex<BTreeMap<u64, u64>>,
+}
+
+impl DiskCache {
+    fn open(dir: PathBuf) -> Option<DiskCache> {
+        std::fs::create_dir_all(&dir).ok()?;
+        let mut ranges = BTreeMap::new();
+        for e in std::fs::read_dir(&dir).ok()?.flatten() {
+            if let Some((s, l)) = e
+                .file_name()
+                .to_str()
+                .and_then(|n| n.split_once('-'))
+                .and_then(|(s, l)| Some((s.parse().ok()?, l.parse().ok()?)))
+            {
+                ranges.insert(s, l);
+            }
+        }
+        Some(DiskCache {
+            dir,
+            ranges: Mutex::new(ranges),
+        })
+    }
+
+    /// The whole blob covering [start, start+length), if any.
+    fn get(&self, start: u64, length: usize) -> Option<(u64, Bytes)> {
+        let (s, l) = {
+            let ranges = self.ranges.lock().unwrap();
+            let (&s, &l) = ranges.range(..=start).next_back()?;
+            (s, l)
+        };
+        if start + length as u64 > s + l {
+            return None;
+        }
+        let b = std::fs::read(self.dir.join(format!("{s}-{l}"))).ok()?;
+        (b.len() as u64 == l).then(|| (s, Bytes::from(b)))
+    }
+
+    /// Best-effort persist; evicts oldest blobs past DISK_MAX.
+    fn put(&self, start: u64, b: &Bytes) {
+        let mut ranges = self.ranges.lock().unwrap();
+        if ranges.contains_key(&start) {
+            return;
+        }
+        if std::fs::write(self.dir.join(format!("{start}-{}", b.len())), b).is_err() {
+            return;
+        }
+        ranges.insert(start, b.len() as u64);
+        while ranges.values().sum::<u64>() > DISK_MAX {
+            let oldest = ranges
+                .iter()
+                .filter_map(|(&s, &l)| {
+                    let p = self.dir.join(format!("{s}-{l}"));
+                    Some((std::fs::metadata(&p).and_then(|m| m.modified()).ok()?, s, p))
+                })
+                .min();
+            let Some((_, s, p)) = oldest else { break };
+            let _ = std::fs::remove_file(p);
+            ranges.remove(&s);
+        }
+    }
+}
 
 /// One remote parquet file addressed by HTTP range requests, cached
 /// per-process so a batch scan shares footers, key chunks, and pages.
@@ -99,7 +240,7 @@ impl RemoteInner {
         Ok(resp)
     }
 
-    fn cached(&self, start: u64, length: usize) -> Option<Bytes> {
+    fn mem_cached(&self, start: u64, length: usize) -> Option<Bytes> {
         let cache = self.cache.lock().unwrap();
         let (&s, b) = cache.range(..=start).next_back()?;
         let off = (start - s) as usize;
@@ -110,20 +251,50 @@ impl RemoteInner {
         }
     }
 
-    /// Cache-through read of an exact range.
-    fn read_range(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
-        if length == 0 {
-            return Ok(Bytes::new());
-        }
-        if let Some(b) = self.cached(start, length) {
-            return Ok(b);
-        }
-        let b = self.fetch(start, length)?;
+    fn remember(&self, start: u64, b: Bytes) {
         let mut cache = self.cache.lock().unwrap();
         if cache.values().map(Bytes::len).sum::<usize>() + b.len() > CACHE_MAX {
             cache.clear();
         }
-        cache.insert(start, b.clone());
+        cache.insert(start, b);
+    }
+
+    /// Memory first, then disk (promoting the covering blob so header
+    /// walks stay in memory).
+    fn cached(&self, start: u64, length: usize) -> Option<Bytes> {
+        if let Some(b) = self.mem_cached(start, length) {
+            return Some(b);
+        }
+        let (s, blob) = self.disk.as_ref()?.get(start, length)?;
+        self.remember(s, blob.clone());
+        let off = (start - s) as usize;
+        Some(blob.slice(off..off + length))
+    }
+
+    /// Cache-through read of an exact range, single-flighted by start
+    /// offset: a loser of the race waits, then rechecks the cache.
+    fn read_range(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+        loop {
+            if let Some(b) = self.cached(start, length) {
+                return Ok(b);
+            }
+            let mut inflight = self.inflight.lock().unwrap();
+            if inflight.insert(start) {
+                break;
+            }
+            let _wait = self.inflight_done.wait(inflight).unwrap();
+        }
+        let fetched = self.fetch(start, length);
+        self.inflight.lock().unwrap().remove(&start);
+        self.inflight_done.notify_all();
+        let b = fetched?;
+        self.remember(start, b.clone());
+        if let Some(disk) = &self.disk {
+            disk.put(start, &b);
+        }
         Ok(b)
     }
 }
@@ -198,32 +369,65 @@ struct RemoteFile {
 }
 
 fn open_remote(path: &str) -> Result<Arc<RemoteFile>> {
-    static FILES: OnceLock<Mutex<HashMap<String, Arc<RemoteFile>>>> = OnceLock::new();
-    let files = FILES.get_or_init(Default::default);
-    if let Some(f) = files.lock().unwrap().get(path) {
+    type Slot = Arc<Mutex<Option<Arc<RemoteFile>>>>;
+    static FILES: OnceLock<Mutex<HashMap<String, Slot>>> = OnceLock::new();
+    let slot: Slot = {
+        let mut files = FILES.get_or_init(Default::default).lock().unwrap();
+        Arc::clone(files.entry(path.to_string()).or_default())
+    };
+    // Per-path build lock: racing opens of one file build it once,
+    // while different files still open in parallel.
+    let mut slot = slot.lock().unwrap();
+    if let Some(f) = &*slot {
         return Ok(Arc::clone(f));
     }
-    let url = format!("{DATASET_URL}/{path}");
-    // File length via a 1-byte range probe: HEAD on the resolve URL
-    // redirects to a CDN that doesn't always answer HEAD usefully.
-    let resp = http()
-        .get(&url)
-        .header(reqwest::header::RANGE, "bytes=0-0")
-        .send()?
-        .error_for_status()?;
-    let len: u64 = resp
-        .headers()
-        .get(reqwest::header::CONTENT_RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit('/').next())
-        .and_then(|v| v.parse().ok())
-        .with_context(|| format!("no content-range from {url}"))?;
+
+    static REVISION: OnceLock<Option<String>> = OnceLock::new();
+    let revision = REVISION.get_or_init(pinned_revision);
+    let rev = revision.as_deref().unwrap_or("main");
+    let url = format!("{DATASET_BASE}/{rev}/{path}");
+    let disk = revision
+        .as_ref()
+        .and_then(|sha| DiskCache::open(http_cache_root().join(sha).join(path.replace('/', "_"))));
+
+    // File length: persisted beside the blobs, else a 1-byte range
+    // probe (HEAD on the resolve URL redirects to a CDN that doesn't
+    // always answer HEAD usefully).
+    let len_path = disk.as_ref().map(|d| d.dir.join("len"));
+    let cached_len: Option<u64> = len_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok()?.trim().parse().ok());
+    let len = match cached_len {
+        Some(n) => n,
+        None => {
+            let resp = http()
+                .get(&url)
+                .header(reqwest::header::RANGE, "bytes=0-0")
+                .send()?
+                .error_for_status()?;
+            let n: u64 = resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.rsplit('/').next())
+                .and_then(|v| v.parse().ok())
+                .with_context(|| format!("no content-range from {url}"))?;
+            if let Some(p) = &len_path {
+                let _ = std::fs::write(p, n.to_string());
+            }
+            n
+        }
+    };
+
     let remote = Arc::new(Remote {
         inner: Arc::new(RemoteInner {
             client: http().clone(),
             url,
             len,
             cache: Mutex::new(BTreeMap::new()),
+            disk,
+            inflight: Mutex::new(HashSet::new()),
+            inflight_done: Condvar::new(),
         }),
     });
     let meta = ParquetMetaDataReader::new().parse_and_finish(remote.as_ref())?;
@@ -231,10 +435,7 @@ fn open_remote(path: &str) -> Result<Arc<RemoteFile>> {
         remote,
         meta: Arc::new(meta),
     });
-    files
-        .lock()
-        .unwrap()
-        .insert(path.to_string(), Arc::clone(&file));
+    *slot = Some(Arc::clone(&file));
     Ok(file)
 }
 
@@ -625,6 +826,29 @@ mod tests {
         )
         .unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn disk_cache_roundtrip_and_eviction() {
+        let dir = std::env::temp_dir().join(format!("hdx-fatcat-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = DiskCache::open(dir.clone()).unwrap();
+        cache.put(100, &Bytes::from(vec![7u8; 50]));
+        // Covered sub-range comes back sliced from the blob.
+        let (s, b) = cache.get(120, 10).unwrap();
+        assert_eq!((s, b.len()), (100, 50));
+        assert!(cache.get(100, 51).is_none(), "past blob end");
+        assert!(cache.get(99, 1).is_none(), "before blob start");
+        // A fresh open rebuilds the map from the directory listing.
+        let reopened = DiskCache::open(dir.clone()).unwrap();
+        assert!(reopened.get(100, 50).is_some());
+        // Blobs past DISK_MAX evict oldest-first, keeping the rest.
+        let big = Bytes::from(vec![0u8; (DISK_MAX / 2 + 1) as usize]);
+        cache.put(1 << 30, &big);
+        cache.put(2 << 30, &big);
+        assert!(cache.get(100, 50).is_none(), "oldest blob evicted");
+        assert!(cache.get(2 << 30, 8).is_some(), "newest survives");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
