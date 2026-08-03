@@ -503,6 +503,15 @@ async fn online_probe(
 
     let total = probes.len();
     eprintln!("probing {total} matched digests online…");
+    // Probe width: 6 is politeness for third-party APIs. A batch that
+    // only touches fatcat hits our own published dataset on a CDN over
+    // one multiplexed connection — far wider is fine.
+    let fatcat = crate::backends::fatcat::NAME;
+    let width = if probes.values().all(|s| s.iter().all(|&b| b == fatcat)) {
+        32
+    } else {
+        6
+    };
     let done = AtomicUsize::new(0);
     let errors: Mutex<std::collections::BTreeMap<String, usize>> = Mutex::new(Default::default());
     futures::stream::iter(probes.into_iter().map(|(coord, only)| {
@@ -517,11 +526,13 @@ async fn online_probe(
         async move {
             match crate::resolve::resolve(client, &coord, &popts).await {
                 Ok(res) => {
-                    for (backend, _) in res.errors {
+                    for (backend, msg) in res.errors {
+                        // One line per distinct failure mode, not per
+                        // probe: keep the message, it names the cause.
                         *errors
                             .lock()
                             .unwrap()
-                            .entry(backend.to_string())
+                            .entry(format!("{backend}: {msg}"))
                             .or_default() += 1;
                     }
                 }
@@ -535,7 +546,7 @@ async fn online_probe(
             }
         }
     }))
-    .buffer_unordered(6)
+    .buffer_unordered(width)
     .collect::<Vec<()>>()
     .await;
     for (what, n) in errors.lock().unwrap().iter() {
