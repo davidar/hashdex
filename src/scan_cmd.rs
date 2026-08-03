@@ -131,6 +131,16 @@ struct FileResult {
     matched: Vec<String>, // filter names
 }
 
+fn to_fresh(r: &FileResult) -> crate::local_index::FreshEntry {
+    (
+        r.path.to_string_lossy().into_owned(),
+        r.size,
+        r.mtime_ns,
+        r.sha1,
+        r.sha256,
+    )
+}
+
 /// Walk paths, hash every regular file (sha1 + sha256 in one pass), check
 /// membership filters locally. Zero network. This is the personal-NSRL
 /// scan: "which of my files are publicly known bytes."
@@ -206,7 +216,7 @@ pub async fn scan(
         );
     }
 
-    let mut index = if opts.no_index {
+    let index = if opts.no_index {
         None
     } else {
         match LocalIndex::open() {
@@ -245,8 +255,47 @@ pub async fn scan(
         .map(|n| n.get())
         .unwrap_or(4);
     let cached_ref = &cached;
+    let index_cell = Mutex::new(index);
 
     std::thread::scope(|scope| {
+        // Incremental persistence: a killed scan keeps the hashing it
+        // already paid for. Fresh hashes flush in batches as workers
+        // produce them; stale-path deletion stays at the very end —
+        // only a COMPLETE walk is allowed to delete.
+        scope.spawn(|| {
+            let mut flushed_upto = 0usize;
+            let mut last_flush = std::time::Instant::now();
+            loop {
+                std::thread::park_timeout(std::time::Duration::from_millis(500));
+                let finished = done.load(Ordering::Relaxed) >= total;
+                let pending = results.lock().unwrap().len() - flushed_upto;
+                if pending > 0
+                    && (finished || pending >= 2000 || last_flush.elapsed().as_secs() >= 5)
+                {
+                    let fresh: Vec<crate::local_index::FreshEntry> = {
+                        let res = results.lock().unwrap();
+                        let batch = res[flushed_upto..]
+                            .iter()
+                            .filter(|r| !r.from_index)
+                            .map(to_fresh)
+                            .collect();
+                        flushed_upto = res.len();
+                        batch
+                    };
+                    last_flush = std::time::Instant::now();
+                    if !fresh.is_empty() {
+                        if let Some(ix) = index_cell.lock().unwrap().as_mut() {
+                            if let Err(e) = ix.commit_scan(&fresh, &[]) {
+                                eprintln!("warning: incremental index flush failed: {e}");
+                            }
+                        }
+                    }
+                }
+                if finished {
+                    break;
+                }
+            }
+        });
         for _ in 0..threads {
             scope.spawn(|| {
                 let mut buf = vec![0u8; 1 << 20];
@@ -317,21 +366,15 @@ pub async fn scan(
     let skipped = skipped.into_inner().unwrap();
     let unreadable = unreadable.into_inner().unwrap();
 
-    // Persist: fresh hashes in, vanished paths out.
+    // Persist: fresh hashes in (idempotent over the incremental
+    // flushes), vanished paths out.
+    let mut index = index_cell.into_inner().unwrap();
     let reused = results.iter().filter(|r| r.from_index).count();
     if let Some(ix) = &mut index {
         let fresh: Vec<crate::local_index::FreshEntry> = results
             .iter()
             .filter(|r| !r.from_index)
-            .map(|r| {
-                (
-                    r.path.to_string_lossy().into_owned(),
-                    r.size,
-                    r.mtime_ns,
-                    r.sha1,
-                    r.sha256,
-                )
-            })
+            .map(to_fresh)
             .collect();
         let seen: HashSet<String> = results
             .iter()
