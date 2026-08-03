@@ -4,7 +4,11 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use parquet::column::reader::{get_typed_column_reader, ColumnReaderImpl};
 use parquet::data_type::{ByteArrayType, DataType, Int32Type, Int64Type};
-use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData};
+use parquet::file::metadata::{
+    PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
+};
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
+use parquet::file::page_index::offset_index::PageLocation;
 use parquet::file::reader::{ChunkReader, Length};
 use parquet::file::serialized_reader::SerializedPageReader;
 use parquet::file::statistics::Statistics;
@@ -430,7 +434,11 @@ fn open_remote(path: &str) -> Result<Arc<RemoteFile>> {
             inflight_done: Condvar::new(),
         }),
     });
-    let meta = ParquetMetaDataReader::new().parse_and_finish(remote.as_ref())?;
+    // Optional, not Required: pre-page-index revisions still work via
+    // the whole-chunk path.
+    let meta = ParquetMetaDataReader::new()
+        .with_page_index_policy(PageIndexPolicy::Optional)
+        .parse_and_finish(remote.as_ref())?;
     let file = Arc::new(RemoteFile {
         remote,
         meta: Arc::new(meta),
@@ -467,16 +475,31 @@ fn candidate_row_groups(meta: &ParquetMetaData, col: usize, key: &[u8]) -> Vec<u
         .collect()
 }
 
+/// Page locations for one column chunk, when the footer carries an
+/// offset index. With locations the page reader seeks straight to a
+/// page and skips others without any read; without, skipping means
+/// walking page headers.
+fn page_locations(meta: &ParquetMetaData, rgi: usize, col: usize) -> Option<Vec<PageLocation>> {
+    Some(
+        meta.offset_index()?
+            .get(rgi)?
+            .get(col)?
+            .page_locations()
+            .clone(),
+    )
+}
+
 fn typed_reader<R: ChunkReader + 'static, T: DataType>(
     reader: &Arc<R>,
     rg: &RowGroupMetaData,
     col: usize,
+    locations: Option<Vec<PageLocation>>,
 ) -> Result<ColumnReaderImpl<T>> {
     let pages = SerializedPageReader::new(
         Arc::clone(reader),
         rg.column(col),
         rg.num_rows() as usize,
-        None,
+        locations,
     )?;
     Ok(get_typed_column_reader::<T>(
         parquet::column::reader::get_column_reader(meta_column(rg, col), Box::new(pages)),
@@ -490,23 +513,60 @@ fn meta_column(rg: &RowGroupMetaData, col: usize) -> parquet::schema::types::Col
 /// Scan the sorted key column of one row group for `key`: returns the
 /// first matching record index and how many match (counting continues
 /// past `cap` so "and N more" stays honest, but stops at the group end
-/// or first greater value). The whole key chunk is fetched up front in
-/// one ranged request — it gets decoded anyway.
+/// or first greater value).
+///
+/// With a page index, per-page min/max route the scan straight to the
+/// first admitting page (or prove absence with no data read at all).
+/// Without one, the whole key chunk is fetched up front in one ranged
+/// request — it gets decoded anyway.
 fn scan_key_column<R: ChunkReader + 'static>(
     reader: &Arc<R>,
-    rg: &RowGroupMetaData,
+    meta: &ParquetMetaData,
+    rgi: usize,
     col: usize,
     key: &[u8],
 ) -> Result<Option<(usize, usize)>> {
-    let (start, len) = rg.column(col).byte_range();
-    let _ = reader.get_bytes(start, len as usize)?; // warm the range cache
-    let mut r = typed_reader::<R, ByteArrayType>(reader, rg, col)?;
+    let rg = meta.row_group(rgi);
+    let locations = page_locations(meta, rgi, col);
+    let column_index = meta
+        .column_index()
+        .and_then(|c| c.get(rgi)?.get(col))
+        .and_then(|ix| match ix {
+            ColumnIndexMetaData::BYTE_ARRAY(ix) => Some(ix),
+            _ => None,
+        });
+    let skip = match (&locations, column_index) {
+        (Some(locs), Some(ix)) => {
+            // Keys are globally sorted, so admitting pages are
+            // contiguous; land on the first.
+            let admits = (0..locs.len()).position(|i| {
+                matches!((ix.min_value(i), ix.max_value(i)),
+                    (Some(mn), Some(mx)) if mn <= key && key <= mx)
+            });
+            match admits {
+                Some(page) => locs[page].first_row_index as usize,
+                None => return Ok(None),
+            }
+        }
+        _ => {
+            let (start, len) = rg.column(col).byte_range();
+            let _ = reader.get_bytes(start, len as usize)?; // warm the range cache
+            0
+        }
+    };
+    let mut r = typed_reader::<R, ByteArrayType>(reader, rg, col, locations)?;
+    if skip > 0 {
+        r.skip_records(skip)?;
+    }
     let max_def = meta_column(rg, col).max_def_level();
-    let (mut record, mut first, mut count) = (0usize, None, 0usize);
+    let (mut record, mut first, mut count) = (skip, None, 0usize);
     loop {
         let mut vals = Vec::new();
         let mut defs: Vec<i16> = Vec::new();
-        let (records, _, _) = r.read_records(4096, Some(&mut defs), None, &mut vals)?;
+        // Modest batches: the reader only fetches pages it must, so a
+        // small batch keeps the early exit from dragging in pages past
+        // the match (in-page state carries across calls).
+        let (records, _, _) = r.read_records(256, Some(&mut defs), None, &mut vals)?;
         if records == 0 {
             break;
         }
@@ -545,16 +605,19 @@ enum ColValues {
 /// page-skipping everything before it.
 fn read_column<R: ChunkReader + 'static>(
     reader: &Arc<R>,
-    rg: &RowGroupMetaData,
+    meta: &ParquetMetaData,
+    rgi: usize,
     col: usize,
     skip: usize,
     take: usize,
 ) -> Result<ColValues> {
     use parquet::basic::Type;
+    let rg = meta.row_group(rgi);
+    let locations = page_locations(meta, rgi, col);
     let max_def = meta_column(rg, col).max_def_level();
     macro_rules! read {
         ($t:ty, $conv:expr) => {{
-            let mut r = typed_reader::<R, $t>(reader, rg, col)?;
+            let mut r = typed_reader::<R, $t>(reader, rg, col, locations.clone())?;
             if skip > 0 {
                 r.skip_records(skip)?;
             }
@@ -611,7 +674,7 @@ fn find_rows<R: ChunkReader + 'static>(
     let mut total = 0usize;
     for rgi in candidate_row_groups(meta, kidx, key.as_bytes()) {
         let rg = meta.row_group(rgi);
-        let Some((first, count)) = scan_key_column(reader, rg, kidx, key.as_bytes())? else {
+        let Some((first, count)) = scan_key_column(reader, meta, rgi, kidx, key.as_bytes())? else {
             continue;
         };
         total += count;
@@ -628,11 +691,15 @@ fn find_rows<R: ChunkReader + 'static>(
                 .map(|name| {
                     s.spawn(move || {
                         let cidx = column_index(meta, name)?;
-                        let (start, len) = rg.column(cidx).byte_range();
-                        if len <= PREFETCH_MAX {
-                            let _ = reader.get_bytes(start, len as usize)?;
+                        // Whole-chunk prefetch only pays off when there
+                        // is no offset index to seek by.
+                        if meta.offset_index().is_none() {
+                            let (start, len) = rg.column(cidx).byte_range();
+                            if len <= PREFETCH_MAX {
+                                let _ = reader.get_bytes(start, len as usize)?;
+                            }
                         }
-                        read_column(reader, rg, cidx, first, take)
+                        read_column(reader, meta, rgi, cidx, first, take)
                     })
                 })
                 .collect();
@@ -772,6 +839,7 @@ fn claim(row: &Value) -> Claim {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Bytes, not File: File's ChunkReader dups the fd, whose shared
     // seek position races under the parallel column reads.
@@ -782,6 +850,148 @@ mod tests {
         let bytes = Bytes::from(std::fs::read(path).ok()?);
         let meta = ParquetMetaDataReader::new().parse_and_finish(&bytes).ok()?;
         Some((Arc::new(bytes), Arc::new(meta)))
+    }
+
+    /// In-memory reader that counts every data byte handed out, so
+    /// tests can assert what the page index saves us from reading.
+    struct Counting {
+        inner: Bytes,
+        read: Arc<AtomicUsize>,
+    }
+
+    struct CountingRead {
+        inner: Bytes,
+        read: Arc<AtomicUsize>,
+    }
+
+    impl Read for CountingRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.inner.split_to(n));
+            self.read.fetch_add(n, Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+
+    impl Length for Counting {
+        fn len(&self) -> u64 {
+            self.inner.len() as u64
+        }
+    }
+
+    impl ChunkReader for Counting {
+        type T = CountingRead;
+        fn get_read(&self, start: u64) -> parquet::errors::Result<CountingRead> {
+            Ok(CountingRead {
+                inner: self.inner.slice(start as usize..),
+                read: Arc::clone(&self.read),
+            })
+        }
+        fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+            self.read.fetch_add(length, Ordering::Relaxed);
+            Ok(self.inner.slice(start as usize..start as usize + length))
+        }
+    }
+
+    /// The page-indexed fixtures (tools/make_fatcat_fixtures.py). The
+    /// footer MUST carry the index — Required, not Optional — so a
+    /// regressed generator fails loudly instead of silently testing
+    /// the fallback path twice.
+    fn fixture_pi(name: &str) -> Option<(Arc<Counting>, Arc<AtomicUsize>, Arc<ParquetMetaData>)> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/fatcat")
+            .join(name);
+        let bytes = Bytes::from(std::fs::read(path).ok()?);
+        let meta = ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Required)
+            .parse_and_finish(&bytes)
+            .expect("page-indexed fixture must carry offset+column indexes");
+        let read = Arc::new(AtomicUsize::new(0));
+        let counting = Arc::new(Counting {
+            inner: bytes,
+            read: Arc::clone(&read),
+        });
+        Some((counting, read, Arc::new(meta)))
+    }
+
+    /// key(i) from tools/make_fatcat_fixtures.py.
+    fn key(i: u64) -> String {
+        format!("{:064x}", i * 16 + 8)
+    }
+
+    /// A key strictly between page 0's max and page 1's min in the
+    /// first row group: admitted by row-group stats, by no page.
+    fn page_gap_key(meta: &ParquetMetaData, kidx: usize) -> String {
+        let Some(ColumnIndexMetaData::BYTE_ARRAY(ix)) = meta.column_index().unwrap()[0].get(kidx)
+        else {
+            panic!("no byte-array column index on the key column")
+        };
+        let max0 = std::str::from_utf8(ix.max_value(0).unwrap()).unwrap();
+        let tail = u64::from_str_radix(&max0[max0.len() - 16..], 16).unwrap();
+        format!("{:064x}", tail + 8)
+    }
+
+    #[test]
+    fn page_index_point_lookup() {
+        let Some((file, read, meta)) = fixture_pi("files_pi.parquet") else {
+            return; // fixture not generated on this machine
+        };
+
+        // Straddle key: two releases across the rg0/rg1 boundary.
+        let k = key(1999);
+        let (rows, total) = find_rows(&file, &meta, "sha256", DATA_COLS, &k, MAX_ROWS).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(rows[0]["title"].as_str(), Some("Straddle One"));
+        assert_eq!(rows[1]["doi"].as_str(), Some("10.1234/straddle-two"));
+
+        // The point of the page index: a small fraction of the file
+        // read, not whole column chunks.
+        let bytes_read = read.load(Ordering::Relaxed);
+        let total_bytes: i64 = meta
+            .row_groups()
+            .iter()
+            .map(|rg| rg.compressed_size())
+            .sum();
+        assert!(
+            (bytes_read as i64) * 5 < total_bytes,
+            "read {bytes_read} of {total_bytes} compressed bytes"
+        );
+
+        // One key, 41 releases spanning several pages: honest count.
+        let (rows, total) =
+            find_rows(&file, &meta, "sha256", DATA_COLS, &key(3999), MAX_ROWS).unwrap();
+        assert_eq!(total, 41);
+        assert_eq!(rows[40]["title"].as_str(), Some("Many Releases 40"));
+
+        // Admitted by a page but absent: settled by reading pages.
+        let absent = format!("{:064x}", 16u64); // between key(0) and key(1)
+        let (rows, total) =
+            find_rows(&file, &meta, "sha256", DATA_COLS, &absent, MAX_ROWS).unwrap();
+        assert!(rows.is_empty() && total == 0);
+
+        // Falling between two pages: absence proven from the footer
+        // alone — zero data bytes fetched.
+        let kidx = column_index(&meta, "sha256").unwrap();
+        let gap = page_gap_key(&meta, kidx);
+        let before = read.load(Ordering::Relaxed);
+        let (rows, total) = find_rows(&file, &meta, "sha256", DATA_COLS, &gap, MAX_ROWS).unwrap();
+        assert!(rows.is_empty() && total == 0);
+        assert_eq!(
+            read.load(Ordering::Relaxed),
+            before,
+            "between-pages absence must not read data"
+        );
+    }
+
+    #[test]
+    fn page_index_weak_digest_map() {
+        let Some((file, _read, meta)) = fixture_pi("sha1_map_pi.parquet") else {
+            return;
+        };
+        let sha1 = format!("{:040x}", 1999);
+        let (rows, _) = find_rows(&file, &meta, "sha1", &["sha256"], &sha1, 8).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["sha256"].as_str(), Some(key(1999).as_str()));
     }
 
     #[test]
