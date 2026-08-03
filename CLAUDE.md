@@ -26,7 +26,8 @@ hdx filters fetch     # install CIRCL bloom (~1 GB) into the cache dir
 ```
 
 Env: `SWH_TOKEN` (raises SWH quota 120→1200/h), `VT_API_KEY` (enables
-the VirusTotal backend). Cache + filters: `~/.cache/hashdex/`.
+the VirusTotal backend), `HF_TOKEN` (raises Hub rate limits for the
+fatcat backend's range reads). Cache + filters: `~/.cache/hashdex/`.
 
 ## Rules that must not be violated (from DESIGN.md)
 

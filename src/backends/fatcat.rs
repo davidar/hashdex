@@ -117,8 +117,7 @@ fn pinned_revision() -> Option<String> {
         }
     }
     let fetched: Result<String> = (|| {
-        let v: Value = http()
-            .get(REVISION_API)
+        let v: Value = maybe_auth(http().get(REVISION_API), REVISION_API)
             .send()?
             .error_for_status()?
             .json()?;
@@ -229,35 +228,87 @@ fn http() -> &'static reqwest::blocking::Client {
     })
 }
 
+/// HF_TOKEN (optional, like SWH_TOKEN) raises the Hub's anonymous
+/// rate limits. Attached only to huggingface.co itself — never to the
+/// CAS hosts its redirects land on.
+fn maybe_auth(
+    req: reqwest::blocking::RequestBuilder,
+    url: &str,
+) -> reqwest::blocking::RequestBuilder {
+    match std::env::var("HF_TOKEN") {
+        Ok(t) if !t.is_empty() && url.starts_with("https://huggingface.co/") => req.bearer_auth(t),
+        _ => req,
+    }
+}
+
 /// Ranged GET remembering where the redirect landed. Standalone so
 /// open_remote's suffix probe shares it before RemoteInner exists.
+///
+/// 429s back off (honoring Retry-After, bounded) and retry the SAME
+/// target — clearing the memoized CAS URL on them would stampede the
+/// rate-limited resolve host, which is how a burst of first-contact
+/// probes once turned one 429 into a per-file cascade. Other direct-
+/// target failures (expired signature, dropped connection) fall back
+/// to the resolve URL once.
 fn ranged_get(
     client: &reqwest::blocking::Client,
     url: &str,
     effective: &Mutex<Option<String>>,
     range: &str,
 ) -> reqwest::Result<reqwest::blocking::Response> {
-    let attempt = |u: &str| {
-        client
-            .get(u)
+    let mut fell_back = false;
+    let mut attempts = 0u32;
+    loop {
+        let direct = (!fell_back)
+            .then(|| effective.lock().unwrap().clone())
+            .flatten();
+        let target = direct.as_deref().unwrap_or(url);
+        attempts += 1;
+        match maybe_auth(client.get(target), target)
             .header(reqwest::header::RANGE, range)
             .send()
-            .and_then(|r| r.error_for_status())
-    };
-    let direct = effective.lock().unwrap().clone();
-    let resp = match direct {
-        // Signed CAS URLs expire; fall back to the resolve URL once.
-        Some(u) => attempt(&u).or_else(|_| {
-            *effective.lock().unwrap() = None;
-            attempt(url)
-        }),
-        None => attempt(url),
-    }?;
-    let landed = resp.url().as_str();
-    if landed != url {
-        *effective.lock().unwrap() = Some(landed.to_string());
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let landed = resp.url().as_str();
+                if landed != url {
+                    *effective.lock().unwrap() = Some(landed.to_string());
+                }
+                return Ok(resp);
+            }
+            Ok(resp)
+                if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && attempts <= 5 =>
+            {
+                // The Hub's anonymous window outlasts a polite pause;
+                // short caps just burn attempts inside it.
+                let wait = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+                    .unwrap_or(1 << attempts.min(5))
+                    .clamp(2, 30);
+                std::thread::sleep(Duration::from_secs(wait));
+            }
+            Ok(resp) => {
+                if target != url {
+                    *effective.lock().unwrap() = None;
+                    fell_back = true;
+                    continue;
+                }
+                return resp.error_for_status();
+            }
+            Err(e) => {
+                if target != url {
+                    *effective.lock().unwrap() = None;
+                    fell_back = true;
+                    continue;
+                }
+                if attempts > 4 {
+                    return Err(e);
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
     }
-    Ok(resp)
 }
 
 impl RemoteInner {
@@ -801,6 +852,42 @@ const DATA_COLS: &[&str] = &[
 
 fn data_path(sha256: &str) -> String {
     format!("data/files-{}.parquet", &sha256[..1])
+}
+
+fn hex(coord: &Coord) -> String {
+    coord.digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Open every remote file a probe batch will certainly need, in
+/// parallel and outside any per-probe timeout. Cold opens (an 8 MB
+/// suffix request each) are the bulk of a first-contact batch's
+/// work; inside probe budgets they starved probes queued behind them
+/// (241/596 timed out on the first full-Dropbox run). Weak digests
+/// fan out to data files only known after the map lookup — those
+/// still open lazily, one single-flighted open per file.
+pub fn preopen(coords: &[Coord]) {
+    let mut paths = HashSet::new();
+    for c in coords {
+        match c.scheme {
+            Scheme::Sha256 => {
+                paths.insert(data_path(&hex(c)));
+            }
+            Scheme::Sha1 => {
+                paths.insert("maps/sha1.parquet".to_string());
+            }
+            Scheme::Md5 => {
+                paths.insert("maps/md5.parquet".to_string());
+            }
+            _ => {}
+        }
+    }
+    std::thread::scope(|s| {
+        for p in &paths {
+            s.spawn(move || {
+                let _ = open_remote(p); // probes retry and report errors
+            });
+        }
+    });
 }
 
 fn blocking_lookup(coord: &Coord) -> Result<Option<Finding>> {

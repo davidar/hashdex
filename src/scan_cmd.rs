@@ -512,6 +512,17 @@ async fn online_probe(
     } else {
         6
     };
+    // Cold remote-file opens run before the probe stream, outside any
+    // per-probe timeout: a first-contact burst must not eat probe
+    // budgets on suffix fetches.
+    let warm: Vec<crate::coord::Coord> = probes
+        .iter()
+        .filter(|(_, set)| set.contains(fatcat))
+        .map(|(coord, _)| coord.clone())
+        .collect();
+    if !warm.is_empty() {
+        let _ = tokio::task::spawn_blocking(move || crate::backends::fatcat::preopen(&warm)).await;
+    }
     let done = AtomicUsize::new(0);
     let errors: Mutex<std::collections::BTreeMap<String, usize>> = Mutex::new(Default::default());
     futures::stream::iter(probes.into_iter().map(|(coord, only)| {
@@ -519,7 +530,9 @@ async fn online_probe(
             refresh: ropts.refresh,
             no_cache: ropts.no_cache,
             offline: false,
-            timeout_secs: ropts.timeout_secs,
+            // Wide fatcat batches sit in 429-backoff and stream queues
+            // that a single-lookup budget doesn't anticipate.
+            timeout_secs: ropts.timeout_secs.max(if width > 6 { 120 } else { 0 }),
             only: Some(only),
         };
         let (done, errors) = (&done, &errors);
