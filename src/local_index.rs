@@ -52,9 +52,17 @@ impl LocalIndex {
         // Scan roots canonicalize before indexing now; rows recorded
         // under relative spellings by older builds are unreachable
         // (never matched, never aged out) and only bloat locate.
-        let orphaned = conn.execute("DELETE FROM local_files WHERE path NOT LIKE '/%'", [])?;
+        // Announce BEFORE the slow parts: the delete walks the whole
+        // table and the vacuum rewrites the file.
+        let orphaned: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM local_files WHERE path NOT LIKE '/%'",
+            [],
+            |r| r.get(0),
+        )?;
         if orphaned > 0 {
-            eprintln!("local index: purged {orphaned} relative-path entries; compacting…");
+            eprintln!("local index: purging {orphaned} relative-path entries (one-time)…");
+            conn.execute("DELETE FROM local_files WHERE path NOT LIKE '/%'", [])?;
+            eprintln!("local index: compacting…");
             conn.execute_batch("VACUUM")?;
         }
         Ok(LocalIndex { conn })

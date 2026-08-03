@@ -159,6 +159,7 @@ pub async fn scan(
     // it would pollute the known/unknown metrics with our own artifacts —
     // unless a scan root points inside it explicitly.
     let own_cache = crate::cache::cache_dir();
+    let ticker = &Ticker::new();
     let mut excluded_own_cache = false;
     let mut files = Vec::new();
     // Unreadable paths (permission denied, vanished mid-scan, …) are
@@ -183,12 +184,20 @@ pub async fn scan(
             });
         for entry in walker {
             match entry {
-                Ok(e) if e.file_type().is_file() => files.push(e.into_path()),
+                Ok(e) if e.file_type().is_file() => {
+                    files.push(e.into_path());
+                    // The walk itself can take minutes on a big tree;
+                    // it must not look like a hang.
+                    ticker.update(500_000, files.len(), || {
+                        format!("walking… {} files found", files.len())
+                    });
+                }
                 Ok(_) => {}
                 Err(e) => unreadable.push(e.to_string()),
             }
         }
     }
+    ticker.clear();
     let total = files.len();
     if excluded_own_cache {
         eprintln!(
@@ -225,7 +234,6 @@ pub async fn scan(
     probe_order.sort_by_key(|f| f.bytes);
     let probe_order = &probe_order;
 
-    let ticker = &Ticker::new();
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let big_skipped_files = AtomicUsize::new(0);
