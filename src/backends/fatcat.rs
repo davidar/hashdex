@@ -61,6 +61,10 @@ pub fn supports(s: Scheme) -> bool {
 struct RemoteInner {
     client: reqwest::blocking::Client,
     url: String,
+    /// Where the resolve URL's redirect landed (a signed CAS URL):
+    /// later requests go direct and skip the redirect round trip,
+    /// falling back to `url` once when the signature expires.
+    effective: Mutex<Option<String>>,
     len: u64,
     /// Fetched ranges keyed by start offset. Ranges may overlap; a
     /// lookup is served by any single cached range that covers it.
@@ -80,6 +84,9 @@ struct RemoteInner {
 /// Per-file cap on cached range bytes (17 data files + 2 maps can be
 /// open at once in a scan).
 const CACHE_MAX: usize = 96 << 20;
+/// Cold-open speculative suffix: must cover magic + footer (~150 KB)
+/// + page-index region (~5 MB on the data files) in one request.
+const SUFFIX: u64 = 8 << 20;
 /// Per-file cap on persisted range bytes; oldest blobs go first.
 const DISK_MAX: u64 = 64 << 20;
 
@@ -222,19 +229,50 @@ fn http() -> &'static reqwest::blocking::Client {
     })
 }
 
+/// Ranged GET remembering where the redirect landed. Standalone so
+/// open_remote's suffix probe shares it before RemoteInner exists.
+fn ranged_get(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    effective: &Mutex<Option<String>>,
+    range: &str,
+) -> reqwest::Result<reqwest::blocking::Response> {
+    let attempt = |u: &str| {
+        client
+            .get(u)
+            .header(reqwest::header::RANGE, range)
+            .send()
+            .and_then(|r| r.error_for_status())
+    };
+    let direct = effective.lock().unwrap().clone();
+    let resp = match direct {
+        // Signed CAS URLs expire; fall back to the resolve URL once.
+        Some(u) => attempt(&u).or_else(|_| {
+            *effective.lock().unwrap() = None;
+            attempt(url)
+        }),
+        None => attempt(url),
+    }?;
+    let landed = resp.url().as_str();
+    if landed != url {
+        *effective.lock().unwrap() = Some(landed.to_string());
+    }
+    Ok(resp)
+}
+
 impl RemoteInner {
     fn fetch(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
         let end = start + length as u64 - 1;
-        let resp = self
-            .client
-            .get(&self.url)
-            .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
-            .send()
-            .and_then(|r| r.error_for_status())
-            .and_then(|r| r.bytes())
-            .map_err(|e| {
-                parquet::errors::ParquetError::External(format!("{}: {e}", self.url).into())
-            })?;
+        let resp = ranged_get(
+            &self.client,
+            &self.url,
+            &self.effective,
+            &format!("bytes={start}-{end}"),
+        )
+        .and_then(|r| r.bytes())
+        .map_err(|e| {
+            parquet::errors::ParquetError::External(format!("{}: {e}", self.url).into())
+        })?;
         if resp.len() < length {
             return Err(parquet::errors::ParquetError::EOF(format!(
                 "short range read from {}",
@@ -394,28 +432,42 @@ fn open_remote(path: &str) -> Result<Arc<RemoteFile>> {
         .as_ref()
         .and_then(|sha| DiskCache::open(http_cache_root().join(sha).join(path.replace('/', "_"))));
 
-    // File length: persisted beside the blobs, else a 1-byte range
-    // probe (HEAD on the resolve URL redirects to a CDN that doesn't
-    // always answer HEAD usefully).
+    // File length: persisted beside the blobs (the disk cache then
+    // already holds the footer region from the first open). On a cold
+    // open, ONE speculative suffix request answers everything: its
+    // Content-Range carries the file length, and the last SUFFIX bytes
+    // cover magic + footer + the whole page-index region, so the
+    // metadata parse below does no further requests. (HEAD is useless
+    // here — the resolve redirect's CDN doesn't answer it reliably.)
+    let effective = Mutex::new(None);
     let len_path = disk.as_ref().map(|d| d.dir.join("len"));
     let cached_len: Option<u64> = len_path
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok()?.trim().parse().ok());
+    let mut suffix: Option<(u64, Bytes)> = None;
     let len = match cached_len {
         Some(n) => n,
         None => {
-            let resp = http()
-                .get(&url)
-                .header(reqwest::header::RANGE, "bytes=0-0")
-                .send()?
-                .error_for_status()?;
-            let n: u64 = resp
+            let resp = ranged_get(http(), &url, &effective, &format!("bytes=-{SUFFIX}"))?;
+            let content_range = resp
                 .headers()
                 .get(reqwest::header::CONTENT_RANGE)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.rsplit('/').next())
-                .and_then(|v| v.parse().ok())
-                .with_context(|| format!("no content-range from {url}"))?;
+                .map(str::to_string);
+            let body = resp.bytes()?;
+            // "bytes <start>-<end>/<total>"; a file smaller than
+            // SUFFIX arrives whole with start 0.
+            let (start, n) = match content_range
+                .as_deref()
+                .and_then(|v| v.strip_prefix("bytes "))
+                .and_then(|v| v.split_once('/'))
+                .and_then(|(range, total)| {
+                    Some((range.split_once('-')?.0.parse().ok()?, total.parse().ok()?))
+                }) {
+                Some((s, t)) => (s, t),
+                None => (0, body.len() as u64), // 200: served whole
+            };
+            suffix = Some((start, body));
             if let Some(p) = &len_path {
                 let _ = std::fs::write(p, n.to_string());
             }
@@ -427,6 +479,7 @@ fn open_remote(path: &str) -> Result<Arc<RemoteFile>> {
         inner: Arc::new(RemoteInner {
             client: http().clone(),
             url,
+            effective,
             len,
             cache: Mutex::new(BTreeMap::new()),
             disk,
@@ -434,6 +487,12 @@ fn open_remote(path: &str) -> Result<Arc<RemoteFile>> {
             inflight_done: Condvar::new(),
         }),
     });
+    if let Some((start, body)) = suffix {
+        if let Some(d) = &remote.inner.disk {
+            d.put(start, &body);
+        }
+        remote.inner.remember(start, body);
+    }
     // Optional, not Required: pre-page-index revisions still work via
     // the whole-chunk path.
     let meta = ParquetMetaDataReader::new()
