@@ -236,6 +236,7 @@ pub async fn scan(
 
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
+    let hashed_fresh = AtomicUsize::new(0);
     let big_skipped_files = AtomicUsize::new(0);
     let results: Mutex<Vec<FileResult>> = Mutex::new(Vec::with_capacity(total));
     let skipped: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -256,6 +257,9 @@ pub async fn scan(
                     }
                     match examine(&files[i], cached_ref, opts.rehash, &mut buf) {
                         Ok(Some(mut r)) => {
+                            if !r.from_index {
+                                hashed_fresh.fetch_add(1, Ordering::Relaxed);
+                            }
                             let sha1_hex = hex_upper(&r.sha1);
                             let sha256_hex = hex_lower(&r.sha256);
                             let mut skipped_big = false;
@@ -294,7 +298,14 @@ pub async fn scan(
                             .push(format!("{}: {e}", files[i].display())),
                     }
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    ticker.update(100_000, d, || format!("hashing… {d}/{total} files"));
+                    // Most files are index hits (stat + compare), not
+                    // hashing — the label must not claim otherwise.
+                    ticker.update(100_000, d, || {
+                        format!(
+                            "checking… {d}/{total} files ({} hashed fresh)",
+                            hashed_fresh.load(Ordering::Relaxed)
+                        )
+                    });
                 }
             });
         }
