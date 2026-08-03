@@ -145,6 +145,15 @@ pub async fn scan(
     client: &reqwest::Client,
     ropts: &crate::resolve::Options,
 ) -> Result<()> {
+    // Canonical roots first: the local index keys on the literal path
+    // string, so `scan .` and `scan /same/dir` must agree on spelling
+    // or every rescan re-hashes and local.db accretes parallel trees.
+    let paths: Vec<PathBuf> = paths
+        .iter()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+        .collect();
+    let paths = &paths;
+
     // Collect the file list first so workers can chew through it by index.
     // hdx's own cache (dumps, extracts, filters, local.db) is excluded —
     // it would pollute the known/unknown metrics with our own artifacts —

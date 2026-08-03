@@ -49,6 +49,14 @@ impl LocalIndex {
             CREATE INDEX IF NOT EXISTS local_files_sha1 ON local_files(sha1);
             CREATE INDEX IF NOT EXISTS local_files_sha256 ON local_files(sha256);",
         )?;
+        // Scan roots canonicalize before indexing now; rows recorded
+        // under relative spellings by older builds are unreachable
+        // (never matched, never aged out) and only bloat locate.
+        let orphaned = conn.execute("DELETE FROM local_files WHERE path NOT LIKE '/%'", [])?;
+        if orphaned > 0 {
+            eprintln!("local index: purged {orphaned} relative-path entries; compacting…");
+            conn.execute_batch("VACUUM")?;
+        }
         Ok(LocalIndex { conn })
     }
 

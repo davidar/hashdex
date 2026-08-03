@@ -4,7 +4,7 @@
 //! own XDG_CACHE_HOME so nothing touches the real ~/.cache/hashdex and
 //! tests can run in parallel.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 // Digests of the bytes "abc" (verified against python hashlib / git).
@@ -58,6 +58,17 @@ impl TestEnv {
     fn hdx(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_hdx"))
             .args(args)
+            .env("XDG_CACHE_HOME", self.root.join("cache"))
+            .output()
+            .expect("failed to run hdx")
+    }
+
+    /// Like hdx(), but run from a working directory — for relative-path
+    /// invocations.
+    fn hdx_in(&self, cwd: &Path, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_hdx"))
+            .args(args)
+            .current_dir(cwd)
             .env("XDG_CACHE_HOME", self.root.join("cache"))
             .output()
             .expect("failed to run hdx")
@@ -238,6 +249,17 @@ fn build_scan_locate_lifecycle() {
         summary["known"], 1,
         "index reuse must not lose filter matches"
     );
+
+    // A RELATIVE spelling of the same root must reuse the same index
+    // entries — roots canonicalize before keying, so `scan .` and
+    // `scan /abs/path` are one tree, not two.
+    let out = env.hdx_in(&work, &["scan", ".", "--json"]);
+    let summary = scan_summary(&out);
+    assert_eq!(
+        summary["hashed"], 0,
+        "relative respelling rehashed: {summary}"
+    );
+    assert_eq!(summary["from_index"], summary["files"]);
 
     // --rehash bypasses the index.
     let out = env.hdx(&["scan", work.to_str().unwrap(), "--json", "--rehash"]);
