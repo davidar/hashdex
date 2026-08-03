@@ -436,14 +436,37 @@ fn weak_digest_ambiguity_is_honest() {
     assert!(!stdout(&out).contains("consistent with"));
 }
 
+// Digests of b"the quick brown fox jumps over the lazy dog\n" (44
+// bytes — content must exceed the sub-digest identity floor).
+const FOX_MD5: &str = "1e280e1713df124d35709cf6138d9f91";
+const FOX_SHA1: &str = "5d2781d78fa5a97b7bafa849fe933dfc9dc93eba";
+const FOX_SHA256: &str = "1153a4080f1fcb04425aa0b841c2b14606fe6df25d9076d2a1face2d5af57129";
+// Digests of b"\n": the ubiquitous single-newline file, 1 byte —
+// genuinely present in fatcat via a botched deposit.
+const NL_MD5: &str = "68b329da9893e34099c7d8ad5cb9c940";
+const NL_SHA1: &str = "adc83b19e793491b1c6ea0fd8b46cd9f32e592fc";
+const NL_SHA256: &str = "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b";
+
 /// Scan resolves by default now: attributed files list themselves with
 /// a compact claim line, and (with no network-mapped filters installed)
-/// nothing touches the network.
+/// nothing touches the network. Files smaller than a sha256 digest are
+/// never attributed — a digest can't identify content shorter than
+/// itself, however many corpora register it.
 #[test]
 fn scan_resolves_by_default() {
     let env = TestEnv::new("scanresolve");
-    build_fatcat_index(&env, &[(ABC_SHA1, ABC_SHA256, ABC_MD5)]);
-    env.write("paper.pdf", b"abc");
+    build_fatcat_index(
+        &env,
+        &[
+            (FOX_SHA1, FOX_SHA256, FOX_MD5),
+            (NL_SHA1, NL_SHA256, NL_MD5),
+        ],
+    );
+    env.write(
+        "paper.pdf",
+        b"the quick brown fox jumps over the lazy dog\n",
+    );
+    env.write("__init__.py", b"\n"); // sub-digest size: membership yes, identity no
     let out = env.hdx(&["scan", env.work().to_str().unwrap(), "--json"]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let text = stdout(&out);
@@ -458,10 +481,17 @@ fn scan_resolves_by_default() {
     assert_eq!(summary["attributed"], 1);
 
     // Text mode: one compact claim line per attributed file by default.
+    // The newline file, though indexed under a real release, must not
+    // appear — sub-digest content is unattributable.
     let out = env.hdx(&["scan", env.work().to_str().unwrap()]);
     let text = stdout(&out);
     assert!(text.contains("scholarly file"), "no claim line:\n{text}");
     assert!(text.contains("attributed"), "no attributed count:\n{text}");
+    assert!(text.contains("paper.pdf"), "paper missing:\n{text}");
+    assert!(
+        !text.contains("__init__.py"),
+        "sub-digest file attributed:\n{text}"
+    );
 
     // --no-resolve is the classic census: summary only, no claims.
     let out = env.hdx(&["scan", env.work().to_str().unwrap(), "--no-resolve"]);

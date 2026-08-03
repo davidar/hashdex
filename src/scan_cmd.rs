@@ -52,6 +52,16 @@ const SWH_ANON_CAP: usize = 100;
 /// fault, and known-file corroboration isn't worth disk seeks.
 const EXPENSIVE_FILTER_BYTES: u64 = 2 << 30;
 
+/// A file smaller than the digest that names it cannot be identified
+/// BY that digest: the name carries more information than the content,
+/// so "identity" degenerates into transcription — you'd quote such a
+/// file, not cite it. (The single newline is in every corpus and also
+/// registered to a real 1993 paper by a botched fatcat deposit.)
+/// Sub-digest files keep their true membership tags but are never
+/// attributed or probed; explicit `hdx <hash>` lookups still render
+/// every witness.
+const IDENTITY_MIN_BYTES: u64 = 32; // = the sha256 digest's length
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum ListMode {
     None,
@@ -359,14 +369,18 @@ pub async fn scan(
             }
         }
         // Attributed listing needs the evidence to decide visibility,
-        // so the walk runs for every file whenever we resolve.
-        let evidence = resolver.as_ref().map(|(indexes, cache)| {
-            let coord = crate::coord::Coord {
-                scheme: Scheme::Sha256,
-                digest: r.sha256.to_vec(),
-            };
-            crate::walk::walk(&coord, indexes, cache.as_ref())
-        });
+        // so the walk runs for every file whenever we resolve — except
+        // sub-digest-size files, which are never attributed.
+        let evidence = resolver
+            .as_ref()
+            .filter(|_| r.size >= IDENTITY_MIN_BYTES)
+            .map(|(indexes, cache)| {
+                let coord = crate::coord::Coord {
+                    scheme: Scheme::Sha256,
+                    digest: r.sha256.to_vec(),
+                };
+                crate::walk::walk(&coord, indexes, cache.as_ref())
+            });
         let has_claims = evidence
             .as_ref()
             .is_some_and(|ev| ev.iter().any(|e| !e.finding.claims.is_empty()));
@@ -554,7 +568,9 @@ async fn online_probe(
     };
     let mut probes: HashMap<crate::coord::Coord, HashSet<&'static str>> = HashMap::new();
     for r in results {
-        if r.matched.is_empty() {
+        // Sub-digest files never earn a probe: nothing that small is
+        // identifiable, however many corpora contain it.
+        if r.matched.is_empty() || r.size < IDENTITY_MIN_BYTES {
             continue;
         }
         // One probe per (file, backend): when several of a backend's
