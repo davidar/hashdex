@@ -49,8 +49,7 @@ them. hashdex federates over the indexes that exist, ingests digest
 extracts where an inversion exists but isn't queryable, and only
 self-inverts (from metadata, never content) where nobody else has.
 It never downloads content to hash it — ingest cost scales with
-metadata, full stop. See [DESIGN.md](DESIGN.md) for the whole argument;
-[SOURCES.md](SOURCES.md) is the verified inventory of bulk hash sources.
+metadata, full stop.
 
 ## Commands
 
@@ -145,7 +144,7 @@ or from a checkout: `cargo build --release` (binary at
 
 Early but real: the federated resolver, disk scanner, local hash
 index, inverted-index crosswalk walk, and ten filter families work
-today ([DESIGN.md](DESIGN.md) tracks the MVP ladder). On the author's
+today. On the author's
 machine the filters identify 68% of all files (by count) as publicly
 known bytes — most of the remainder is content that only ever existed
 there. The bigger arc — more sources, richer crosswalk edges, web-tier
