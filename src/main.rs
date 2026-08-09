@@ -156,6 +156,15 @@ enum FilterAction {
     },
     /// List installed filters
     List,
+    /// Fold an installed filter to half its size by ORing the two halves
+    /// of its bit array. Every key stays a member; the false-positive
+    /// rate rises (roughly squaring the bits-set fraction — e.g. the
+    /// 70 GiB swh filter folds to 35 GiB at ~2% FP instead of 0.01%).
+    /// Re-download with `hdx filters fetch` to undo.
+    Fold {
+        /// Installed filter to fold: NAME, or NAME.SCHEME if ambiguous
+        name: String,
+    },
     /// Build a filter from files of hex digest lines (one per line)
     Build {
         /// Filter name (installs as <name>.<scheme>.bloom)
@@ -274,6 +283,7 @@ async fn main() -> Result<()> {
                 filters_cmd::fetch(&client, names, *all, from.as_deref()).await?
             }
             FilterAction::List => filters_cmd::list()?,
+            FilterAction::Fold { name } => filters_cmd::fold(name)?,
             FilterAction::Build {
                 name,
                 scheme,

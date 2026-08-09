@@ -327,6 +327,62 @@ pub fn build(
     Ok(())
 }
 
+/// Fold an installed filter to half its size (see `filter::fold`).
+/// Replaces the file; the original is re-downloadable via fetch.
+pub fn fold(spec: &str) -> Result<()> {
+    let filters = filter::load_all()?;
+    let matched: Vec<_> = filters
+        .iter()
+        .filter(|f| f.name == spec || format!("{}.{}", f.name, f.scheme.as_str()) == spec)
+        .collect();
+    let f = match matched.as_slice() {
+        [] => anyhow::bail!("no installed filter named {spec:?} (run `hdx filters list`)"),
+        [f] => f,
+        many => anyhow::bail!(
+            "ambiguous: {spec} has {} installed filters — name one as NAME.SCHEME ({})",
+            many.len(),
+            many.iter()
+                .map(|f| format!("{}.{}", f.name, f.scheme.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    let fname = format!("{}.{}.bloom", f.name, f.scheme.as_str());
+    let path = filter::filters_dir().join(&fname);
+    let part = filter::filters_dir().join(format!("{fname}.fold.part"));
+    let old_bytes = f.bytes;
+    eprintln!(
+        "folding {fname}: {} → ~{} (false positives rise; refetch to undo)…",
+        human(old_bytes),
+        human(crate::filter::HEADER_LEN as u64 + (old_bytes.saturating_sub(48)) / 2),
+    );
+    drop(filters); // release the mmap on the file we're about to replace
+    let stats = filter::fold(&path, &part)?;
+    std::fs::rename(&part, &path).context("finalize folded filter")?;
+    let new_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    eprintln!(
+        "folded {fname}: {} → {} bits, {} → {}, fill {:.1}%, false-positive rate now ~{:.1e}",
+        stats.m_old,
+        stats.m_new,
+        human(old_bytes),
+        human(new_bytes),
+        stats.fill * 100.0,
+        stats.p_new
+    );
+    Ok(())
+}
+
+fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    format!("{v:.1} {}", UNITS[u])
+}
+
 pub fn list() -> Result<()> {
     let filters = filter::load_all()?;
     if filters.is_empty() {

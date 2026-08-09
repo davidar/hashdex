@@ -25,7 +25,7 @@ pub struct Bloom {
     pub n_elements: u64,
 }
 
-const HEADER_LEN: usize = 48;
+pub const HEADER_LEN: usize = 48;
 const MOD: u64 = 18_446_744_073_709_551_529; // 2^64 - 87
 const G: u64 = 18_446_744_073_709_550_147;
 
@@ -153,6 +153,104 @@ impl BloomBuilder {
     }
 }
 
+pub struct FoldStats {
+    pub m_old: u64,
+    pub m_new: u64,
+    pub fill: f64,
+    pub p_new: f64,
+}
+
+/// Halve a DCSO bloom filter in place-ish: OR the second half of the bit
+/// array onto the first and halve `m` in the header. Sound because the
+/// probe position is `h % m`, and for even m, `h % m ≡ h % (m/2)  (mod
+/// m/2)` — every key inserted in the original is still found in the fold.
+/// The price is a denser array: fill fraction f becomes ~1-(1-f)², so
+/// the false-positive rate goes from f^k to roughly (2f)^k. The header's
+/// p field is rewritten to the honest measured value, `fill^k`.
+///
+/// Streams src → dst (two sequential cursors over the mmap); never holds
+/// the array in RAM.
+pub fn fold(src: &Path, dst: &Path) -> Result<FoldStats> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let file =
+        std::fs::File::open(src).with_context(|| format!("open bloom filter {}", src.display()))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let _ = mmap.advise(memmap2::Advice::Sequential);
+    if mmap.len() < HEADER_LEN {
+        bail!("bloom filter too short: {}", src.display());
+    }
+    let u64_at =
+        |i: usize| -> u64 { u64::from_le_bytes(mmap[i * 8..i * 8 + 8].try_into().unwrap()) };
+    let (version, n, k, m, n_elements) = (u64_at(0), u64_at(1), u64_at(3), u64_at(4), u64_at(5));
+    if version & 0xff != 1 {
+        bail!("unsupported bloom filter version {version}");
+    }
+    if m % 2 != 0 {
+        bail!(
+            "cannot fold: bit count m={m} is odd (folding needs the new size to divide the old; \
+             this filter has already been folded or was built with an odd m)"
+        );
+    }
+    let words_total = m.div_ceil(64) as usize;
+    if mmap.len() < HEADER_LEN + words_total * 8 {
+        bail!("bloom filter truncated: {}", src.display());
+    }
+    // Word i of the source bit array; out-of-range and tail bits beyond
+    // m read as zero so trailing file data can't leak into the fold.
+    let word = |i: usize| -> u64 {
+        if i >= words_total {
+            return 0;
+        }
+        let off = HEADER_LEN + i * 8;
+        let mut w = u64::from_le_bytes(mmap[off..off + 8].try_into().unwrap());
+        if i == words_total - 1 && m % 64 != 0 {
+            w &= (1u64 << (m % 64)) - 1;
+        }
+        w
+    };
+
+    let m2 = m / 2;
+    let words2 = m2.div_ceil(64) as usize;
+    let out = std::fs::File::create(dst)
+        .with_context(|| format!("create folded filter {}", dst.display()))?;
+    let mut w = std::io::BufWriter::new(out);
+    // Header placeholder; p is patched after the fill count is known.
+    for v in [1u64, n, 0, k, m2, n_elements] {
+        w.write_all(&v.to_le_bytes())?;
+    }
+    let mut ones: u64 = 0;
+    for j in 0..words2 {
+        // New bit i = old bit i | old bit i+m2. The low word is src word
+        // j verbatim; the high word is 64 bits at bit offset m2 + 64j.
+        let o = m2 + 64 * j as u64;
+        let (wi, sh) = ((o / 64) as usize, (o % 64) as u32);
+        let hi = if sh == 0 {
+            word(wi)
+        } else {
+            (word(wi) >> sh) | (word(wi + 1) << (64 - sh))
+        };
+        let mut d = word(j) | hi;
+        if j == words2 - 1 && m2 % 64 != 0 {
+            d &= (1u64 << (m2 % 64)) - 1;
+        }
+        ones += d.count_ones() as u64;
+        w.write_all(&d.to_le_bytes())?;
+    }
+    let fill = ones as f64 / m2 as f64;
+    let p_new = fill.powi(k as i32);
+    let mut out = w.into_inner()?;
+    out.seek(SeekFrom::Start(16))?;
+    out.write_all(&p_new.to_bits().to_le_bytes())?;
+    out.flush()?;
+    Ok(FoldStats {
+        m_old: m,
+        m_new: m2,
+        fill,
+        p_new,
+    })
+}
+
 fn fnv1_64(data: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in data {
@@ -278,6 +376,56 @@ mod tests {
             hex, "593635f214df50af3fe42b41b3c86fa6ca6c79c312a66818ed748435982bc6ae",
             "DCSO filter bytes changed — this breaks compatibility with published filters"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fold_halves_and_preserves_members() {
+        // n=1000, p=0.01 sizes to m=9586 (even, foldable once; the
+        // half 4793 is odd, so a second fold must refuse).
+        let mut b = BloomBuilder::new(1000, 0.01).unwrap();
+        assert_eq!(b.m % 2, 0, "test premise: m must be even");
+        let keys: Vec<String> = (0..1000).map(|i| format!("MEMBER{i:04}")).collect();
+        for k in &keys {
+            b.add(k.as_bytes());
+        }
+        let dir = tmp_dir("bloom-fold");
+        let full = dir.join("full.bloom");
+        b.write(&full).unwrap();
+
+        let folded = dir.join("folded.bloom");
+        let stats = fold(&full, &folded).unwrap();
+        assert_eq!(stats.m_old, b.m);
+        assert_eq!(stats.m_new, b.m / 2);
+        assert!(stats.fill > 0.0 && stats.fill < 1.0);
+
+        let bloom = Bloom::open(&folded).unwrap();
+        assert_eq!(bloom.n_elements, 1000);
+        assert_eq!(bloom.m, b.m / 2);
+        for k in &keys {
+            assert!(bloom.check(k.as_bytes()), "member {k} lost by fold");
+        }
+        // The fold trades size for false positives: the measured rate
+        // must be elevated but nowhere near "everything matches".
+        let fp = (0..10_000)
+            .filter(|i| bloom.check(format!("ABSENT{i:05}").as_bytes()))
+            .count();
+        assert!(fp > 0, "fold with zero FPs at half size is implausible");
+        assert!(
+            fp < 5_000,
+            "fold degenerated into match-everything: {fp}/10000"
+        );
+        // Header p was rewritten to the measured value.
+        let bytes = std::fs::read(&folded).unwrap();
+        let p = f64::from_bits(u64::from_le_bytes(bytes[16..24].try_into().unwrap()));
+        assert!((p - stats.p_new).abs() < 1e-12);
+
+        // Odd m refuses to fold.
+        let err = match fold(&folded, &dir.join("f2.bloom")) {
+            Ok(_) => panic!("folding an odd-m filter must fail"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("odd"), "unhelpful error: {err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
