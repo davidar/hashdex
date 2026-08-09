@@ -1,7 +1,7 @@
 use crate::coord::Scheme;
 use crate::filter::NamedFilter;
 use crate::local_index::{CachedEntry, LocalIndex};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::json;
 use sha2::Digest;
 use std::collections::{HashMap, HashSet};
@@ -158,10 +158,15 @@ pub async fn scan(
     // Canonical roots first: the local index keys on the literal path
     // string, so `scan .` and `scan /same/dir` must agree on spelling
     // or every rescan re-hashes and local.db accretes parallel trees.
+    // A root that doesn't resolve is an error, not an empty scan: a
+    // typo'd path must not report "0 files, 0 unknown" and exit 0.
     let paths: Vec<PathBuf> = paths
         .iter()
-        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
-        .collect();
+        .map(|p| {
+            p.canonicalize()
+                .with_context(|| format!("cannot scan {}", p.display()))
+        })
+        .collect::<Result<_>>()?;
     let paths = &paths;
 
     let own_cache = crate::cache::cache_dir();
@@ -340,7 +345,12 @@ pub async fn scan(
                                     r.matched.push(f.name.clone());
                                 }
                             }
+                            // One name per source: a source with sha1 AND
+                            // sha256 blooms firing on the same file must
+                            // not render as "fatcat,fatcat" or count twice
+                            // in the per-source summary.
                             r.matched.sort();
+                            r.matched.dedup();
                             if skipped_big {
                                 big_skipped_files.fetch_add(1, Ordering::Relaxed);
                             }
@@ -535,9 +545,14 @@ pub async fn scan(
                         .max_by_key(|(_, c)| (c.url.is_some(), c.statement.len()))
                     {
                         // Compact default: the most informative single
-                        // claim (URL-bearing beats bare join keys), no
-                        // URL printed. -v for the full blocks.
+                        // claim (URL-bearing beats bare join keys) WITH
+                        // its URL — the URL is usually the payload the
+                        // user is after (wayback copy, SWH archive).
+                        // -v for the full multi-claim blocks.
                         println!("             {:<12} {}", backend, claim.statement);
+                        if let Some(url) = &claim.url {
+                            println!("             {:<12} → {url}", "");
+                        }
                     }
                 }
             }
@@ -572,27 +587,34 @@ pub async fn scan(
             String::new()
         };
         println!(
-            "{scanned} files ({}) — {known} known ({}){attribution}, {} unknown",
+            "{scanned} file{} ({}) — {known} known ({}){attribution}, {} unknown",
+            s(scanned),
             human(total_bytes),
             human(known_bytes),
             scanned - known
         );
         for (f, n) in &per_filter {
-            println!("  {f}: {n} files");
+            println!("  {f}: {n} file{}", s(*n));
         }
         let big_skipped = big_skipped_files.load(Ordering::Relaxed);
         if big_skipped > 0 {
             println!(
-                "  ({big_skipped} known files skipped filters over {} — per-filter counts are a floor; --probe-all for full attribution)",
+                "  ({big_skipped} known file{} skipped filters over {} — per-filter counts are a floor; --probe-all for full attribution)",
+                s(big_skipped),
                 human(EXPENSIVE_FILTER_BYTES)
             );
         }
         println!(
-            "  hashed {} files, reused {reused} from local index",
-            scanned - reused
+            "  hashed {} file{}, reused {reused} from local index",
+            scanned - reused,
+            s(scanned - reused)
         );
         if !unreadable.is_empty() {
-            println!("  {} paths unreadable (not counted)", unreadable.len());
+            println!(
+                "  {} path{} unreadable (not counted)",
+                unreadable.len(),
+                s(unreadable.len())
+            );
         }
         if filters.is_empty() {
             println!("  (no filters installed — run `hdx filters fetch` first; every file reports unknown)");
@@ -602,7 +624,11 @@ pub async fn scan(
     // Diagnostics for both output modes: stderr, so JSON stdout stays pure.
     if !unreadable.is_empty() {
         const SHOWN: usize = 5;
-        eprintln!("{} paths unreadable:", unreadable.len());
+        eprintln!(
+            "{} path{} unreadable:",
+            unreadable.len(),
+            s(unreadable.len())
+        );
         for u in unreadable.iter().take(SHOWN) {
             eprintln!("  {u}");
         }
@@ -720,7 +746,7 @@ async fn online_probe(
     }
 
     let total = probes.len();
-    eprintln!("probing {total} matched digests online…");
+    eprintln!("probing {total} matched digest{} online…", s(total));
     // Probe width: 6 is politeness for third-party APIs. A batch that
     // only touches fatcat hits our own published dataset on a CDN over
     // one multiplexed connection — far wider is fine.
@@ -841,6 +867,15 @@ fn examine(
         from_index: false,
         matched: Vec::new(),
     }))
+}
+
+/// Pluralizing suffix: `{n} file{}` with `s(n)`.
+fn s(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
