@@ -28,6 +28,11 @@ pub struct Options {
     /// --online sets this so each digest only visits backends whose
     /// membership filter matched.
     pub only: Option<std::collections::HashSet<&'static str>>,
+    /// Show a live stderr line naming the backends still being waited
+    /// on. Single lookups want this (one slow backend blocks the whole
+    /// render — the wait must not look like a hang); scan's batch
+    /// probes run under their own ticker and set it false.
+    pub progress: bool,
 }
 
 /// Resolution order (DESIGN.md): network backends are asked about the
@@ -74,18 +79,60 @@ pub async fn resolve(client: &Client, coord: &Coord, opts: &Options) -> Result<R
         }
 
         let timeout = Duration::from_secs(opts.timeout_secs);
+        let pending: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<&'static str>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(
+                to_fetch.iter().map(|b| b.name).collect(),
+            ));
+        // The render is all-or-nothing (cluster welding needs every
+        // answer), so one slow backend holds the terminal — name it
+        // instead of sitting silent.
+        let ticker = if opts.progress && !to_fetch.is_empty() {
+            let ticker = std::sync::Arc::new(crate::scan_cmd::Ticker::new());
+            let task = tokio::spawn({
+                let (ticker, pending) = (ticker.clone(), pending.clone());
+                let start = std::time::Instant::now();
+                async move {
+                    loop {
+                        let names: Vec<&str> = pending.lock().unwrap().iter().copied().collect();
+                        if names.is_empty() {
+                            break;
+                        }
+                        ticker.update(usize::MAX, 0, || {
+                            format!(
+                                "asking {}… ({}s)",
+                                names.join(", "),
+                                start.elapsed().as_secs()
+                            )
+                        });
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
+            });
+            Some((ticker, task))
+        } else {
+            None
+        };
         let fetches = to_fetch.iter().map(|b| {
             let client = client.clone();
             let coord = coord.clone();
+            let pending = pending.clone();
             async move {
-                match tokio::time::timeout(timeout, (b.lookup)(&client, &coord)).await {
+                let outcome = match tokio::time::timeout(timeout, (b.lookup)(&client, &coord)).await
+                {
                     Ok(Ok(result)) => (b.name, Ok(result)),
                     Ok(Err(e)) => (b.name, Err(e.to_string())),
                     Err(_) => (b.name, Err("timed out".to_string())),
-                }
+                };
+                pending.lock().unwrap().remove(b.name);
+                outcome
             }
         });
-        for (name, outcome) in join_all(fetches).await {
+        let outcomes = join_all(fetches).await;
+        if let Some((ticker, task)) = ticker {
+            task.abort();
+            ticker.clear();
+        }
+        for (name, outcome) in outcomes {
             match outcome {
                 Ok(Some(finding)) => {
                     if let Some(cache) = &cache {

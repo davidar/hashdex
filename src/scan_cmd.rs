@@ -778,6 +778,9 @@ async fn online_probe(
             // that a single-lookup budget doesn't anticipate.
             timeout_secs: ropts.timeout_secs.max(if width > 6 { 120 } else { 0 }),
             only: Some(only),
+            // The probe stream has its own ticker; per-digest progress
+            // lines would fight over the terminal.
+            progress: false,
         };
         let (done, errors) = (&done, &errors);
         async move {

@@ -189,6 +189,7 @@ async fn main() -> Result<()> {
         offline: cli.offline,
         timeout_secs: cli.timeout,
         only: None,
+        progress: true,
     };
     let client = reqwest::Client::builder()
         .user_agent(format!("hashdex-hdx/{}", env!("CARGO_PKG_VERSION")))
