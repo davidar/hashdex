@@ -4,7 +4,6 @@ pub mod fatcat;
 pub mod rekor;
 pub mod snapshot;
 pub mod swh;
-pub mod virustotal;
 
 use crate::coord::{Coord, Scheme};
 use crate::finding::Finding;
@@ -24,7 +23,7 @@ pub struct Backend {
 }
 
 pub fn all() -> Vec<Backend> {
-    let mut v = vec![
+    vec![
         Backend {
             name: depsdev::NAME,
             supports: depsdev::supports,
@@ -55,13 +54,5 @@ pub fn all() -> Vec<Backend> {
             supports: rekor::supports,
             lookup: |c, k| Box::pin(rekor::lookup(c, k)),
         },
-    ];
-    if virustotal::enabled() {
-        v.push(Backend {
-            name: virustotal::NAME,
-            supports: virustotal::supports,
-            lookup: |c, k| Box::pin(virustotal::lookup(c, k)),
-        });
-    }
-    v
+    ]
 }

@@ -78,7 +78,7 @@ Privacy is a consent line, not a mode:
   over static published parquet — the server sees byte offsets, never
   your digests — so `scan` uses them without asking.
 - **Third-party APIs** (CIRCL, deps.dev, Software Heritage, Rekor,
-  snapshot.debian.org, VirusTotal) are only told your digests when you
+  snapshot.debian.org) are only told your digests when you
   ask: single-hash `hdx <hash>` lookups query them, and batch scans
   need explicit `--online` consent (optionally restricted:
   `--online=circl,swh`). Per-scan politeness ceilings apply.
@@ -90,7 +90,7 @@ observations in `~/.cache/hashdex/`; errors are never cached.
 
 Env: `SWH_TOKEN` raises the Software Heritage rate limit,
 `HF_TOKEN` lifts anonymous Hugging Face limits for dataset range
-reads, `VT_API_KEY` enables the VirusTotal backend.
+reads.
 
 ## Per-source filters
 

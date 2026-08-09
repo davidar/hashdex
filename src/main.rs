@@ -26,8 +26,8 @@ use std::path::PathBuf;
     about = "Resolve any hash against the indexes the world already maintains",
     long_about = "Given a hash (hex, base32, SRI, SWHID, or scheme:hex), hdx asks the \n\
                   public inverted indexes what they know: deps.dev, CIRCL hashlookup, \n\
-                  Software Heritage, snapshot.debian.org, Rekor, and (with VT_API_KEY) \n\
-                  VirusTotal. Answers are cached locally as observations.\n\n\
+                  Software Heritage, snapshot.debian.org, Rekor, and the fatcat \n\
+                  scholarly index. Answers are cached locally as observations.\n\n\
                   Bare 64-hex is read as sha256 (use blake2s256:<hex> to override); \n\
                   bare 40-hex as sha1; 32-char base32 as CDX-style sha1."
 )]
