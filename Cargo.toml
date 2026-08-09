@@ -8,6 +8,9 @@ repository = "https://github.com/davidar/hashdex"
 readme = "README.md"
 keywords = ["hash", "sha256", "bloom-filter", "provenance", "forensics"]
 categories = ["command-line-utilities", "filesystem"]
+# Allowlist: the crate ships what cargo needs to build the binary.
+# Docs, tools, tests, and fixtures live in the GitHub repo.
+include = ["/src", "/Cargo.toml", "/README.md", "/LICENSE"]
 
 [[bin]]
 name = "hdx"
