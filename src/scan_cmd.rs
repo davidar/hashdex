@@ -175,6 +175,15 @@ pub async fn scan(
         .collect::<Result<_>>()?;
     let paths = &paths;
 
+    // Roots the user named as literal files always get a per-file
+    // verdict: an explicit two-file scan that prints nothing reads as
+    // "scan doesn't know these" even when the summary counted them.
+    let file_roots: HashSet<&Path> = paths
+        .iter()
+        .filter(|p| p.is_file())
+        .map(|p| p.as_path())
+        .collect();
+
     let own_cache = crate::cache::cache_dir();
     let ticker = &Ticker::new();
 
@@ -454,6 +463,7 @@ pub async fn scan(
 
     let mut known = 0usize;
     let mut attributed = 0usize;
+    let mut membership_only = 0usize;
     let mut known_bytes = 0u64;
     let mut total_bytes = 0u64;
     let mut per_filter: std::collections::BTreeMap<&str, usize> = Default::default();
@@ -502,12 +512,15 @@ pub async fn scan(
             known += 1;
             known_bytes += r.size;
         }
+        if resolver.is_some() && !r.matched.is_empty() && !has_claims {
+            membership_only += 1;
+        }
         let show = match opts.list {
             ListMode::None => false,
             ListMode::All => true,
             ListMode::Known => !r.matched.is_empty(),
             ListMode::Unknown => r.matched.is_empty(),
-            ListMode::Attributed => has_claims,
+            ListMode::Attributed => has_claims || file_roots.contains(r.path.as_path()),
         };
         if show {
             ticker.clear();
@@ -604,6 +617,7 @@ pub async fn scan(
     });
     if resolver.is_some() {
         summary["attributed"] = json!(attributed);
+        summary["membership_only"] = json!(membership_only);
     }
     if opts.json {
         println!("{summary}");
@@ -623,6 +637,17 @@ pub async fn scan(
         );
         for (f, n) in &per_filter {
             println!("  {f}: {n} file{}", s(*n));
+        }
+        if membership_only > 0 {
+            let consent = if opts.online.is_none() {
+                "; --online asks their sources for claims"
+            } else {
+                ""
+            };
+            println!(
+                "  ({membership_only} known file{} matched filters but carry no claims — membership only{consent}; --known lists them)",
+                s(membership_only)
+            );
         }
         let big_skipped = big_skipped_files.load(Ordering::Relaxed);
         if big_skipped > 0 {

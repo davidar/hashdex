@@ -544,6 +544,32 @@ fn scan_does_not_attribute_across_weak_digests() {
     );
 }
 
+/// Naming a file directly must produce its per-file verdict even when
+/// the only evidence is filter membership (no claims yet): a two-file
+/// scan that prints nothing reads as "scan doesn't know these" when it
+/// did. The summary also says why there are no claim lines.
+#[test]
+fn explicit_file_roots_always_listed() {
+    let env = TestEnv::new("fileroot");
+    let file = env.write("fox.txt", b"the quick brown fox jumps over the lazy dog\n");
+    let list = env.digest_list("pub.sha256.txt", FOX_SHA256);
+    let out = env.hdx(&["filters", "build", "pub", "sha256", list.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    let out = env.hdx(&["scan", file.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("fox.txt"),
+        "explicit file root not listed:\n{text}"
+    );
+    assert!(
+        text.contains("membership only"),
+        "no membership-only hint:\n{text}"
+    );
+    assert!(text.contains("--online"), "hint missing --online:\n{text}");
+}
+
 #[test]
 fn fetch_registry_works_offline() {
     let env = TestEnv::new("fetch");
