@@ -23,6 +23,8 @@ hdx scan <dir>        # scan against filters + attribute what it can
                       #   (dataset probes by default; --no-resolve =
                       #   census; --online consents to third-party APIs)
 hdx index build fatcat <tsv.gz>   # self-invert a dump (sorted mmap index)
+tools/release_tarballs.py         # harvest debian/homebrew/guix artifact
+                                  #   hashes → `hdx index build tarballs`
 hdx filters fetch     # install CIRCL bloom (~1 GB) into the cache dir
 ```
 

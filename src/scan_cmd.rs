@@ -462,12 +462,8 @@ pub async fn scan(
             format!("resolving locally… {i}/{} files", results.len())
         });
         total_bytes += r.size;
-        if !r.matched.is_empty() {
-            known += 1;
-            known_bytes += r.size;
-            for m in &r.matched {
-                *per_filter.entry(m.as_str()).or_default() += 1;
-            }
+        for m in &r.matched {
+            *per_filter.entry(m.as_str()).or_default() += 1;
         }
         // Attributed listing needs the evidence to decide visibility,
         // so the walk runs for every file whenever we resolve — except
@@ -487,6 +483,14 @@ pub async fn scan(
             .is_some_and(|ev| ev.iter().any(|e| !e.finding.claims.is_empty()));
         if has_claims {
             attributed += 1;
+        }
+        // Known = a filter matched OR the walk produced a claim: index
+        // rows (tarballs, cached observations) are witness-grade
+        // evidence, stronger than a probabilistic bloom hit — a file
+        // can't be both attributed and "unknown".
+        if !r.matched.is_empty() || has_claims {
+            known += 1;
+            known_bytes += r.size;
         }
         let show = match opts.list {
             ListMode::None => false,
@@ -519,10 +523,23 @@ pub async fn scan(
                 }
                 println!("{obj}");
             } else {
-                let tag = if r.matched.is_empty() {
-                    "unknown".to_string()
-                } else {
+                let tag = if !r.matched.is_empty() {
                     r.matched.join(",")
+                } else if has_claims {
+                    // No filter fired but the local walk attributed it
+                    // (index-only sources like tarballs have no bloom):
+                    // name the attestors, don't call it unknown.
+                    let mut backends: Vec<&str> = evidence
+                        .iter()
+                        .flatten()
+                        .filter(|e| !e.finding.claims.is_empty())
+                        .map(|e| e.finding.backend.as_str())
+                        .collect();
+                    backends.sort_unstable();
+                    backends.dedup();
+                    backends.join(",")
+                } else {
+                    "unknown".to_string()
                 };
                 println!("{:<12} {}", tag, r.path.display());
                 if let Some(evidence) = &evidence {

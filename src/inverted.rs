@@ -65,7 +65,24 @@ const FATCAT: SourceSpec = SourceSpec {
     finding: fatcat_finding,
 };
 
-pub const SOURCES: &[SourceSpec] = &[FATCAT];
+/// Release artifacts from distro package indexes (Debian sid Sources,
+/// Homebrew formulae, Guix sources.json) — tools/release_tarballs.py
+/// emits the TSV: witness, sha256, md5, name, version, filename, loc
+/// ("-" = absent). Row layout: sha256(0..32) ‖ md5(32..48, zeros =
+/// absent) ‖ witness(48) ‖ name(49..121) ‖ version(121..177) ‖
+/// filename(177..305) ‖ loc(305..497). `loc` is the Debian pool
+/// directory, the Homebrew upstream URL, or the Guix content-addressed
+/// mirror URL.
+const TARBALLS: SourceSpec = SourceSpec {
+    name: "tarballs",
+    row_width: 497,
+    primary: (Scheme::Sha256, 0),
+    secondary: &[(Scheme::Md5, 32)],
+    parse_line: tarballs_parse,
+    finding: tarballs_finding,
+};
+
+pub const SOURCES: &[SourceSpec] = &[FATCAT, TARBALLS];
 
 pub fn source(name: &str) -> Option<&'static SourceSpec> {
     SOURCES.iter().find(|s| s.name == name)
@@ -118,6 +135,98 @@ fn fatcat_finding(row: &[u8]) -> Finding {
             format!("md5:{}", hex(&row[52..68])),
         ],
     }
+}
+
+const TARBALLS_WITNESSES: &[&str] = &["debian", "homebrew", "guix"];
+
+fn tarballs_parse(line: &str, row: &mut [u8]) -> Result<()> {
+    let mut fields = line.split('\t');
+    let (
+        Some(witness),
+        Some(sha256),
+        Some(md5),
+        Some(name),
+        Some(version),
+        Some(filename),
+        Some(loc),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        bail!("expected 7 tab-separated fields");
+    };
+    let Some(w) = TARBALLS_WITNESSES.iter().position(|n| *n == witness) else {
+        bail!("unknown witness {witness:?}");
+    };
+    hex_into(sha256, &mut row[0..32])?;
+    if md5 == "-" {
+        row[32..48].fill(0);
+    } else {
+        hex_into(md5, &mut row[32..48])?;
+    }
+    row[48] = w as u8 + 1;
+    str_into(name, &mut row[49..121])?;
+    str_into(version, &mut row[121..177])?;
+    str_into(filename, &mut row[177..305])?;
+    str_into(loc, &mut row[305..497])?;
+    Ok(())
+}
+
+fn tarballs_finding(row: &[u8]) -> Finding {
+    let name = str_from(&row[49..121]);
+    let version = str_from(&row[121..177]);
+    let filename = str_from(&row[177..305]);
+    let loc = str_from(&row[305..497]);
+    let (backend, statement, url) = match row[48] {
+        1 => (
+            "debian",
+            format!(
+                "Debian sid packages these bytes as {filename} (source package {name} {version})"
+            ),
+            Some(format!("https://deb.debian.org/debian/{loc}/{filename}")),
+        ),
+        2 => (
+            "homebrew",
+            format!("Homebrew packages these bytes as {name} {version} (upstream source)"),
+            Some(loc),
+        ),
+        _ => (
+            "guix",
+            format!("GNU Guix packages these bytes as {filename}"),
+            Some(loc),
+        ),
+    };
+    let mut coords = vec![format!("sha256:{}", hex(&row[0..32]))];
+    if row[32..48].iter().any(|&b| b != 0) {
+        coords.push(format!("md5:{}", hex(&row[32..48])));
+    }
+    Finding {
+        backend: backend.into(),
+        claims: vec![Claim::new(statement, url)],
+        coords,
+    }
+}
+
+/// NUL-pad `s` into `out`; a "-" field means absent (stored empty).
+fn str_into(s: &str, out: &mut [u8]) -> Result<()> {
+    let s = if s == "-" { "" } else { s };
+    if s.len() > out.len() {
+        bail!("field over {} bytes: {s:?}", out.len());
+    }
+    out[..s.len()].copy_from_slice(s.as_bytes());
+    out[s.len()..].fill(0);
+    Ok(())
+}
+
+fn str_from(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 /// fatcat entity ident: lowercase unpadded base32 of the UUID bytes.
@@ -614,8 +723,14 @@ fn build_in(spec: &'static SourceSpec, input: &Path, chunk_bytes: usize, dir: &P
             rows_in.read_exact(&mut row)?;
             for (scheme, offset, sorter) in &mut idx_sorters {
                 let dlen = scheme.digest_len();
+                let digest = &row[*offset..*offset + dlen];
+                // All-zero = the row doesn't carry this digest
+                // (e.g. tarballs rows without an md5): no idx entry.
+                if digest.iter().all(|&b| b == 0) {
+                    continue;
+                }
                 entry.clear();
-                entry.extend_from_slice(&row[*offset..*offset + dlen]);
+                entry.extend_from_slice(digest);
                 entry.extend_from_slice(&row_no.to_le_bytes());
                 sorter.add(&entry)?;
             }
@@ -750,7 +865,10 @@ mod tests {
             let c = Coord::parse(&format!("sha256:{i:064x}")).unwrap();
             assert_eq!(ix.lookup(&c).len(), 1, "row {i} findable by sha256");
             let c = Coord::parse(&format!("sha1:{i:040x}")).unwrap();
-            assert_eq!(ix.lookup(&c).len(), 1, "row {i} findable by sha1 idx");
+            // Row 0's sha1 is all-zero, which the build treats as
+            // digest-absent: no idx entry.
+            let want = if i == 0 { 0 } else { 1 };
+            assert_eq!(ix.lookup(&c).len(), want, "row {i} via sha1 idx");
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -771,6 +889,59 @@ mod tests {
         let input = dir.join("empty.tsv");
         std::fs::write(&input, "junk\n").unwrap();
         assert!(build_in(&FATCAT, &input, 1 << 20, &dir).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tarballs_build_and_render() {
+        let dir = tmp_dir("tarballs");
+        // debian row (with md5 crosswalk), homebrew + guix (md5 absent),
+        // one unknown witness (skipped), one overlong field (skipped)
+        let long = "x".repeat(200);
+        let tsv = format!(
+            "debian\t{SHA256_ABC}\t{MD5_ABC}\thello\t2.12.3-1\thello_2.12.3.orig.tar.gz\tpool/main/h/hello\n\
+             homebrew\t{SHA256_EMPTY}\t-\twget\t1.25.0\t-\thttps://ftp.gnu.org/gnu/wget/wget-1.25.0.tar.gz\n\
+             guix\t{SHA256_EMPTY}\t-\t-\t-\thello-2.12.3.tar.gz\thttps://bordeaux.guix.gnu.org/file/hello-2.12.3.tar.gz/sha256/086vqwk2wl8zfs47sq2xpjc9k066ilmb8z6dn0q6ymwjzlm196cd\n\
+             pypi\t{SHA256_ABC}\t-\t-\t-\t-\t-\n\
+             debian\t{SHA256_ABC}\t{MD5_ABC}\t{long}\t1\tf\tpool/main\n"
+        );
+        let input = dir.join("in.tsv");
+        std::fs::write(&input, tsv).unwrap();
+        build_in(&TARBALLS, &input, 1 << 20, &dir).unwrap();
+        let ix = open_one(&TARBALLS, &dir).unwrap();
+        assert_eq!(ix.row_count(), 3);
+
+        let debian = ix.lookup(&Coord::parse(&format!("sha256:{SHA256_ABC}")).unwrap());
+        assert_eq!(debian.len(), 1);
+        assert_eq!(debian[0].backend, "debian");
+        assert_eq!(
+            debian[0].claims[0].statement,
+            "Debian sid packages these bytes as hello_2.12.3.orig.tar.gz (source package hello 2.12.3-1)"
+        );
+        assert_eq!(
+            debian[0].claims[0].url.as_deref(),
+            Some("https://deb.debian.org/debian/pool/main/h/hello/hello_2.12.3.orig.tar.gz")
+        );
+        // single-witness multi-hash row: md5 co-observed
+        assert!(debian[0].coords.contains(&format!("md5:{MD5_ABC}")));
+        // …and findable through the md5 idx
+        assert_eq!(
+            ix.lookup(&Coord::parse(&format!("md5:{MD5_ABC}")).unwrap())
+                .len(),
+            1
+        );
+
+        let two = ix.lookup(&Coord::parse(&format!("sha256:{SHA256_EMPTY}")).unwrap());
+        let backends: Vec<&str> = two.iter().map(|f| f.backend.as_str()).collect();
+        assert!(backends.contains(&"homebrew") && backends.contains(&"guix"));
+        for f in &two {
+            // md5-less rows co-observe nothing beyond sha256
+            assert_eq!(f.coords.len(), 1);
+            assert!(f.claims[0].url.as_deref().unwrap().starts_with("https://"));
+        }
+        // absent md5 never lands in the idx: the all-zero key finds nothing
+        let zero_md5 = Coord::parse(&format!("md5:{}", "0".repeat(32))).unwrap();
+        assert!(ix.lookup(&zero_md5).is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

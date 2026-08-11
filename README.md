@@ -131,6 +131,21 @@ Filter hits are probabilistic (default p = 10⁻⁴) and per-source, so a
 scan line tells you *which* index knows the file. Confirm anything
 important with `hdx <hash>`.
 
+One source is an exact inverted index instead of a filter:
+
+- **Release tarballs** — every content-level source above indexes what
+  is *inside* an archive, never the archive itself (Software Heritage
+  unpacks tarballs; Fedora hashes installed files), so a pristine
+  `hello-2.12.3.tar.gz` used to resolve to nothing. Debian sid,
+  Homebrew, and GNU Guix all publish per-artifact checksums for the
+  source archives they package: `tools/release_tarballs.py` harvests
+  all three indexes (six metadata GETs, no content) and
+  `hdx index build tarballs` turns them into ~160k witness rows that
+  resolve offline to claims like "Debian sid packages these bytes as
+  hello_2.12.3.orig.tar.gz" with a download URL — Guix's are
+  content-addressed mirror URLs that name the hash itself. Debian rows
+  carry md5 alongside sha256, a single-witness crosswalk edge.
+
 ## Build
 
 ```
