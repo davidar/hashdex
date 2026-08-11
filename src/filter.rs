@@ -1,33 +1,17 @@
 use crate::coord::Scheme;
+use crate::dcso::{self, Header, HEADER_LEN};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-/// Reader for the DCSO/hashlookup bloom filter format (the format CIRCL
-/// publishes hashlookup-full.bloom in).
-///
-/// Layout, all little-endian u64: version(=1), n (capacity), p (fpp as
-/// f64 bits), k (hash count), m (bit count), N (elements), then
-/// ceil(m/64) u64 words of bit array, then arbitrary trailing data.
-///
-/// Membership hashing (ported from DCSO/bloom, Go semantics preserved):
-///   h = FNV-1 64(value) % M            with M = 2^64 - 87
-///   repeat k times: h = (h *wrap* g) % M,  bit = h % m
-///   with g = 18446744073709550147.
-/// The multiply wraps mod 2^64 before the % M, because that is what Go's
-/// uint64 arithmetic does in the reference implementation.
-///
-/// CIRCL inserts SHA-1 digests as UPPERCASE HEX STRINGS.
+/// mmap-backed reader for DCSO/hashlookup bloom filters (the format
+/// CIRCL publishes hashlookup-full.bloom in). Format and membership
+/// hashing live in [`crate::dcso`].
 pub struct Bloom {
     k: u64,
     m: u64,
     mmap: memmap2::Mmap,
-    bits_offset: usize,
     pub n_elements: u64,
 }
-
-pub const HEADER_LEN: usize = 48;
-const MOD: u64 = 18_446_744_073_709_551_529; // 2^64 - 87
-const G: u64 = 18_446_744_073_709_550_147;
 
 impl Bloom {
     pub fn open(path: &Path) -> Result<Bloom> {
@@ -39,48 +23,27 @@ impl Bloom {
         // saturates the disk on filters bigger than RAM (the 70 GB SWH
         // filter made scans ~200x slower without this).
         let _ = mmap.advise(memmap2::Advice::Random);
-        if mmap.len() < HEADER_LEN {
-            bail!("bloom filter too short: {}", path.display());
-        }
-        let u64_at =
-            |i: usize| -> u64 { u64::from_le_bytes(mmap[i * 8..i * 8 + 8].try_into().unwrap()) };
-        let version = u64_at(0);
-        if version & 0xff != 1 {
-            bail!("unsupported bloom filter version {version}");
-        }
-        let k = u64_at(3);
-        let m = u64_at(4);
-        let n_elements = u64_at(5);
-        let words = m.div_ceil(64) as usize;
-        if mmap.len() < HEADER_LEN + words * 8 {
+        let h = Header::parse(&mmap, &path.display().to_string())?;
+        if mmap.len() < HEADER_LEN + h.bits_len() {
             bail!(
                 "bloom filter truncated: header says {} bits but file has {} bytes",
-                m,
+                h.m,
                 mmap.len()
             );
         }
         Ok(Bloom {
-            k,
-            m,
+            k: h.k,
+            m: h.m,
             mmap,
-            bits_offset: HEADER_LEN,
-            n_elements,
+            n_elements: h.n_elements,
         })
     }
 
     pub fn check(&self, value: &[u8]) -> bool {
-        let mut h = fnv1_64(value) % MOD;
-        for _ in 0..self.k {
-            h = h.wrapping_mul(G) % MOD;
-            let bit = h % self.m;
-            let word = (bit >> 6) as usize;
-            let off = self.bits_offset + word * 8;
-            let w = u64::from_le_bytes(self.mmap[off..off + 8].try_into().unwrap());
-            if w & (1u64 << (bit & 63)) == 0 {
-                return false;
-            }
-        }
-        true
+        dcso::check_with(value, self.k, self.m, |off| {
+            let off = off as usize;
+            u64::from_le_bytes(self.mmap[off..off + 8].try_into().unwrap())
+        })
     }
 }
 
@@ -99,12 +62,7 @@ pub struct BloomBuilder {
 impl BloomBuilder {
     /// Size for `n` expected elements at false-positive rate `p`.
     pub fn new(n: u64, p: f64) -> Result<BloomBuilder> {
-        if n == 0 || !(p > 0.0 && p < 1.0) {
-            bail!("bloom: need n > 0 and 0 < p < 1 (got n={n}, p={p})");
-        }
-        let ln2 = std::f64::consts::LN_2;
-        let m = ((n as f64) * (-p.ln()) / (ln2 * ln2)).ceil() as u64;
-        let k = ((m as f64 / n as f64) * ln2).round().max(1.0) as u64;
+        let (m, k) = dcso::size_for(n, p)?;
         let words = m.div_ceil(64) as usize;
         Ok(BloomBuilder {
             k,
@@ -117,10 +75,7 @@ impl BloomBuilder {
     }
 
     pub fn add(&mut self, value: &[u8]) {
-        let mut h = fnv1_64(value) % MOD;
-        for _ in 0..self.k {
-            h = h.wrapping_mul(G) % MOD;
-            let bit = h % self.m;
+        for bit in dcso::bit_positions(value, self.k, self.m) {
             self.bits[(bit >> 6) as usize] |= 1u64 << (bit & 63);
         }
         self.n_elements += 1;
@@ -135,16 +90,15 @@ impl BloomBuilder {
         let file = std::fs::File::create(path)
             .with_context(|| format!("create bloom filter {}", path.display()))?;
         let mut w = std::io::BufWriter::new(file);
-        for v in [
-            1u64,
-            self.n_capacity,
-            self.p.to_bits(),
-            self.k,
-            self.m,
-            self.n_elements,
-        ] {
-            w.write_all(&v.to_le_bytes())?;
-        }
+        let header = Header {
+            version: 1,
+            n_capacity: self.n_capacity,
+            p: self.p,
+            k: self.k,
+            m: self.m,
+            n_elements: self.n_elements,
+        };
+        w.write_all(&header.to_bytes())?;
         for word in &self.bits {
             w.write_all(&word.to_le_bytes())?;
         }
@@ -177,15 +131,8 @@ pub fn fold(src: &Path, dst: &Path) -> Result<FoldStats> {
         std::fs::File::open(src).with_context(|| format!("open bloom filter {}", src.display()))?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     let _ = mmap.advise(memmap2::Advice::Sequential);
-    if mmap.len() < HEADER_LEN {
-        bail!("bloom filter too short: {}", src.display());
-    }
-    let u64_at =
-        |i: usize| -> u64 { u64::from_le_bytes(mmap[i * 8..i * 8 + 8].try_into().unwrap()) };
-    let (version, n, k, m, n_elements) = (u64_at(0), u64_at(1), u64_at(3), u64_at(4), u64_at(5));
-    if version & 0xff != 1 {
-        bail!("unsupported bloom filter version {version}");
-    }
+    let h = Header::parse(&mmap, &src.display().to_string())?;
+    let (n, k, m, n_elements) = (h.n_capacity, h.k, h.m, h.n_elements);
     if m % 2 != 0 {
         bail!(
             "cannot fold: bit count m={m} is odd (folding needs the new size to divide the old; \
@@ -216,9 +163,17 @@ pub fn fold(src: &Path, dst: &Path) -> Result<FoldStats> {
         .with_context(|| format!("create folded filter {}", dst.display()))?;
     let mut w = std::io::BufWriter::new(out);
     // Header placeholder; p is patched after the fill count is known.
-    for v in [1u64, n, 0, k, m2, n_elements] {
-        w.write_all(&v.to_le_bytes())?;
-    }
+    w.write_all(
+        &Header {
+            version: 1,
+            n_capacity: n,
+            p: 0.0,
+            k,
+            m: m2,
+            n_elements,
+        }
+        .to_bytes(),
+    )?;
     let mut ones: u64 = 0;
     for j in 0..words2 {
         // New bit i = old bit i | old bit i+m2. The low word is src word
@@ -249,15 +204,6 @@ pub fn fold(src: &Path, dst: &Path) -> Result<FoldStats> {
         fill,
         p_new,
     })
-}
-
-fn fnv1_64(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in data {
-        h = h.wrapping_mul(0x100000001b3);
-        h ^= b as u64;
-    }
-    h
 }
 
 /// A named membership filter bound to the scheme it keys on.

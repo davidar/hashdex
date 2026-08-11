@@ -15,25 +15,42 @@ include = ["/src", "/Cargo.toml", "/README.md", "/LICENSE"]
 [[bin]]
 name = "hdx"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# The native side: CLI, network backends, mmap filters, sqlite cache.
+# Without it the remaining core compiles for wasm32.
+cli = [
+    "dep:clap",
+    "dep:tokio",
+    "dep:reqwest",
+    "dep:rusqlite",
+    "dep:dirs",
+    "dep:walkdir",
+    "dep:memmap2",
+    "dep:flate2",
+    "dep:futures",
+]
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "stream", "blocking", "http2"] }
+clap = { version = "4", features = ["derive"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "stream", "blocking", "http2"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 data-encoding = "2"
 sha1 = "0.10"
 sha2 = "0.10"
 md-5 = "0.10"
 blake2 = "0.10"
-futures = "0.3"
-dirs = "5"
-walkdir = "2"
-memmap2 = "0.9"
-flate2 = "1"
+futures = { version = "0.3", optional = true }
+dirs = { version = "5", optional = true }
+walkdir = { version = "2", optional = true }
+memmap2 = { version = "0.9", optional = true }
+flate2 = { version = "1", optional = true }
 parquet = { version = "59.1.0", default-features = false, features = ["zstd"] }
 bytes = "1.12.1"
 

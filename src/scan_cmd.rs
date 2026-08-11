@@ -83,6 +83,12 @@ pub struct Ticker {
     last_ms: std::sync::atomic::AtomicU64,
 }
 
+impl Default for Ticker {
+    fn default() -> Ticker {
+        Ticker::new()
+    }
+}
+
 impl Ticker {
     pub fn new() -> Ticker {
         use std::io::IsTerminal;

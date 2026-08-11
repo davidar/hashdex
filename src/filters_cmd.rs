@@ -354,7 +354,7 @@ pub fn fold(spec: &str) -> Result<()> {
     eprintln!(
         "folding {fname}: {} → ~{} (false positives rise; refetch to undo)…",
         human(old_bytes),
-        human(crate::filter::HEADER_LEN as u64 + (old_bytes.saturating_sub(48)) / 2),
+        human(crate::dcso::HEADER_LEN as u64 + (old_bytes.saturating_sub(48)) / 2),
     );
     drop(filters); // release the mmap on the file we're about to replace
     let stats = filter::fold(&path, &part)?;

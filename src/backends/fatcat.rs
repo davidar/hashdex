@@ -1,60 +1,31 @@
-use crate::coord::{Coord, Scheme};
-use crate::finding::{Claim, Finding};
+//! Native transport for the fatcat dataset (`crate::fatcat`): blocking
+//! HTTP range reads against the published parquet, revision-pinned and
+//! persisted on disk.
+//!
+//! URLs are pinned to a repo revision (Hub API, refreshed hourly), so
+//! every byte range is immutable and fetched ranges persist on disk
+//! across invocations with no validation traffic. A stale pin is safe:
+//! old revisions stay fetchable, they're just up to an hour behind.
+
+use crate::coord::Coord;
+use crate::fatcat::{start_paths, DATASET_BASE, REVISION_API};
+use crate::finding::Finding;
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use parquet::column::reader::{get_typed_column_reader, ColumnReaderImpl};
-use parquet::data_type::{ByteArrayType, DataType, Int32Type, Int64Type};
-use parquet::file::metadata::{
-    PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
-};
-use parquet::file::page_index::column_index::ColumnIndexMetaData;
-use parquet::file::page_index::offset_index::PageLocation;
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::reader::{ChunkReader, Length};
-use parquet::file::serialized_reader::SerializedPageReader;
-use parquet::file::statistics::Statistics;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
-pub const NAME: &str = "fatcat";
+pub use crate::fatcat::{supports, NAME};
 
-/// The final fatcat bulk export (2024-02-18), republished as parquet
-/// sorted by sha256 (weak-digest maps sorted by their key). fatcat.wiki
-/// is offline, so the claim URLs are the ones that still resolve: the
-/// wayback capture of the hashed bytes first, then the DOI.
-///
-/// Transport: HTTP range reads against the published parquet itself.
-/// Row-group footer stats route each digest to one ~256K-row group;
-/// the sorted key column is fetched in a single ranged request and
-/// scanned with early exit; the handful of claim columns are then
-/// page-skipped to the matching rows. No server-side query layer —
-/// the sorted layout IS the index.
-///
-/// URLs are pinned to a repo revision (Hub API, refreshed hourly), so
-/// every byte range is immutable and fetched ranges persist on disk
-/// across invocations with no validation traffic. A stale pin is safe:
-/// old revisions stay fetchable, they're just up to an hour behind.
-const DATASET_BASE: &str = "https://huggingface.co/datasets/david-ar/fatcat-files/resolve";
-const REVISION_API: &str =
-    "https://huggingface.co/api/datasets/david-ar/fatcat-files/revision/main";
 const REVISION_TTL: Duration = Duration::from_secs(3600);
-const SHOWN: usize = 5;
-/// Releases read per digest (claims render at most SHOWN; the rest is
-/// only counted). Bounds pathological many-release files.
-const MAX_ROWS: usize = 50;
 /// Block size for page-header walks through uncached territory.
 const HEADER_BLOCK: usize = 16 << 10;
-/// Column chunks at or below this arrive as one ranged request instead
-/// of a header walk: below ~4 MB one bulk fetch beats a round-trip per
-/// skipped page.
-const PREFETCH_MAX: u64 = 4 << 20;
-
-pub fn supports(s: Scheme) -> bool {
-    matches!(s, Scheme::Md5 | Scheme::Sha1 | Scheme::Sha256)
-}
 
 // ---------------------------------------------------------------- transport
 
@@ -557,306 +528,7 @@ fn open_remote(path: &str) -> Result<Arc<RemoteFile>> {
     Ok(file)
 }
 
-// ------------------------------------------------------------------ search
-
-fn column_index(meta: &ParquetMetaData, name: &str) -> Result<usize> {
-    meta.file_metadata()
-        .schema_descr()
-        .columns()
-        .iter()
-        .position(|c| c.path().string() == name)
-        .with_context(|| format!("column {name} not in parquet schema"))
-}
-
-/// Row groups whose footer min/max admit `key` (0 or 1 in practice;
-/// 2 when a digest's rows straddle a boundary).
-fn candidate_row_groups(meta: &ParquetMetaData, col: usize, key: &[u8]) -> Vec<usize> {
-    meta.row_groups()
-        .iter()
-        .enumerate()
-        .filter(|(_, rg)| match rg.column(col).statistics() {
-            Some(Statistics::ByteArray(s)) => match (s.min_opt(), s.max_opt()) {
-                (Some(min), Some(max)) => min.data() <= key && key <= max.data(),
-                _ => false,
-            },
-            _ => false,
-        })
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// Page locations for one column chunk, when the footer carries an
-/// offset index. With locations the page reader seeks straight to a
-/// page and skips others without any read; without, skipping means
-/// walking page headers.
-fn page_locations(meta: &ParquetMetaData, rgi: usize, col: usize) -> Option<Vec<PageLocation>> {
-    Some(
-        meta.offset_index()?
-            .get(rgi)?
-            .get(col)?
-            .page_locations()
-            .clone(),
-    )
-}
-
-fn typed_reader<R: ChunkReader + 'static, T: DataType>(
-    reader: &Arc<R>,
-    rg: &RowGroupMetaData,
-    col: usize,
-    locations: Option<Vec<PageLocation>>,
-) -> Result<ColumnReaderImpl<T>> {
-    let pages = SerializedPageReader::new(
-        Arc::clone(reader),
-        rg.column(col),
-        rg.num_rows() as usize,
-        locations,
-    )?;
-    Ok(get_typed_column_reader::<T>(
-        parquet::column::reader::get_column_reader(meta_column(rg, col), Box::new(pages)),
-    ))
-}
-
-fn meta_column(rg: &RowGroupMetaData, col: usize) -> parquet::schema::types::ColumnDescPtr {
-    rg.schema_descr().column(col)
-}
-
-/// Scan the sorted key column of one row group for `key`: returns the
-/// first matching record index and how many match (counting continues
-/// past `cap` so "and N more" stays honest, but stops at the group end
-/// or first greater value).
-///
-/// With a page index, per-page min/max route the scan straight to the
-/// first admitting page (or prove absence with no data read at all).
-/// Without one, the whole key chunk is fetched up front in one ranged
-/// request — it gets decoded anyway.
-fn scan_key_column<R: ChunkReader + 'static>(
-    reader: &Arc<R>,
-    meta: &ParquetMetaData,
-    rgi: usize,
-    col: usize,
-    key: &[u8],
-) -> Result<Option<(usize, usize)>> {
-    let rg = meta.row_group(rgi);
-    let locations = page_locations(meta, rgi, col);
-    let column_index = meta
-        .column_index()
-        .and_then(|c| c.get(rgi)?.get(col))
-        .and_then(|ix| match ix {
-            ColumnIndexMetaData::BYTE_ARRAY(ix) => Some(ix),
-            _ => None,
-        });
-    let skip = match (&locations, column_index) {
-        (Some(locs), Some(ix)) => {
-            // Keys are globally sorted, so admitting pages are
-            // contiguous; land on the first.
-            let admits = (0..locs.len()).position(|i| {
-                matches!((ix.min_value(i), ix.max_value(i)),
-                    (Some(mn), Some(mx)) if mn <= key && key <= mx)
-            });
-            match admits {
-                Some(page) => locs[page].first_row_index as usize,
-                None => return Ok(None),
-            }
-        }
-        _ => {
-            let (start, len) = rg.column(col).byte_range();
-            let _ = reader.get_bytes(start, len as usize)?; // warm the range cache
-            0
-        }
-    };
-    let mut r = typed_reader::<R, ByteArrayType>(reader, rg, col, locations)?;
-    if skip > 0 {
-        r.skip_records(skip)?;
-    }
-    let max_def = meta_column(rg, col).max_def_level();
-    let (mut record, mut first, mut count) = (skip, None, 0usize);
-    loop {
-        let mut vals = Vec::new();
-        let mut defs: Vec<i16> = Vec::new();
-        // Modest batches: the reader only fetches pages it must, so a
-        // small batch keeps the early exit from dragging in pages past
-        // the match (in-page state carries across calls).
-        let (records, _, _) = r.read_records(256, Some(&mut defs), None, &mut vals)?;
-        if records == 0 {
-            break;
-        }
-        // A required column (max_def 0) fills no def levels.
-        defs.resize(records, max_def);
-        let mut vi = 0;
-        for &d in defs.iter().take(records) {
-            let val = if d == max_def {
-                let v = vals[vi].data();
-                vi += 1;
-                Some(v)
-            } else {
-                None
-            };
-            if let Some(v) = val {
-                if v == key {
-                    first.get_or_insert(record);
-                    count += 1;
-                } else if v > key {
-                    return Ok(first.map(|f| (f, count)));
-                }
-            }
-            record += 1;
-        }
-    }
-    Ok(first.map(|f| (f, count)))
-}
-
-enum ColValues {
-    Str(Vec<Option<String>>),
-    I32(Vec<Option<i32>>),
-    I64(Vec<Option<i64>>),
-}
-
-/// Read `take` records of one column starting at record `skip`,
-/// page-skipping everything before it.
-fn read_column<R: ChunkReader + 'static>(
-    reader: &Arc<R>,
-    meta: &ParquetMetaData,
-    rgi: usize,
-    col: usize,
-    skip: usize,
-    take: usize,
-) -> Result<ColValues> {
-    use parquet::basic::Type;
-    let rg = meta.row_group(rgi);
-    let locations = page_locations(meta, rgi, col);
-    let max_def = meta_column(rg, col).max_def_level();
-    macro_rules! read {
-        ($t:ty, $conv:expr) => {{
-            let mut r = typed_reader::<R, $t>(reader, rg, col, locations.clone())?;
-            if skip > 0 {
-                r.skip_records(skip)?;
-            }
-            let mut vals = Vec::new();
-            let mut defs: Vec<i16> = Vec::new();
-            let mut out = Vec::with_capacity(take);
-            while out.len() < take {
-                vals.clear();
-                defs.clear();
-                let (records, _, _) =
-                    r.read_records(take - out.len(), Some(&mut defs), None, &mut vals)?;
-                if records == 0 {
-                    break;
-                }
-                defs.resize(records, max_def); // required cols fill no def levels
-                let mut vi = 0;
-                for &d in defs.iter().take(records) {
-                    if d == max_def {
-                        out.push(Some($conv(&vals[vi])));
-                        vi += 1;
-                    } else {
-                        out.push(None);
-                    }
-                }
-            }
-            out
-        }};
-    }
-    Ok(match meta_column(rg, col).physical_type() {
-        Type::BYTE_ARRAY => {
-            ColValues::Str(read!(ByteArrayType, |v: &parquet::data_type::ByteArray| {
-                String::from_utf8_lossy(v.data()).into_owned()
-            }))
-        }
-        Type::INT32 => ColValues::I32(read!(Int32Type, |v: &i32| *v)),
-        Type::INT64 => ColValues::I64(read!(Int64Type, |v: &i64| *v)),
-        t => anyhow::bail!("unsupported column type {t}"),
-    })
-}
-
-/// Point lookup in a parquet file sorted by `key_col`: rows (as JSON
-/// objects of the requested columns) whose key equals `key`, plus the
-/// total number of matching rows.
-fn find_rows<R: ChunkReader + 'static>(
-    reader: &Arc<R>,
-    meta: &ParquetMetaData,
-    key_col: &str,
-    cols: &[&str],
-    key: &str,
-    cap: usize,
-) -> Result<(Vec<Value>, usize)> {
-    let kidx = column_index(meta, key_col)?;
-    let mut rows = Vec::new();
-    let mut total = 0usize;
-    for rgi in candidate_row_groups(meta, kidx, key.as_bytes()) {
-        let rg = meta.row_group(rgi);
-        let Some((first, count)) = scan_key_column(reader, meta, rgi, kidx, key.as_bytes())? else {
-            continue;
-        };
-        total += count;
-        let take = count.min(cap.saturating_sub(rows.len()));
-        if take == 0 {
-            continue;
-        }
-        let mut objs: Vec<serde_json::Map<String, Value>> = vec![serde_json::Map::new(); take];
-        // One thread per column: each is a chain of ranged reads, so
-        // the wall clock is the slowest column, not the sum.
-        let col_vals: Vec<(&str, Result<ColValues>)> = std::thread::scope(|s| {
-            let handles: Vec<_> = cols
-                .iter()
-                .map(|name| {
-                    s.spawn(move || {
-                        let cidx = column_index(meta, name)?;
-                        // Whole-chunk prefetch only pays off when there
-                        // is no offset index to seek by.
-                        if meta.offset_index().is_none() {
-                            let (start, len) = rg.column(cidx).byte_range();
-                            if len <= PREFETCH_MAX {
-                                let _ = reader.get_bytes(start, len as usize)?;
-                            }
-                        }
-                        read_column(reader, meta, rgi, cidx, first, take)
-                    })
-                })
-                .collect();
-            cols.iter()
-                .zip(handles)
-                .map(|(name, h)| (*name, h.join().expect("column reader panicked")))
-                .collect()
-        });
-        for (name, vals) in col_vals {
-            let vals = vals?;
-            for (i, obj) in objs.iter_mut().enumerate() {
-                let v = match &vals {
-                    ColValues::Str(v) => v[i].as_ref().map_or(Value::Null, |s| json!(s)),
-                    ColValues::I32(v) => v[i].map_or(Value::Null, |n| json!(n)),
-                    ColValues::I64(v) => v[i].map_or(Value::Null, |n| json!(n)),
-                };
-                obj.insert(name.to_string(), v);
-            }
-        }
-        for mut obj in objs {
-            obj.insert(key_col.to_string(), json!(key));
-            rows.push(Value::Object(obj));
-        }
-    }
-    Ok((rows, total))
-}
-
 // ------------------------------------------------------------------ lookup
-
-const DATA_COLS: &[&str] = &[
-    "title",
-    "release_year",
-    "container_name",
-    "doi",
-    "arxiv",
-    "wayback_url",
-    "sha1",
-    "md5",
-];
-
-fn data_path(sha256: &str) -> String {
-    format!("data/files-{}.parquet", &sha256[..1])
-}
-
-fn hex(coord: &Coord) -> String {
-    coord.digest.iter().map(|b| format!("{b:02x}")).collect()
-}
 
 /// Open every remote file a probe batch will certainly need, in
 /// parallel and outside any per-probe timeout. Cold opens (an 8 MB
@@ -866,21 +538,7 @@ fn hex(coord: &Coord) -> String {
 /// fan out to data files only known after the map lookup — those
 /// still open lazily, one single-flighted open per file.
 pub fn preopen(coords: &[Coord]) {
-    let mut paths = HashSet::new();
-    for c in coords {
-        match c.scheme {
-            Scheme::Sha256 => {
-                paths.insert(data_path(&hex(c)));
-            }
-            Scheme::Sha1 => {
-                paths.insert("maps/sha1.parquet".to_string());
-            }
-            Scheme::Md5 => {
-                paths.insert("maps/md5.parquet".to_string());
-            }
-            _ => {}
-        }
-    }
+    let paths: HashSet<String> = coords.iter().flat_map(start_paths).collect();
     std::thread::scope(|s| {
         for p in &paths {
             s.spawn(move || {
@@ -890,299 +548,19 @@ pub fn preopen(coords: &[Coord]) {
     });
 }
 
-fn blocking_lookup(coord: &Coord) -> Result<Option<Finding>> {
-    let hex: String = coord.digest.iter().map(|b| format!("{b:02x}")).collect();
-    // Weak digests go through the sorted maps to sha256 first.
-    let sha256s: Vec<String> = match coord.scheme {
-        Scheme::Sha256 => vec![hex],
-        Scheme::Sha1 | Scheme::Md5 => {
-            let scheme = if coord.scheme == Scheme::Sha1 {
-                "sha1"
-            } else {
-                "md5"
-            };
-            let file = open_remote(&format!("maps/{scheme}.parquet"))?;
-            let (rows, _) = find_rows(&file.remote, &file.meta, scheme, &["sha256"], &hex, 8)?;
-            let mut v: Vec<String> = rows
-                .iter()
-                .filter_map(|r| r["sha256"].as_str().map(str::to_string))
-                .collect();
-            v.dedup();
-            v.truncate(3); // weak-digest collisions are rendered, not merged
-            v
-        }
-        _ => return Ok(None),
-    };
-    if sha256s.is_empty() {
-        return Ok(None);
-    }
-
-    let mut rows = Vec::new();
-    let mut total = 0usize;
-    for sha in &sha256s {
-        let file = open_remote(&data_path(sha))?;
-        let (mut r, t) = find_rows(&file.remote, &file.meta, "sha256", DATA_COLS, sha, MAX_ROWS)?;
-        rows.append(&mut r);
-        total += t;
-    }
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    let mut claims: Vec<Claim> = rows.iter().take(SHOWN).map(claim).collect();
-    if total > SHOWN {
-        claims.push(Claim::new(
-            format!("… and {} more releases", total - SHOWN),
-            None,
-        ));
-    }
-    // Each dataset row is a single witness carrying all three digests —
-    // exactly the multi-hash row the edge-minting rule admits.
-    let coords = ["sha1", "sha256", "md5"]
-        .iter()
-        .filter_map(|s| {
-            let hex = rows[0][*s].as_str()?;
-            Some(format!("{s}:{hex}"))
-        })
-        .collect();
-    Ok(Some(Finding {
-        backend: NAME.into(),
-        claims,
-        coords,
-    }))
+fn open_pair(path: &str) -> Result<(Arc<Remote>, Arc<ParquetMetaData>)> {
+    let file = open_remote(path)?;
+    Ok((Arc::clone(&file.remote), Arc::clone(&file.meta)))
 }
 
 pub async fn lookup(_client: &reqwest::Client, coord: &Coord) -> Result<Option<Finding>> {
     let coord = coord.clone();
-    tokio::task::spawn_blocking(move || blocking_lookup(&coord)).await?
-}
-
-fn claim(row: &Value) -> Claim {
-    let mut statement = format!(
-        "scholarly file: \"{}\"",
-        row["title"].as_str().unwrap_or("(untitled)")
-    );
-    if let Some(year) = row["release_year"].as_i64() {
-        statement.push_str(&format!(" ({year})"));
-    }
-    if let Some(venue) = row["container_name"].as_str() {
-        statement.push_str(&format!(", {venue}"));
-    }
-    let doi = row["doi"].as_str();
-    let arxiv = row["arxiv"].as_str();
-    if let Some(doi) = doi {
-        statement.push_str(&format!(", doi:{doi}"));
-    } else if let Some(arxiv) = arxiv {
-        statement.push_str(&format!(", arXiv:{arxiv}"));
-    }
-    let url = row["wayback_url"]
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| doi.map(|d| format!("https://doi.org/{d}")))
-        .or_else(|| arxiv.map(|a| format!("https://arxiv.org/abs/{a}")));
-    Claim::new(statement, url)
+    tokio::task::spawn_blocking(move || crate::fatcat::lookup_with(open_pair, &coord)).await?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    // Bytes, not File: File's ChunkReader dups the fd, whose shared
-    // seek position races under the parallel column reads.
-    fn fixture(name: &str) -> Option<(Arc<Bytes>, Arc<ParquetMetaData>)> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/data/fatcat")
-            .join(name);
-        let bytes = Bytes::from(std::fs::read(path).ok()?);
-        let meta = ParquetMetaDataReader::new().parse_and_finish(&bytes).ok()?;
-        Some((Arc::new(bytes), Arc::new(meta)))
-    }
-
-    /// In-memory reader that counts every data byte handed out, so
-    /// tests can assert what the page index saves us from reading.
-    struct Counting {
-        inner: Bytes,
-        read: Arc<AtomicUsize>,
-    }
-
-    struct CountingRead {
-        inner: Bytes,
-        read: Arc<AtomicUsize>,
-    }
-
-    impl Read for CountingRead {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let n = self.inner.len().min(buf.len());
-            buf[..n].copy_from_slice(&self.inner.split_to(n));
-            self.read.fetch_add(n, Ordering::Relaxed);
-            Ok(n)
-        }
-    }
-
-    impl Length for Counting {
-        fn len(&self) -> u64 {
-            self.inner.len() as u64
-        }
-    }
-
-    impl ChunkReader for Counting {
-        type T = CountingRead;
-        fn get_read(&self, start: u64) -> parquet::errors::Result<CountingRead> {
-            Ok(CountingRead {
-                inner: self.inner.slice(start as usize..),
-                read: Arc::clone(&self.read),
-            })
-        }
-        fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
-            self.read.fetch_add(length, Ordering::Relaxed);
-            Ok(self.inner.slice(start as usize..start as usize + length))
-        }
-    }
-
-    /// The page-indexed fixtures (tools/make_fatcat_fixtures.py). The
-    /// footer MUST carry the index — Required, not Optional — so a
-    /// regressed generator fails loudly instead of silently testing
-    /// the fallback path twice.
-    fn fixture_pi(name: &str) -> Option<(Arc<Counting>, Arc<AtomicUsize>, Arc<ParquetMetaData>)> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/data/fatcat")
-            .join(name);
-        let bytes = Bytes::from(std::fs::read(path).ok()?);
-        let meta = ParquetMetaDataReader::new()
-            .with_page_index_policy(PageIndexPolicy::Required)
-            .parse_and_finish(&bytes)
-            .expect("page-indexed fixture must carry offset+column indexes");
-        let read = Arc::new(AtomicUsize::new(0));
-        let counting = Arc::new(Counting {
-            inner: bytes,
-            read: Arc::clone(&read),
-        });
-        Some((counting, read, Arc::new(meta)))
-    }
-
-    /// key(i) from tools/make_fatcat_fixtures.py.
-    fn key(i: u64) -> String {
-        format!("{:064x}", i * 16 + 8)
-    }
-
-    /// A key strictly between page 0's max and page 1's min in the
-    /// first row group: admitted by row-group stats, by no page.
-    fn page_gap_key(meta: &ParquetMetaData, kidx: usize) -> String {
-        let Some(ColumnIndexMetaData::BYTE_ARRAY(ix)) = meta.column_index().unwrap()[0].get(kidx)
-        else {
-            panic!("no byte-array column index on the key column")
-        };
-        let max0 = std::str::from_utf8(ix.max_value(0).unwrap()).unwrap();
-        let tail = u64::from_str_radix(&max0[max0.len() - 16..], 16).unwrap();
-        format!("{:064x}", tail + 8)
-    }
-
-    #[test]
-    fn page_index_point_lookup() {
-        let Some((file, read, meta)) = fixture_pi("files_pi.parquet") else {
-            return; // fixture not generated on this machine
-        };
-
-        // Straddle key: two releases across the rg0/rg1 boundary.
-        let k = key(1999);
-        let (rows, total) = find_rows(&file, &meta, "sha256", DATA_COLS, &k, MAX_ROWS).unwrap();
-        assert_eq!(total, 2);
-        assert_eq!(rows[0]["title"].as_str(), Some("Straddle One"));
-        assert_eq!(rows[1]["doi"].as_str(), Some("10.1234/straddle-two"));
-
-        // The point of the page index: a small fraction of the file
-        // read, not whole column chunks.
-        let bytes_read = read.load(Ordering::Relaxed);
-        let total_bytes: i64 = meta
-            .row_groups()
-            .iter()
-            .map(|rg| rg.compressed_size())
-            .sum();
-        assert!(
-            (bytes_read as i64) * 5 < total_bytes,
-            "read {bytes_read} of {total_bytes} compressed bytes"
-        );
-
-        // One key, 41 releases spanning several pages: honest count.
-        let (rows, total) =
-            find_rows(&file, &meta, "sha256", DATA_COLS, &key(3999), MAX_ROWS).unwrap();
-        assert_eq!(total, 41);
-        assert_eq!(rows[40]["title"].as_str(), Some("Many Releases 40"));
-
-        // Admitted by a page but absent: settled by reading pages.
-        let absent = format!("{:064x}", 16u64); // between key(0) and key(1)
-        let (rows, total) =
-            find_rows(&file, &meta, "sha256", DATA_COLS, &absent, MAX_ROWS).unwrap();
-        assert!(rows.is_empty() && total == 0);
-
-        // Falling between two pages: absence proven from the footer
-        // alone — zero data bytes fetched.
-        let kidx = column_index(&meta, "sha256").unwrap();
-        let gap = page_gap_key(&meta, kidx);
-        let before = read.load(Ordering::Relaxed);
-        let (rows, total) = find_rows(&file, &meta, "sha256", DATA_COLS, &gap, MAX_ROWS).unwrap();
-        assert!(rows.is_empty() && total == 0);
-        assert_eq!(
-            read.load(Ordering::Relaxed),
-            before,
-            "between-pages absence must not read data"
-        );
-    }
-
-    #[test]
-    fn page_index_weak_digest_map() {
-        let Some((file, _read, meta)) = fixture_pi("sha1_map_pi.parquet") else {
-            return;
-        };
-        let sha1 = format!("{:040x}", 1999);
-        let (rows, _) = find_rows(&file, &meta, "sha1", &["sha256"], &sha1, 8).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["sha256"].as_str(), Some(key(1999).as_str()));
-    }
-
-    #[test]
-    fn fixture_point_lookup() {
-        let Some((file, meta)) = fixture("files.parquet") else {
-            return; // fixture not generated on this machine
-        };
-        // Key present with two releases (rows straddle a row-group edge).
-        let key = "aa".repeat(32);
-        let (rows, total) = find_rows(&file, &meta, "sha256", DATA_COLS, &key, MAX_ROWS).unwrap();
-        assert_eq!(total, 2);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0]["title"].as_str(), Some("Straddle Paper"));
-        assert_eq!(rows[0]["sha1"].as_str(), Some("11".repeat(20).as_str()));
-        assert_eq!(rows[1]["doi"].as_str(), Some("10.1234/second"));
-        // Null columns render as JSON null, not a crash.
-        assert!(rows[1]["container_name"].is_null());
-        let c = claim(&rows[0]);
-        assert!(c.statement.contains("Straddle Paper"));
-        assert!(c.url.as_deref().unwrap().contains("web.archive.org"));
-
-        // Absent key: no candidate row group admits it.
-        let (rows, total) = find_rows(
-            &file,
-            &meta,
-            "sha256",
-            DATA_COLS,
-            &"00".repeat(32),
-            MAX_ROWS,
-        )
-        .unwrap();
-        assert!(rows.is_empty() && total == 0);
-
-        // Present nibble range but absent key: scan returns nothing.
-        let (rows, _) = find_rows(
-            &file,
-            &meta,
-            "sha256",
-            DATA_COLS,
-            &"ab".repeat(32),
-            MAX_ROWS,
-        )
-        .unwrap();
-        assert!(rows.is_empty());
-    }
 
     #[test]
     fn disk_cache_roundtrip_and_eviction() {
@@ -1205,15 +583,5 @@ mod tests {
         assert!(cache.get(100, 50).is_none(), "oldest blob evicted");
         assert!(cache.get(2 << 30, 8).is_some(), "newest survives");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn fixture_weak_digest_map() {
-        let Some((file, meta)) = fixture("sha1_map.parquet") else {
-            return;
-        };
-        let (rows, _) = find_rows(&file, &meta, "sha1", &["sha256"], &"11".repeat(20), 8).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["sha256"].as_str(), Some("aa".repeat(32).as_str()));
     }
 }

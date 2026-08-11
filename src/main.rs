@@ -1,21 +1,8 @@
-mod backends;
-mod cache;
-mod coord;
-mod coords_cmd;
-mod filter;
-mod filters_cmd;
-mod finding;
-mod index_cmd;
-mod inverted;
-mod local_index;
-mod resolve;
-mod scan_cmd;
-mod walk;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use coord::{Coord, Scheme};
-use resolve::{Options, Resolution};
+use hashdex::coord::{Coord, Scheme};
+use hashdex::resolve::{self, Options, Resolution};
+use hashdex::{cache, coords_cmd, filter, filters_cmd, index_cmd, local_index, scan_cmd};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
