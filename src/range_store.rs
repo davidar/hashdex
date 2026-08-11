@@ -266,10 +266,10 @@ mod tests {
         // with two releases.
         let sha1 = format!("{:040x}", 1999);
         let coord = Coord::parse(&format!("sha1:{sha1}")).unwrap();
-        let finding = map
+        let findings = map
             .drive(|| files.drive(|| fatcat::lookup_with(open, &coord)))
-            .unwrap()
-            .expect("known digest must resolve");
+            .unwrap();
+        let finding = findings.first().expect("known digest must resolve");
 
         assert_eq!(finding.backend, "fatcat");
         assert!(finding.claims[0].statement.contains("Straddle One"));
@@ -297,7 +297,7 @@ mod tests {
         let before = files.round_trips.load(Ordering::Relaxed);
         let gap = Coord::parse(&format!("sha256:{:064x}", 16u64 * 16)).unwrap();
         let miss = files.drive(|| fatcat::lookup_with(open, &gap)).unwrap();
-        assert!(miss.is_none());
+        assert!(miss.is_empty());
         assert_eq!(
             files.round_trips.load(Ordering::Relaxed),
             before,

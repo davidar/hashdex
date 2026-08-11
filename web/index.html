@@ -276,7 +276,7 @@ async function resolveCoords(coords, file, token) {
   if (fatcatCoord) datasets.push({
     label: "fatcat",
     call: () => fatcat_lookup(`${fatcatCoord}:${coords[fatcatCoord]}`),
-    findings: (v) => (v ? [v] : []),
+    findings: (v) => v || [],
     attestor: (f) => `attested by ${f.backend} (IA fatcat bulk export, 2024-02-18)`,
   });
   if (tarballsCoord) datasets.push({

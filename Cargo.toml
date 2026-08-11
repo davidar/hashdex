@@ -54,5 +54,10 @@ flate2 = { version = "1", optional = true }
 parquet = { version = "59.1.0", default-features = false, features = ["zstd"] }
 bytes = "1.12.1"
 
+[dev-dependencies]
+# The CLI tests write tiny fixture datasets (the same page-oriented
+# parquet the published repos hold) into their scratch cache dirs.
+parquet = { version = "59.1.0", default-features = false }
+
 [profile.release]
 lto = true

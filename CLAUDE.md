@@ -22,15 +22,18 @@ hdx coords <file>     # mint all six coordinates of local files
 hdx scan <dir>        # scan against filters + attribute what it can
                       #   (dataset probes by default; --no-resolve =
                       #   census; --online consents to third-party APIs)
-hdx index build fatcat <tsv.gz>   # self-invert a dump (sorted mmap index)
+hdx index pull tarballs           # local copy of a published dataset
+                                  #   (same parquet, mmap'd; resolution
+                                  #   is remote range reads by default)
 tools/release_tarballs.py         # harvest debian/homebrew/guix artifact
-                                  #   hashes → `hdx index build tarballs`
+                                  #   hashes (dump → published parquet)
 hdx filters fetch     # install CIRCL bloom (~1 GB) into the cache dir
 ```
 
 Env: `SWH_TOKEN` (raises SWH quota 120→1200/h), `HF_TOKEN` (raises
-Hub rate limits for the fatcat backend's range reads). Cache +
-filters: `~/.cache/hashdex/`.
+Hub rate limits for the dataset backends' range reads). Cache +
+filters: `~/.cache/hashdex/`. Published datasets are parquet on the
+wire AND at rest — no bespoke local index formats (HDXI is retired).
 
 ## Rules that must not be violated (from DESIGN.md)
 

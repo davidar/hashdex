@@ -55,11 +55,11 @@ metadata, full stop.
 
 | | |
 |---|---|
-| `hdx <hash>` | resolve: local walk over inverted indexes + observation store, then live backends (hex, base32, SRI, SWHID, `scheme:hex`); `--offline` skips the network |
+| `hdx <hash>` | resolve: local walk over pulled datasets + observation store, then live backends (hex, base32, SRI, SWHID, `scheme:hex`); `--offline` skips the network |
 | `hdx scan <paths>` | scan + attribute: hash files (persisted updatedb-style, so rescans are stat-only), check membership filters, cite what the indexes can name. `--no-resolve` = membership census only; `-v` = full citation blocks; `--list unknown\|known\|all` = per-file lines |
 | `hdx coords <file> [--lookup]` | mint all six coordinates of a local file (md5, sha1, sha256, sha512, blake2s256, git blob); recorded as a local crosswalk observation |
 | `hdx locate <hash>` | find local files by digest (inverse of `hdx <hash>`) |
-| `hdx index build <source> <dump>` | self-invert a source dump (e.g. fatcat) into a sorted mmap coordinate index |
+| `hdx index pull <name>` | download a published claim dataset (fatcat, tarballs) for local + offline resolution — by default hdx range-reads the published parquet on demand; `hdx index rm` frees the copy |
 | `hdx filters fetch [names\|--all]` | download published membership filters (no args: list what's available) |
 | `hdx filters build <name> <scheme> <files>` | build a DCSO-format bloom from hex digest lines |
 | `hdx filters fold <name>` | halve a filter's size in place, trading false-positive rate for space |
@@ -73,9 +73,10 @@ Privacy is a consent line, not a mode:
 
 - **Offline by default where it matters**: membership checks and
   `scan`'s attribution walk run against local filters and indexes.
-- **Dataset transports** (the fatcat scholarly index) are range reads
-  over static published parquet — the server sees byte offsets, never
-  your digests — so `scan` uses them without asking.
+- **Dataset transports** (the fatcat scholarly index, release
+  tarballs) are range reads over static published parquet — the
+  server sees byte offsets, never your digests — so `scan` uses them
+  without asking. `hdx index pull` makes them local and fully offline.
 - **Third-party APIs** (CIRCL, deps.dev, Software Heritage, Rekor,
   snapshot.debian.org) are only told your digests when you
   ask: single-hash `hdx <hash>` lookups query them, and batch scans
@@ -131,7 +132,7 @@ Filter hits are probabilistic (default p = 10⁻⁴) and per-source, so a
 scan line tells you *which* index knows the file. Confirm anything
 important with `hdx <hash>`.
 
-One source is an exact inverted index instead of a filter:
+One source is an exact witness index instead of a filter:
 
 - **Release tarballs** — every content-level source above indexes what
   is *inside* an archive, never the archive itself (Software Heritage
@@ -139,15 +140,15 @@ One source is an exact inverted index instead of a filter:
   `hello-2.12.3.tar.gz` used to resolve to nothing. Debian sid,
   Homebrew, and GNU Guix all publish per-artifact checksums for the
   source archives they package: `tools/release_tarballs.py` harvests
-  all three indexes (six metadata GETs, no content) and
-  `hdx index build tarballs` turns them into ~160k witness rows that
-  resolve offline to claims like "Debian sid packages these bytes as
+  all three indexes (six metadata GETs, no content) into ~160k witness
+  rows, published as page-indexed parquet
+  ([release-tarballs](https://huggingface.co/datasets/david-ar/release-tarballs)).
+  `hdx <hash>` point-reads it remotely by default and resolves to
+  claims like "Debian sid packages these bytes as
   hello_2.12.3.orig.tar.gz" with a download URL — Guix's are
   content-addressed mirror URLs that name the hash itself. Debian rows
-  carry md5 alongside sha256, a single-witness crosswalk edge. The
-  same rows are published as page-indexed parquet
-  ([release-tarballs](https://huggingface.co/datasets/david-ar/release-tarballs))
-  for remote point lookups.
+  carry md5 alongside sha256, a single-witness crosswalk edge.
+  `hdx index pull tarballs` (~25 MB) makes it local and offline.
 
 ## Build
 
@@ -161,7 +162,7 @@ or from a checkout: `cargo build --release` (binary at
 ## Status
 
 Early but real: the federated resolver, disk scanner, local hash
-index, inverted-index crosswalk walk, and ten filter families work
+index, cross-source crosswalk walk, and ten filter families work
 today. On the author's
 machine the filters identify 68% of all files (by count) as publicly
 known bytes — most of the remainder is content that only ever existed

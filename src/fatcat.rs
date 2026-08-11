@@ -1,7 +1,8 @@
 //! The fatcat scholarly file index, transport-free: dataset identity,
 //! digest→file routing, claim rendering, and the lookup driver. The
-//! native backend (`backends::fatcat`) drives this over blocking HTTP
-//! range reads with a disk cache; a wasm build drives it over fetch.
+//! native backend (`backends::dataset`) drives this over blocking HTTP
+//! range reads with a disk cache — or over an mmap of a pulled local
+//! copy; a wasm build drives it over fetch.
 //!
 //! The dataset is the final fatcat bulk export (2024-02-18),
 //! republished as parquet sorted by sha256 (weak-digest maps sorted by
@@ -66,8 +67,10 @@ fn hex(coord: &Coord) -> String {
 
 /// The whole lookup, generic over how a repo-relative path becomes a
 /// readable file: weak digests go through the sorted maps to sha256
-/// first, then the data files yield claims.
-pub fn lookup_with<R, F>(open: F, coord: &Coord) -> Result<Option<Finding>>
+/// first, then the data files yield claims. One finding PER sha256 —
+/// a weak-digest query reaching several distinct contents must render
+/// them as distinct, never merged into one finding.
+pub fn lookup_with<R, F>(open: F, coord: &Coord) -> Result<Vec<Finding>>
 where
     R: ChunkReader + 'static,
     F: Fn(&str) -> Result<(Arc<R>, Arc<ParquetMetaData>)>,
@@ -91,44 +94,40 @@ where
             v.truncate(3); // weak-digest collisions are rendered, not merged
             v
         }
-        _ => return Ok(None),
+        _ => return Ok(Vec::new()),
     };
-    if sha256s.is_empty() {
-        return Ok(None);
-    }
 
-    let mut rows = Vec::new();
-    let mut total = 0usize;
+    let mut findings = Vec::new();
     for sha in &sha256s {
         let (reader, meta) = open(&data_path(sha))?;
-        let (mut r, t) = find_rows(&reader, &meta, "sha256", DATA_COLS, sha, MAX_ROWS)?;
-        rows.append(&mut r);
-        total += t;
+        let (rows, total) = find_rows(&reader, &meta, "sha256", DATA_COLS, sha, MAX_ROWS)?;
+        if rows.is_empty() {
+            continue;
+        }
+        let mut claims: Vec<Claim> = rows.iter().take(SHOWN).map(claim).collect();
+        if total > SHOWN {
+            claims.push(Claim::new(
+                format!("… and {} more releases", total - SHOWN),
+                None,
+            ));
+        }
+        // Each dataset row is a single witness carrying all three
+        // digests — exactly the multi-hash row the edge-minting rule
+        // admits.
+        let coords = ["sha1", "sha256", "md5"]
+            .iter()
+            .filter_map(|s| {
+                let hex = rows[0][*s].as_str()?;
+                Some(format!("{s}:{hex}"))
+            })
+            .collect();
+        findings.push(Finding {
+            backend: NAME.into(),
+            claims,
+            coords,
+        });
     }
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    let mut claims: Vec<Claim> = rows.iter().take(SHOWN).map(claim).collect();
-    if total > SHOWN {
-        claims.push(Claim::new(
-            format!("… and {} more releases", total - SHOWN),
-            None,
-        ));
-    }
-    // Each dataset row is a single witness carrying all three digests —
-    // exactly the multi-hash row the edge-minting rule admits.
-    let coords = ["sha1", "sha256", "md5"]
-        .iter()
-        .filter_map(|s| {
-            let hex = rows[0][*s].as_str()?;
-            Some(format!("{s}:{hex}"))
-        })
-        .collect();
-    Ok(Some(Finding {
-        backend: NAME.into(),
-        claims,
-        coords,
-    }))
+    Ok(findings)
 }
 
 pub fn claim(row: &Value) -> Claim {

@@ -37,7 +37,7 @@ pub struct Options {
 
 /// Resolution order (DESIGN.md): network backends are asked about the
 /// queried coordinate only; the local walk then expands across the
-/// inverted indexes and the observation store — including coordinates
+/// pulled datasets and the observation store — including coordinates
 /// the network answers just crosswalked. Network runs first so fresh
 /// observations are in the store before the walk sweeps it.
 pub async fn resolve(client: &Client, coord: &Coord, opts: &Options) -> Result<Resolution> {
@@ -54,6 +54,11 @@ pub async fn resolve(client: &Client, coord: &Coord, opts: &Options) -> Result<R
         let mut to_fetch = Vec::new();
         for backend in backends::all() {
             if !(backend.supports)(coord.scheme) {
+                continue;
+            }
+            // A pulled dataset answers from disk in the walk below —
+            // its network backend would re-read the same rows remotely.
+            if crate::datasets::is_local(backend.name) {
                 continue;
             }
             if let Some(only) = &opts.only {
@@ -134,17 +139,17 @@ pub async fn resolve(client: &Client, coord: &Coord, opts: &Options) -> Result<R
         }
         for (name, outcome) in outcomes {
             match outcome {
-                Ok(Some(finding)) => {
+                Ok(findings) if findings.is_empty() => {
                     if let Some(cache) = &cache {
-                        cache.put(name, coord, Some(&finding));
-                    }
-                    fresh.push(finding);
-                }
-                Ok(None) => {
-                    if let Some(cache) = &cache {
-                        cache.put(name, coord, None);
+                        cache.put(name, coord, &[]);
                     }
                     misses.push(name);
+                }
+                Ok(findings) => {
+                    if let Some(cache) = &cache {
+                        cache.put(name, coord, &findings);
+                    }
+                    fresh.extend(findings);
                 }
                 // Errors are reported but never cached: transient
                 // upstream failure must not masquerade as a durable miss.
@@ -153,8 +158,9 @@ pub async fn resolve(client: &Client, coord: &Coord, opts: &Options) -> Result<R
         }
     }
 
-    let indexes = crate::inverted::open_all().unwrap_or_default();
-    let mut evidence = walk::walk(coord, &indexes, cache.as_ref());
+    let datasets = crate::datasets::open_all();
+    let local = |c: &Coord| -> Vec<Finding> { datasets.iter().flat_map(|d| d.lookup(c)).collect() };
+    let mut evidence = walk::walk(coord, &local, cache.as_ref());
 
     // With --no-cache the fresh findings never reached the store, so
     // the walk can't have seen them; merge them in (dedup by identity).

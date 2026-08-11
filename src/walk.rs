@@ -1,10 +1,9 @@
 use crate::cache::Cache;
 use crate::coord::{Coord, Scheme};
 use crate::finding::Finding;
-use crate::inverted::SourceIndex;
 use std::collections::{HashMap, HashSet};
 
-/// The graph walk: local resolution over inverted indexes + the
+/// The graph walk: local resolution over pulled datasets + the
 /// observation store. DESIGN.md's empirical bet made code — the walk is
 /// shallow (2–3 hops) and narrow (5–15 coordinates), so closure is
 /// computed live per query instead of materialized.
@@ -48,9 +47,14 @@ pub struct WalkResult {
     pub collision: bool,
 }
 
-/// Fixpoint lookup: query local sources, follow co-observed
-/// coordinates, repeat until nothing new (or caps).
-pub fn walk(queried: &Coord, indexes: &[SourceIndex], cache: Option<&Cache>) -> Vec<Evidence> {
+/// Fixpoint lookup: query local sources (a closure over whatever
+/// datasets are pulled), follow co-observed coordinates, repeat until
+/// nothing new (or caps).
+pub fn walk(
+    queried: &Coord,
+    local: &dyn Fn(&Coord) -> Vec<Finding>,
+    cache: Option<&Cache>,
+) -> Vec<Evidence> {
     let mut evidence: Vec<Evidence> = Vec::new();
     let mut seen_findings: HashSet<String> = HashSet::new();
     let mut visited: HashSet<Coord> = HashSet::new();
@@ -65,10 +69,7 @@ pub fn walk(queried: &Coord, indexes: &[SourceIndex], cache: Option<&Cache>) -> 
             if !visited.insert(coord.clone()) {
                 continue;
             }
-            let mut found: Vec<Finding> = Vec::new();
-            for ix in indexes {
-                found.extend(ix.lookup(&coord));
-            }
+            let mut found: Vec<Finding> = local(&coord);
             if let Some(cache) = cache {
                 found.extend(cache.findings_for(&coord));
             }

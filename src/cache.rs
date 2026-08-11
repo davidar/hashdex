@@ -73,7 +73,7 @@ impl Cache {
             mapped.collect::<std::result::Result<_, _>>()?
         };
         for (backend, coordinate, json) in rows {
-            if let Ok(finding) = serde_json::from_str::<Finding>(&json) {
+            for finding in parse_findings(&json) {
                 self.index_coords(&backend, &coordinate, &finding);
             }
         }
@@ -126,8 +126,14 @@ impl Cache {
         }
     }
 
-    pub fn put(&self, backend: &str, coord: &Coord, finding: Option<&Finding>) {
-        let json = finding.and_then(|f| serde_json::to_string(f).ok());
+    /// Record one backend's whole answer for one coordinate: empty =
+    /// a definitive miss, otherwise every finding it returned (stored
+    /// as one JSON array — dataset backends witness several findings
+    /// per digest).
+    pub fn put(&self, backend: &str, coord: &Coord, findings: &[Finding]) {
+        let json = (!findings.is_empty())
+            .then(|| serde_json::to_string(findings).ok())
+            .flatten();
         let _ = self.conn.execute(
             "INSERT OR REPLACE INTO observations
              (backend, coordinate, hit, finding, fetched_at)
@@ -135,12 +141,12 @@ impl Cache {
             params![
                 backend,
                 coord.to_string(),
-                finding.is_some() as i64,
+                !findings.is_empty() as i64,
                 json,
                 now()
             ],
         );
-        if let Some(finding) = finding {
+        for finding in findings {
             self.index_coords(backend, &coord.to_string(), finding);
         }
     }
@@ -161,13 +167,18 @@ impl Cache {
             r.get::<_, String>(0)
         });
         match rows {
-            Ok(rows) => rows
-                .flatten()
-                .filter_map(|json| serde_json::from_str(&json).ok())
-                .collect(),
+            Ok(rows) => rows.flatten().flat_map(|j| parse_findings(&j)).collect(),
             Err(_) => Vec::new(),
         }
     }
+}
+
+/// Stored answers are JSON arrays; rows written before multi-finding
+/// backends existed hold a single object. Both parse.
+fn parse_findings(json: &str) -> Vec<Finding> {
+    serde_json::from_str::<Vec<Finding>>(json)
+        .or_else(|_| serde_json::from_str::<Finding>(json).map(|f| vec![f]))
+        .unwrap_or_default()
 }
 
 pub(crate) fn cache_dir() -> PathBuf {

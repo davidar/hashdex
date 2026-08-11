@@ -310,13 +310,14 @@ hit at levels 2–3 is cached as a co-observation at level 1's edge):
    ship in the dumps — mirrors and CLI users inherit the
    don't-hammer behavior, which is how a popular hashdex avoids
    becoming its charity backends' biggest load problem.
-1. **Local/self-inverted shards + overlay** — whatever we've
-   materialized. Implemented as `hdx index`: per-source flat
-   sorted-mmap coordinate indexes — fixed-width witness rows sorted
-   by the primary digest, plus per-scheme digest→row files, 32-byte
-   "HDXI" header, mmap + binary search + `madvise(Random)` — built
-   from a forward dump by streaming external merge sort
-   (laptop-scale even at 122M rows).
+1. **Published dataset shards** — whatever we've materialized,
+   published as key-sorted page-indexed parquet and read the same
+   way everywhere: point lookups routed by row-group and page
+   min/max stats, over HTTP range reads by default (the sorted
+   layout IS the index; no query server), or over an mmap of the
+   same files after an opt-in `hdx index pull` for local/offline
+   use. One wire format, one read path, two transports — no
+   bespoke local index formats.
 2. **Live federation adapters** — the verified inverted-index set
    (deps.dev query, CIRCL, SWH, snapshot.d.o, Rekor v1, opt-in VT).
 3. **Demand-driven probes** — select cases only, per the admission

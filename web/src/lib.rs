@@ -403,8 +403,10 @@ async fn drive_lookup<T>(
     bail!("lookup did not converge")
 }
 
-/// Resolve one coordinate against the fatcat file dataset. Returns the
-/// finding as JSON, or "null" for unsupported schemes and misses.
+/// Resolve one coordinate against the fatcat file dataset. Returns a
+/// JSON array of findings (one per distinct content — a weak digest
+/// can reach several; empty = no hits), or "null" for unsupported
+/// schemes.
 #[wasm_bindgen]
 pub async fn fatcat_lookup(coord: String) -> Result<String, JsValue> {
     fatcat_lookup_inner(&coord).await.map_err(err_js)
@@ -415,11 +417,11 @@ async fn fatcat_lookup_inner(coord: &str) -> Result<String> {
     if !fatcat::supports(coord.scheme) {
         return Ok("null".to_string());
     }
-    let finding = drive_lookup(&FATCAT, &fatcat::start_paths(&coord), |open| {
+    let findings = drive_lookup(&FATCAT, &fatcat::start_paths(&coord), |open| {
         fatcat::lookup_with(|p| open(p), &coord)
     })
     .await?;
-    Ok(serde_json::to_string(&finding)?)
+    Ok(serde_json::to_string(&findings)?)
 }
 
 /// Resolve one coordinate against the release-tarballs dataset.

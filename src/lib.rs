@@ -11,6 +11,7 @@ pub mod coord;
 pub mod dcso;
 pub mod fatcat;
 pub mod finding;
+pub mod media;
 pub mod parquet_index;
 pub mod range_store;
 pub mod tarballs;
@@ -22,13 +23,13 @@ pub mod cache;
 #[cfg(feature = "cli")]
 pub mod coords_cmd;
 #[cfg(feature = "cli")]
+pub mod datasets;
+#[cfg(feature = "cli")]
 pub mod filter;
 #[cfg(feature = "cli")]
 pub mod filters_cmd;
 #[cfg(feature = "cli")]
 pub mod index_cmd;
-#[cfg(feature = "cli")]
-pub mod inverted;
 #[cfg(feature = "cli")]
 pub mod local_index;
 #[cfg(feature = "cli")]

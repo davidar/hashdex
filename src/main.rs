@@ -13,8 +13,9 @@ use std::path::PathBuf;
     about = "Resolve any hash against the indexes the world already maintains",
     long_about = "Given a hash (hex, base32, SRI, SWHID, or scheme:hex), hdx asks the \n\
                   public inverted indexes what they know: deps.dev, CIRCL hashlookup, \n\
-                  Software Heritage, snapshot.debian.org, Rekor, and the fatcat \n\
-                  scholarly index. Answers are cached locally as observations.\n\n\
+                  Software Heritage, snapshot.debian.org, Rekor, the fatcat scholarly \n\
+                  index, and the release-tarballs index (Debian/Homebrew/Guix). \n\
+                  Answers are cached locally as observations.\n\n\
                   Bare 64-hex is read as sha256 (use blake2s256:<hex> to override); \n\
                   bare 40-hex as sha1; 32-char base32 as CDX-style sha1."
 )]
@@ -99,7 +100,9 @@ enum Command {
         /// sha1 or sha256 hash (any common spelling)
         hash: String,
     },
-    /// Manage inverted coordinate indexes (self-inverted source dumps)
+    /// Manage local copies of the published claim datasets (fatcat,
+    /// tarballs) — resolution range-reads them remotely by default; a
+    /// pulled copy is faster and works offline
     Index {
         #[command(subcommand)]
         action: IndexAction,
@@ -113,18 +116,20 @@ enum Command {
 
 #[derive(Subcommand)]
 enum IndexAction {
-    /// Build a source's index from its dump (e.g. fatcat file_hashes.tsv.gz)
-    Build {
-        /// Source name (see `hdx index build --help` errors for the list)
-        source: String,
-        /// The dump file (.tsv or .tsv.gz)
-        file: PathBuf,
-        /// In-RAM sort buffer per pass, in MiB
-        #[arg(long, default_value_t = 1024)]
-        chunk_mb: usize,
+    /// Download a dataset's published parquet for local + offline
+    /// resolution (the local file IS the published file)
+    Pull {
+        /// Dataset name (see `hdx index list`)
+        name: String,
     },
-    /// List installed indexes
+    /// List datasets and their local state
     List,
+    /// Delete a dataset's local copy (resolution goes back to
+    /// on-demand range reads)
+    Rm {
+        /// Dataset name
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -259,12 +264,9 @@ async fn main() -> Result<()> {
             }
         }
         (Some(Command::Index { action }), _) => match action {
-            IndexAction::Build {
-                source,
-                file,
-                chunk_mb,
-            } => index_cmd::build(source, file, *chunk_mb)?,
+            IndexAction::Pull { name } => index_cmd::pull(&client, name).await?,
             IndexAction::List => index_cmd::list()?,
+            IndexAction::Rm { name } => index_cmd::rm(name)?,
         },
         (Some(Command::Filters { action }), _) => match action {
             FilterAction::Fetch { names, all, from } => {

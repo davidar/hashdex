@@ -68,5 +68,5 @@ pub fn record(cache: &Cache, path: &Path, coords: &[Coord]) {
         )],
         coords: coords.iter().map(|c| c.to_string()).collect(),
     };
-    cache.put(LOCAL_ATTESTOR, sha256, Some(&finding));
+    cache.put(LOCAL_ATTESTOR, sha256, std::slice::from_ref(&finding));
 }

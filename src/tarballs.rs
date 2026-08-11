@@ -1,8 +1,8 @@
 //! The release-tarballs dataset, transport-free: identity, routing,
 //! and claim rendering for the Debian/Homebrew/Guix artifact-checksum
 //! index, published as page-indexed parquet sorted by sha256 (an
-//! md5→sha256 map for the Debian rows). The same rows power the local
-//! HDXI index (`inverted`), which shares this module's renderer.
+//! md5→sha256 map for the Debian rows). The native side reads it over
+//! HTTP ranges or from a pulled local copy; wasm drives it over fetch.
 
 use crate::coord::{Coord, Scheme};
 use crate::finding::{Claim, Finding};
@@ -35,7 +35,7 @@ pub fn start_paths(coord: &Coord) -> Vec<String> {
     }
 }
 
-/// One row's fields, however they were stored (parquet or HDXI).
+/// One row's fields, decoded from the parquet.
 pub struct Row<'a> {
     pub witness: &'a str,
     pub name: &'a str,
@@ -128,4 +128,66 @@ where
         findings.extend(rows.iter().map(|r| finding(&json_row(r, sha))));
     }
     Ok(findings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_per_witness_with_claim_urls() {
+        let debian = finding(&Row {
+            witness: "debian",
+            name: "hello",
+            version: "2.12.3-1",
+            filename: "hello_2.12.3.orig.tar.gz",
+            loc: "pool/main/h/hello",
+            sha256: "ab".repeat(32),
+            md5: Some("cd".repeat(16)),
+        });
+        assert_eq!(debian.backend, "debian");
+        assert_eq!(
+            debian.claims[0].statement,
+            "Debian sid packages these bytes as hello_2.12.3.orig.tar.gz \
+             (source package hello 2.12.3-1)"
+        );
+        assert_eq!(
+            debian.claims[0].url.as_deref(),
+            Some("https://deb.debian.org/debian/pool/main/h/hello/hello_2.12.3.orig.tar.gz")
+        );
+        // single-witness multi-hash row: the md5 is co-observed
+        assert!(debian.coords.contains(&format!("md5:{}", "cd".repeat(16))));
+
+        let brew = finding(&Row {
+            witness: "homebrew",
+            name: "wget",
+            version: "1.25.0",
+            filename: "",
+            loc: "https://ftp.gnu.org/gnu/wget/wget-1.25.0.tar.gz",
+            sha256: "ef".repeat(32),
+            md5: None,
+        });
+        assert_eq!(brew.backend, "homebrew");
+        assert!(brew.claims[0].statement.contains("wget 1.25.0"));
+        assert_eq!(
+            brew.claims[0].url.as_deref(),
+            Some("https://ftp.gnu.org/gnu/wget/wget-1.25.0.tar.gz")
+        );
+        // md5-less rows co-observe nothing beyond sha256
+        assert_eq!(brew.coords.len(), 1);
+
+        let guix = finding(&Row {
+            witness: "guix",
+            name: "",
+            version: "",
+            filename: "hello-2.12.3.tar.gz",
+            loc: "https://bordeaux.guix.gnu.org/file/hello-2.12.3.tar.gz/sha256/086vqwk2",
+            sha256: "01".repeat(32),
+            md5: None,
+        });
+        assert_eq!(guix.backend, "guix");
+        assert!(guix.claims[0]
+            .statement
+            .contains("packages these bytes as hello-2.12.3.tar.gz"));
+    }
 }

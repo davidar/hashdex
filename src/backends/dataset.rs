@@ -1,6 +1,6 @@
-//! Native transport for the fatcat dataset (`crate::fatcat`): blocking
-//! HTTP range reads against the published parquet, revision-pinned and
-//! persisted on disk.
+//! Native transport for the published claim datasets (`crate::fatcat`,
+//! `crate::tarballs`): blocking HTTP range reads against the published
+//! parquet, revision-pinned and persisted on disk.
 //!
 //! URLs are pinned to a repo revision (Hub API, refreshed hourly), so
 //! every byte range is immutable and fetched ranges persist on disk
@@ -8,7 +8,7 @@
 //! old revisions stay fetchable, they're just up to an hour behind.
 
 use crate::coord::Coord;
-use crate::fatcat::{start_paths, DATASET_BASE, REVISION_API};
+use crate::datasets::Spec;
 use crate::finding::Finding;
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -20,8 +20,6 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
-
-pub use crate::fatcat::{supports, NAME};
 
 const REVISION_TTL: Duration = Duration::from_secs(3600);
 /// Block size for page-header walks through uncached territory.
@@ -55,22 +53,19 @@ struct RemoteInner {
 /// Per-file cap on cached range bytes (17 data files + 2 maps can be
 /// open at once in a scan).
 const CACHE_MAX: usize = 96 << 20;
-/// Cold-open speculative suffix: must cover magic + footer (~150 KB)
-/// + page-index region (~5 MB on the data files) in one request.
-const SUFFIX: u64 = 8 << 20;
 /// Per-file cap on persisted range bytes; oldest blobs go first.
 const DISK_MAX: u64 = 64 << 20;
 
-fn http_cache_root() -> PathBuf {
-    crate::cache::cache_dir().join("fatcat").join("http")
+fn http_cache_root(spec: &Spec) -> PathBuf {
+    crate::cache::cache_dir().join(spec.name).join("http")
 }
 
 /// The pinned repo revision: the on-disk pin when fresh, else the Hub
 /// API (pruning caches of older revisions), else the stale pin —
 /// offline reuse is exactly what pinning makes safe. None only on a
 /// first run that can't reach the Hub.
-fn pinned_revision() -> Option<String> {
-    let root = http_cache_root();
+fn pinned_revision(spec: &Spec) -> Option<String> {
+    let root = http_cache_root(spec);
     let pin = root.join("revision");
     let stale = || {
         std::fs::read_to_string(&pin)
@@ -87,8 +82,9 @@ fn pinned_revision() -> Option<String> {
             return Some(sha);
         }
     }
+    let api = spec.revision_api();
     let fetched: Result<String> = (|| {
-        let v: Value = maybe_auth(http().get(REVISION_API), REVISION_API)
+        let v: Value = maybe_auth(http().get(&api), &api)
             .send()?
             .error_for_status()?
             .json()?;
@@ -432,12 +428,12 @@ struct RemoteFile {
     meta: Arc<ParquetMetaData>,
 }
 
-fn open_remote(path: &str) -> Result<Arc<RemoteFile>> {
+fn open_remote(spec: &'static Spec, path: &str) -> Result<Arc<RemoteFile>> {
     type Slot = Arc<Mutex<Option<Arc<RemoteFile>>>>;
     static FILES: OnceLock<Mutex<HashMap<String, Slot>>> = OnceLock::new();
     let slot: Slot = {
         let mut files = FILES.get_or_init(Default::default).lock().unwrap();
-        Arc::clone(files.entry(path.to_string()).or_default())
+        Arc::clone(files.entry(format!("{}/{path}", spec.name)).or_default())
     };
     // Per-path build lock: racing opens of one file build it once,
     // while different files still open in parallel.
@@ -446,19 +442,24 @@ fn open_remote(path: &str) -> Result<Arc<RemoteFile>> {
         return Ok(Arc::clone(f));
     }
 
-    static REVISION: OnceLock<Option<String>> = OnceLock::new();
-    let revision = REVISION.get_or_init(pinned_revision);
+    static REVISIONS: OnceLock<Mutex<HashMap<&'static str, Option<String>>>> = OnceLock::new();
+    let revision = {
+        let mut revs = REVISIONS.get_or_init(Default::default).lock().unwrap();
+        revs.entry(spec.name)
+            .or_insert_with(|| pinned_revision(spec))
+            .clone()
+    };
     let rev = revision.as_deref().unwrap_or("main");
-    let url = format!("{DATASET_BASE}/{rev}/{path}");
-    let disk = revision
-        .as_ref()
-        .and_then(|sha| DiskCache::open(http_cache_root().join(sha).join(path.replace('/', "_"))));
+    let url = format!("{}/{rev}/{path}", spec.resolve_base());
+    let disk = revision.as_ref().and_then(|sha| {
+        DiskCache::open(http_cache_root(spec).join(sha).join(path.replace('/', "_")))
+    });
 
     // File length: persisted beside the blobs (the disk cache then
     // already holds the footer region from the first open). On a cold
     // open, ONE speculative suffix request answers everything: its
-    // Content-Range carries the file length, and the last SUFFIX bytes
-    // cover magic + footer + the whole page-index region, so the
+    // Content-Range carries the file length, and the last spec.suffix
+    // bytes cover magic + footer + the whole page-index region, so the
     // metadata parse below does no further requests. (HEAD is useless
     // here — the resolve redirect's CDN doesn't answer it reliably.)
     let effective = Mutex::new(None);
@@ -470,7 +471,7 @@ fn open_remote(path: &str) -> Result<Arc<RemoteFile>> {
     let len = match cached_len {
         Some(n) => n,
         None => {
-            let resp = ranged_get(http(), &url, &effective, &format!("bytes=-{SUFFIX}"))?;
+            let resp = ranged_get(http(), &url, &effective, &format!("bytes=-{}", spec.suffix))?;
             let content_range = resp
                 .headers()
                 .get(reqwest::header::CONTENT_RANGE)
@@ -478,7 +479,7 @@ fn open_remote(path: &str) -> Result<Arc<RemoteFile>> {
                 .map(str::to_string);
             let body = resp.bytes()?;
             // "bytes <start>-<end>/<total>"; a file smaller than
-            // SUFFIX arrives whole with start 0.
+            // the suffix arrives whole with start 0.
             let (start, n) = match content_range
                 .as_deref()
                 .and_then(|v| v.strip_prefix("bytes "))
@@ -531,31 +532,34 @@ fn open_remote(path: &str) -> Result<Arc<RemoteFile>> {
 // ------------------------------------------------------------------ lookup
 
 /// Open every remote file a probe batch will certainly need, in
-/// parallel and outside any per-probe timeout. Cold opens (an 8 MB
-/// suffix request each) are the bulk of a first-contact batch's
-/// work; inside probe budgets they starved probes queued behind them
-/// (241/596 timed out on the first full-Dropbox run). Weak digests
-/// fan out to data files only known after the map lookup — those
-/// still open lazily, one single-flighted open per file.
-pub fn preopen(coords: &[Coord]) {
-    let paths: HashSet<String> = coords.iter().flat_map(start_paths).collect();
+/// parallel and outside any per-probe timeout. Cold opens (a suffix
+/// request each) are the bulk of a first-contact batch's work; inside
+/// probe budgets they starved probes queued behind them (241/596 timed
+/// out on the first full-Dropbox run). Weak digests fan out to data
+/// files only known after the map lookup — those still open lazily,
+/// one single-flighted open per file.
+pub fn preopen(spec: &'static Spec, coords: &[Coord]) {
+    let paths: HashSet<String> = coords.iter().flat_map(spec.start_paths).collect();
     std::thread::scope(|s| {
         for p in &paths {
             s.spawn(move || {
-                let _ = open_remote(p); // probes retry and report errors
+                let _ = open_remote(spec, p); // probes retry and report errors
             });
         }
     });
 }
 
-fn open_pair(path: &str) -> Result<(Arc<Remote>, Arc<ParquetMetaData>)> {
-    let file = open_remote(path)?;
+fn open_pair(spec: &'static Spec, path: &str) -> Result<(Arc<Remote>, Arc<ParquetMetaData>)> {
+    let file = open_remote(spec, path)?;
     Ok((Arc::clone(&file.remote), Arc::clone(&file.meta)))
 }
 
-pub async fn lookup(_client: &reqwest::Client, coord: &Coord) -> Result<Option<Finding>> {
+pub async fn lookup(spec: &'static Spec, coord: &Coord) -> Result<Vec<Finding>> {
     let coord = coord.clone();
-    tokio::task::spawn_blocking(move || crate::fatcat::lookup_with(open_pair, &coord)).await?
+    tokio::task::spawn_blocking(move || {
+        crate::datasets::lookup_in(spec.name, |p| open_pair(spec, p), &coord)
+    })
+    .await?
 }
 
 #[cfg(test)]
@@ -564,7 +568,7 @@ mod tests {
 
     #[test]
     fn disk_cache_roundtrip_and_eviction() {
-        let dir = std::env::temp_dir().join(format!("hdx-fatcat-disk-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hdx-dataset-disk-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let cache = DiskCache::open(dir.clone()).unwrap();
         cache.put(100, &Bytes::from(vec![7u8; 50]));

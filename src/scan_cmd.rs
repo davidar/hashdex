@@ -17,7 +17,7 @@ pub struct ScanOptions {
     pub no_index: bool,
     /// Rehash every file even if the index has a fresh entry.
     pub rehash: bool,
-    /// Resolve files through the local walk (inverted indexes +
+    /// Resolve files through the local walk (pulled datasets +
     /// observation store) plus dataset-transport probes. Off =
     /// membership-only census (--no-resolve).
     pub resolve: bool,
@@ -34,11 +34,6 @@ pub struct ScanOptions {
     /// non-empty restricts (accepts filter or backend names).
     pub online: Option<Vec<String>>,
 }
-
-/// Backends that are range reads against published static datasets:
-/// probing them discloses digests to no one, so they need no --online
-/// consent.
-const DATASET_BACKENDS: &[&str] = &[crate::backends::fatcat::NAME];
 
 /// Per-backend probe ceiling per scan run: a batch resolve must not
 /// turn into a hammering of somebody's public API. Narrow the scan
@@ -447,16 +442,16 @@ pub async fn scan(
         .await;
     }
 
-    // Local resolution context for --resolve: inverted indexes + the
+    // Local resolution context for --resolve: pulled datasets + the
     // observation store (which --online may have just enriched).
     let resolver = if opts.resolve {
-        let indexes = crate::inverted::open_all().unwrap_or_default();
+        let datasets = crate::datasets::open_all();
         let cache = if opts.no_index {
             None
         } else {
             crate::cache::Cache::open().ok()
         };
-        Some((indexes, cache))
+        Some((datasets, cache))
     } else {
         None
     };
@@ -485,12 +480,15 @@ pub async fn scan(
         let evidence = resolver
             .as_ref()
             .filter(|_| r.size >= IDENTITY_MIN_BYTES)
-            .map(|(indexes, cache)| {
+            .map(|(datasets, cache)| {
                 let coord = crate::coord::Coord {
                     scheme: Scheme::Sha256,
                     digest: r.sha256.to_vec(),
                 };
-                let ev = crate::walk::walk(&coord, indexes, cache.as_ref());
+                let local = |c: &crate::coord::Coord| -> Vec<crate::finding::Finding> {
+                    datasets.iter().flat_map(|d| d.lookup(c)).collect()
+                };
+                let ev = crate::walk::walk(&coord, &local, cache.as_ref());
                 crate::walk::cluster(ev, &coord)
                     .clusters
                     .into_iter()
@@ -696,7 +694,7 @@ pub async fn scan(
 /// Filters without a backend (steam, fedora, …) resolve offline only.
 fn backend_for_filter(name: &str) -> Option<&'static str> {
     match name {
-        "fatcat" => Some(crate::backends::fatcat::NAME),
+        "fatcat" => Some("fatcat"),
         "circl" => Some(crate::backends::circl::NAME),
         "depsdev" => Some(crate::backends::depsdev::NAME),
         "rekor" => Some(crate::backends::rekor::NAME),
@@ -723,7 +721,7 @@ async fn online_probe(
     // Dataset transports need no consent; --online grants the APIs
     // (bare = all of them, a list restricts by filter or backend name).
     let selected = |filter: &str, backend: &str| {
-        DATASET_BACKENDS.contains(&backend)
+        crate::datasets::is_dataset(backend)
             || match selection {
                 None => false,
                 Some([]) => true,
@@ -748,6 +746,10 @@ async fn online_probe(
             let Some(backend) = backend_for_filter(&f.name) else {
                 continue;
             };
+            // A pulled dataset already answered in the local walk.
+            if crate::datasets::is_local(backend) {
+                continue;
+            }
             if !selected(&f.name, backend) || !matches!(f.scheme, Scheme::Sha1 | Scheme::Sha256) {
                 continue;
             }
@@ -801,10 +803,12 @@ async fn online_probe(
     let total = probes.len();
     eprintln!("probing {total} matched digest{} online…", s(total));
     // Probe width: 6 is politeness for third-party APIs. A batch that
-    // only touches fatcat hits our own published dataset on a CDN over
-    // one multiplexed connection — far wider is fine.
-    let fatcat = crate::backends::fatcat::NAME;
-    let width = if probes.values().all(|s| s.iter().all(|&b| b == fatcat)) {
+    // only touches our published datasets hits a CDN over one
+    // multiplexed connection — far wider is fine.
+    let width = if probes
+        .values()
+        .all(|s| s.iter().all(|b| crate::datasets::is_dataset(b)))
+    {
         32
     } else {
         6
@@ -812,13 +816,17 @@ async fn online_probe(
     // Cold remote-file opens run before the probe stream, outside any
     // per-probe timeout: a first-contact burst must not eat probe
     // budgets on suffix fetches.
-    let warm: Vec<crate::coord::Coord> = probes
-        .iter()
-        .filter(|(_, set)| set.contains(fatcat))
-        .map(|(coord, _)| coord.clone())
-        .collect();
-    if !warm.is_empty() {
-        let _ = tokio::task::spawn_blocking(move || crate::backends::fatcat::preopen(&warm)).await;
+    for spec in crate::datasets::SPECS {
+        let warm: Vec<crate::coord::Coord> = probes
+            .iter()
+            .filter(|(_, set)| set.contains(spec.name))
+            .map(|(coord, _)| coord.clone())
+            .collect();
+        if !warm.is_empty() {
+            let _ =
+                tokio::task::spawn_blocking(move || crate::backends::dataset::preopen(spec, &warm))
+                    .await;
+        }
     }
     let done = AtomicUsize::new(0);
     let errors: Mutex<std::collections::BTreeMap<String, usize>> = Mutex::new(Default::default());

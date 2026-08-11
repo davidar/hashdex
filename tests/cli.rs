@@ -329,34 +329,168 @@ fn filters_build_rejects_bad_input() {
     assert!(stderr(&out).contains("no input files"));
 }
 
-const UUID_A: &str = "f9c009bd-bd72-4029-9bc7-75a1226f8adc";
-const UUID_B: &str = "7b63c2c4-e17b-4af4-888c-0f17f42a1f94";
+/// Install a tiny fatcat dataset into the env's cache — the exact
+/// layout `hdx index pull` produces (data files keyed by first sha256
+/// nibble, weak-digest maps, `revision` marker written last), written
+/// as real sorted parquet so lookups exercise the one true read path.
+fn install_fatcat_dataset(env: &TestEnv, rows: &[(&str, &str, &str)]) {
+    use std::collections::BTreeMap;
+    let root = env.root.join("cache/hashdex/datasets/fatcat");
 
-/// Build a tiny fatcat inverted index inside the env and return it.
-fn build_fatcat_index(env: &TestEnv, rows: &[(&str, &str, &str)]) {
-    let tsv: String = rows
-        .iter()
-        .map(|(sha1, sha256, md5)| format!("{UUID_A}\t{UUID_B}\t{sha1}\t{sha256}\t{md5}\n"))
-        .collect();
-    let path = env.root.join("fatcat.tsv");
-    std::fs::write(&path, tsv).unwrap();
-    let out = env.hdx(&["index", "build", "fatcat", path.to_str().unwrap()]);
-    assert!(out.status.success(), "index build failed: {}", stderr(&out));
+    let mut by_nibble: BTreeMap<char, Vec<(&str, &str, &str)>> = BTreeMap::new();
+    for r in rows {
+        by_nibble
+            .entry(r.1.chars().next().unwrap())
+            .or_default()
+            .push(*r);
+    }
+    for (nibble, mut rows) in by_nibble {
+        rows.sort_by_key(|r| r.1);
+        let path = root.join(format!("data/files-{nibble}.parquet"));
+        write_parquet(
+            &path,
+            "message fatcat {
+                required binary sha256 (UTF8);
+                optional binary title (UTF8);
+                optional int64 release_year;
+                optional binary container_name (UTF8);
+                optional binary doi (UTF8);
+                optional binary arxiv (UTF8);
+                optional binary wayback_url (UTF8);
+                optional binary sha1 (UTF8);
+                optional binary md5 (UTF8);
+            }",
+            vec![
+                Col::req_str(rows.iter().map(|r| r.1.to_string()).collect()),
+                Col::opt_str(
+                    rows.iter()
+                        .map(|r| Some(format!("Test Paper {}", &r.1[..8])))
+                        .collect(),
+                ),
+                Col::opt_i64(rows.iter().map(|_| Some(2020)).collect()),
+                Col::opt_str(rows.iter().map(|_| None).collect()),
+                Col::opt_str(rows.iter().map(|_| None).collect()),
+                Col::opt_str(rows.iter().map(|_| None).collect()),
+                Col::opt_str(
+                    rows.iter()
+                        .map(|r| {
+                            Some(format!(
+                                "https://web.archive.org/web/2024/{}.pdf",
+                                &r.1[..8]
+                            ))
+                        })
+                        .collect(),
+                ),
+                Col::opt_str(rows.iter().map(|r| Some(r.0.to_string())).collect()),
+                Col::opt_str(rows.iter().map(|r| Some(r.2.to_string())).collect()),
+            ],
+        );
+    }
+
+    for (map, key_of) in [("sha1", 0usize), ("md5", 2usize)] {
+        let mut pairs: Vec<(String, String)> = rows
+            .iter()
+            .map(|r| {
+                let key = if key_of == 0 { r.0 } else { r.2 };
+                (key.to_string(), r.1.to_string())
+            })
+            .collect();
+        pairs.sort();
+        write_parquet(
+            &root.join(format!("maps/{map}.parquet")),
+            &format!(
+                "message map {{
+                    required binary {map} (UTF8);
+                    required binary sha256 (UTF8);
+                }}"
+            ),
+            vec![
+                Col::req_str(pairs.iter().map(|p| p.0.clone()).collect()),
+                Col::req_str(pairs.iter().map(|p| p.1.clone()).collect()),
+            ],
+        );
+    }
+
+    // Written last, same as a real pull: this marks the copy complete.
+    std::fs::write(root.join("revision"), "test-fixture").unwrap();
+}
+
+enum Col {
+    Str(Vec<Option<String>>, bool),
+    I64(Vec<Option<i64>>),
+}
+
+impl Col {
+    fn req_str(v: Vec<String>) -> Col {
+        Col::Str(v.into_iter().map(Some).collect(), true)
+    }
+    fn opt_str(v: Vec<Option<String>>) -> Col {
+        Col::Str(v, false)
+    }
+    fn opt_i64(v: Vec<Option<i64>>) -> Col {
+        Col::I64(v)
+    }
+}
+
+/// One row group, columns in schema order, chunk statistics on (the
+/// defaults) — all a sorted-parquet point lookup needs.
+fn write_parquet(path: &Path, schema: &str, cols: Vec<Col>) {
+    use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
+    use std::sync::Arc;
+
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let schema = Arc::new(parse_message_type(schema).unwrap());
+    let props = Arc::new(WriterProperties::builder().build());
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+    let mut rg = writer.next_row_group().unwrap();
+    for col in cols {
+        let mut c = rg.next_column().unwrap().expect("more columns than schema");
+        match col {
+            Col::Str(vals, required) => {
+                let present: Vec<ByteArray> = vals
+                    .iter()
+                    .flatten()
+                    .map(|s| ByteArray::from(s.as_str()))
+                    .collect();
+                let defs: Vec<i16> = vals.iter().map(|v| v.is_some() as i16).collect();
+                c.typed::<ByteArrayType>()
+                    .write_batch(&present, (!required).then_some(&defs[..]), None)
+                    .unwrap();
+            }
+            Col::I64(vals) => {
+                let present: Vec<i64> = vals.iter().flatten().copied().collect();
+                let defs: Vec<i16> = vals.iter().map(|v| v.is_some() as i16).collect();
+                c.typed::<Int64Type>()
+                    .write_batch(&present, Some(&defs), None)
+                    .unwrap();
+            }
+        }
+        c.close().unwrap();
+    }
+    rg.close().unwrap();
+    writer.close().unwrap();
 }
 
 #[test]
-fn index_build_and_offline_resolve() {
-    let env = TestEnv::new("index");
-    let out = env.hdx(&["index", "list"]);
-    assert!(stdout(&out).contains("no indexes installed"));
-
-    build_fatcat_index(&env, &[(ABC_SHA1, ABC_SHA256, ABC_MD5)]);
+fn local_dataset_lifecycle_and_offline_resolve() {
+    let env = TestEnv::new("dataset");
+    // Nothing pulled: every dataset lists as remote.
     let out = env.hdx(&["index", "list"]);
     assert!(out.status.success());
-    assert!(stdout(&out).contains("fatcat"));
-    assert!(stdout(&out).contains("1 rows"));
+    let text = stdout(&out);
+    assert!(text.contains("fatcat") && text.contains("tarballs"));
+    assert!(text.contains("remote"), "unpulled must say remote:\n{text}");
 
-    // resolve by each of the row's three schemes, fully offline
+    install_fatcat_dataset(&env, &[(ABC_SHA1, ABC_SHA256, ABC_MD5)]);
+    let out = env.hdx(&["index", "list"]);
+    assert!(stdout(&out).contains("local:"), "{}", stdout(&out));
+
+    // resolve by each of the row's three schemes, fully offline —
+    // the local copy carries the full citation and the wayback URL
     for hash in [
         ABC_SHA256.to_string(),
         format!("sha1:{ABC_SHA1}"),
@@ -366,10 +500,10 @@ fn index_build_and_offline_resolve() {
         assert!(out.status.success(), "offline miss for {hash}");
         let text = stdout(&out);
         assert!(text.contains("fatcat"), "no attestor line in:\n{text}");
-        // idents render as join keys; no fatcat.wiki URL (the site is dead)
+        assert!(text.contains("Test Paper"), "no citation in:\n{text}");
         assert!(
-            text.contains("scholarly file file_"),
-            "no ident in:\n{text}"
+            text.contains("web.archive.org"),
+            "no wayback claim URL in:\n{text}"
         );
         assert!(
             !text.contains("fatcat.wiki"),
@@ -379,9 +513,10 @@ fn index_build_and_offline_resolve() {
         assert!(text.contains(ABC_SHA1) || text.contains(ABC_MD5));
     }
 
-    // unknown source name is rejected with the known list
-    let out = env.hdx(&["index", "build", "nope", "x.tsv"]);
+    // unknown dataset names are rejected offline, before any network
+    let out = env.hdx(&["index", "pull", "nope"]);
     assert!(!out.status.success());
+    assert!(stderr(&out).contains("unknown dataset"));
     assert!(stderr(&out).contains("fatcat"));
 
     // offline miss: exit 1, honest message
@@ -389,6 +524,15 @@ fn index_build_and_offline_resolve() {
     let out = env.hdx(&["--offline", absent]);
     assert!(!out.status.success());
     assert!(stdout(&out).contains("offline"));
+
+    // rm drops the local copy; offline resolution loses the witness
+    let out = env.hdx(&["index", "rm", "fatcat"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let out = env.hdx(&["--offline", ABC_SHA256]);
+    assert!(!out.status.success(), "removed dataset still resolves");
+    let out = env.hdx(&["index", "rm", "fatcat"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("no local copy"));
 }
 
 /// The crosswalk demo: `hdx coords` records the six-scheme row of a
@@ -398,7 +542,7 @@ fn index_build_and_offline_resolve() {
 #[test]
 fn walk_crosses_sources_offline() {
     let env = TestEnv::new("walk");
-    build_fatcat_index(&env, &[(ABC_SHA1, ABC_SHA256, ABC_MD5)]);
+    install_fatcat_dataset(&env, &[(ABC_SHA1, ABC_SHA256, ABC_MD5)]);
     let file = env.write("abc.txt", b"abc");
     let out = env.hdx(&["coords", file.to_str().unwrap()]);
     assert!(out.status.success());
@@ -432,7 +576,7 @@ fn weak_digest_ambiguity_is_honest() {
     let env = TestEnv::new("collision");
     let md5 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let (sha256_1, sha256_2) = ("1".repeat(64), "2".repeat(64));
-    build_fatcat_index(
+    install_fatcat_dataset(
         &env,
         &[
             (&"3".repeat(40), &sha256_1, md5),
@@ -477,7 +621,7 @@ const NL_SHA256: &str = "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f980
 #[test]
 fn scan_resolves_by_default() {
     let env = TestEnv::new("scanresolve");
-    build_fatcat_index(
+    install_fatcat_dataset(
         &env,
         &[
             (FOX_SHA1, FOX_SHA256, FOX_MD5),
@@ -530,7 +674,7 @@ fn scan_resolves_by_default() {
 fn scan_does_not_attribute_across_weak_digests() {
     let env = TestEnv::new("scanweak");
     // A fatcat row about DIFFERENT bytes that happens to share fox's md5.
-    build_fatcat_index(&env, &[(&"9".repeat(40), &"8".repeat(64), FOX_MD5)]);
+    install_fatcat_dataset(&env, &[(&"9".repeat(40), &"8".repeat(64), FOX_MD5)]);
     let file = env.write("fox.txt", b"the quick brown fox jumps over the lazy dog\n");
     let out = env.hdx(&["coords", file.to_str().unwrap()]);
     assert!(out.status.success());
