@@ -467,7 +467,11 @@ pub async fn scan(
         }
         // Attributed listing needs the evidence to decide visibility,
         // so the walk runs for every file whenever we resolve — except
-        // sub-digest-size files, which are never attributed.
+        // sub-digest-size files, which are never attributed. Evidence
+        // is clustered and only PRIMARY clusters (those containing the
+        // file's own sha256) attribute: claims reached solely through
+        // weak-digest links are about other bytes that happen to share
+        // an md5/sha1 — "consistent with", never this file's identity.
         let evidence = resolver
             .as_ref()
             .filter(|_| r.size >= IDENTITY_MIN_BYTES)
@@ -476,11 +480,17 @@ pub async fn scan(
                     scheme: Scheme::Sha256,
                     digest: r.sha256.to_vec(),
                 };
-                crate::walk::walk(&coord, indexes, cache.as_ref())
+                let ev = crate::walk::walk(&coord, indexes, cache.as_ref());
+                crate::walk::cluster(ev, &coord)
+                    .clusters
+                    .into_iter()
+                    .filter(|cl| cl.primary)
+                    .flat_map(|cl| cl.findings)
+                    .collect::<Vec<crate::finding::Finding>>()
             });
         let has_claims = evidence
             .as_ref()
-            .is_some_and(|ev| ev.iter().any(|e| !e.finding.claims.is_empty()));
+            .is_some_and(|ev| ev.iter().any(|f| !f.claims.is_empty()));
         if has_claims {
             attributed += 1;
         }
@@ -513,10 +523,10 @@ pub async fn scan(
                 if let Some(evidence) = &evidence {
                     obj["resolved"] = evidence
                         .iter()
-                        .map(|e| {
+                        .map(|f| {
                             json!({
-                                "backend": e.finding.backend,
-                                "claims": e.finding.claims,
+                                "backend": f.backend,
+                                "claims": f.claims,
                             })
                         })
                         .collect();
@@ -532,8 +542,8 @@ pub async fn scan(
                     let mut backends: Vec<&str> = evidence
                         .iter()
                         .flatten()
-                        .filter(|e| !e.finding.claims.is_empty())
-                        .map(|e| e.finding.backend.as_str())
+                        .filter(|f| !f.claims.is_empty())
+                        .map(|f| f.backend.as_str())
                         .collect();
                     backends.sort_unstable();
                     backends.dedup();
@@ -545,11 +555,11 @@ pub async fn scan(
                 if let Some(evidence) = &evidence {
                     if opts.verbose {
                         const SHOWN: usize = 3;
-                        for e in evidence.iter().take(SHOWN) {
-                            let Some(claim) = e.finding.claims.first() else {
+                        for f in evidence.iter().take(SHOWN) {
+                            let Some(claim) = f.claims.first() else {
                                 continue;
                             };
-                            println!("             {:<12} {}", e.finding.backend, claim.statement);
+                            println!("             {:<12} {}", f.backend, claim.statement);
                             if let Some(url) = &claim.url {
                                 println!("             {:<12} → {url}", "");
                             }
@@ -559,12 +569,7 @@ pub async fn scan(
                         }
                     } else if let Some((backend, claim)) = evidence
                         .iter()
-                        .flat_map(|e| {
-                            e.finding
-                                .claims
-                                .iter()
-                                .map(move |c| (&e.finding.backend, c))
-                        })
+                        .flat_map(|f| f.claims.iter().map(move |c| (&f.backend, c)))
                         .max_by_key(|(_, c)| (c.url.is_some(), c.statement.len()))
                     {
                         // Compact default: the most informative single

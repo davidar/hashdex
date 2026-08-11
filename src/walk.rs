@@ -121,7 +121,12 @@ pub fn cluster(evidence: Vec<Evidence>, queried: &Coord) -> WalkResult {
     }
 
     // Effective coordinates of a finding: everything it co-observes,
-    // plus the coordinate we reached it through.
+    // plus the coordinate we reached it through — but only when the
+    // witness row doesn't contradict that coordinate. A row carrying a
+    // DIFFERENT digest for the queried scheme describes other bytes
+    // (e.g. CIRCL answers a sha256 lookup of one SHAttered half with
+    // the other half's record, keyed on their shared sha1); adopting
+    // found_at there would mint an equivalence edge no witness stated.
     let coords_of = |e: &Evidence| -> Vec<Coord> {
         let mut v: Vec<Coord> = e
             .finding
@@ -129,7 +134,12 @@ pub fn cluster(evidence: Vec<Evidence>, queried: &Coord) -> WalkResult {
             .iter()
             .filter_map(|c| Coord::parse(c).ok())
             .collect();
-        v.push(e.found_at.clone());
+        let contradicted = v
+            .iter()
+            .any(|c| c.scheme == e.found_at.scheme && *c != e.found_at);
+        if !contradicted {
+            v.push(e.found_at.clone());
+        }
         v.sort_by(|a, b| (a.scheme.as_str(), &a.digest).cmp(&(b.scheme.as_str(), &b.digest)));
         v.dedup();
         v
@@ -205,5 +215,73 @@ pub fn cluster(evidence: Vec<Evidence>, queried: &Coord) -> WalkResult {
         truncated: n >= MAX_EVIDENCE,
         collision,
         clusters,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::finding::{Claim, Finding};
+
+    fn coord(s: &str) -> Coord {
+        Coord::parse(s).unwrap()
+    }
+
+    fn finding(backend: &str, coords: &[&str]) -> Finding {
+        Finding {
+            backend: backend.into(),
+            claims: vec![Claim::new("claim", None)],
+            coords: coords.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// A witness row answering a strong-digest query with a DIFFERENT
+    /// digest for that same scheme describes other bytes — the live
+    /// case is CIRCL answering a sha256 lookup of one SHAttered half
+    /// with the other half's record, keyed on their shared sha1. The
+    /// query key must not weld into that row's identity cluster.
+    #[test]
+    fn contradicted_response_does_not_weld() {
+        let queried = coord(&format!("sha256:{}", "d".repeat(64)));
+        let other = format!("sha256:{}", "2".repeat(64));
+        let sha1 = format!("sha1:{}", "3".repeat(40));
+        let lying = Evidence {
+            found_at: queried.clone(),
+            finding: finding("circl", &[&other, &sha1]),
+        };
+        let honest = Evidence {
+            found_at: coord(&other),
+            finding: finding("swh", &[&other]),
+        };
+        let result = cluster(vec![lying, honest], &queried);
+        assert_eq!(result.clusters.len(), 1);
+        assert!(
+            !result.clusters[0].primary,
+            "query key welded into a contradicting row's cluster"
+        );
+        assert!(
+            !result.clusters[0].coords.contains(&queried),
+            "queried digest adopted despite contradiction"
+        );
+    }
+
+    /// A row that echoes the queried digest keeps its primary linkage
+    /// (and coords-less findings — rekor, depsdev — still attach via
+    /// the query key alone).
+    #[test]
+    fn echoed_and_coordless_responses_stay_primary() {
+        let queried = coord(&format!("sha256:{}", "a".repeat(64)));
+        let echoed = Evidence {
+            found_at: queried.clone(),
+            finding: finding("swh", &[&queried.to_string()]),
+        };
+        let coordless = Evidence {
+            found_at: queried.clone(),
+            finding: finding("rekor", &[]),
+        };
+        let result = cluster(vec![echoed, coordless], &queried);
+        assert_eq!(result.clusters.len(), 1);
+        assert!(result.clusters[0].primary);
+        assert_eq!(result.clusters[0].findings.len(), 2);
     }
 }

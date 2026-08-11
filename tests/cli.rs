@@ -522,6 +522,28 @@ fn scan_resolves_by_default() {
     assert!(!text.contains("attributed"), "census attributed:\n{text}");
 }
 
+/// Scan attribution comes from primary clusters only: an index row
+/// that shares nothing but a weak digest with the scanned file (the
+/// file's own coords observation supplies the md5 hop) is about other
+/// bytes and must not tag the file.
+#[test]
+fn scan_does_not_attribute_across_weak_digests() {
+    let env = TestEnv::new("scanweak");
+    // A fatcat row about DIFFERENT bytes that happens to share fox's md5.
+    build_fatcat_index(&env, &[(&"9".repeat(40), &"8".repeat(64), FOX_MD5)]);
+    let file = env.write("fox.txt", b"the quick brown fox jumps over the lazy dog\n");
+    let out = env.hdx(&["coords", file.to_str().unwrap()]);
+    assert!(out.status.success());
+
+    let out = env.hdx(&["scan", env.work().to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        !text.contains("fatcat"),
+        "md5-only row attributed to the file:\n{text}"
+    );
+}
+
 #[test]
 fn fetch_registry_works_offline() {
     let env = TestEnv::new("fetch");
