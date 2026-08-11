@@ -123,7 +123,7 @@
 </main>
 
 <script type="module">
-import init, { parse_coord, Hasher, filter_list, probe_filter, fatcat_lookup }
+import init, { parse_coord, Hasher, filter_list, probe_filter, fatcat_lookup, tarballs_lookup }
   from "./pkg/hashdex_web.js";
 
 const $ = (id) => document.getElementById(id);
@@ -259,13 +259,36 @@ async function resolveCoords(coords, file, token) {
   const claimSection = el("section");
   claimSection.append(el("h2", null, "attributions"));
   const claimCard = el("div", "card");
-  const claimNote = el("p", "note", "asking the fatcat scholarly index…");
+  const claimNote = el("p", "note", "asking the published indexes…");
   claimSection.append(claimCard, claimNote);
 
-  if (applicable.length) result.append(srcSection);
+  // The parquet datasets the page can point-look-up into, each fed the
+  // strongest coordinate it speaks. Lookups return findings whose
+  // claims render as they land.
   const fatcatCoord = ["sha256", "sha1", "md5"].find((s) => coords[s]);
-  if (fatcatCoord) result.append(claimSection);
-  if (!applicable.length && !fatcatCoord) {
+  const tarballsCoord = ["sha256", "md5"].find((s) => coords[s]);
+  const TARBALL_ATTESTORS = {
+    debian: "the Debian sid Sources index",
+    homebrew: "the Homebrew formulae API",
+    guix: "GNU Guix sources.json",
+  };
+  const datasets = [];
+  if (fatcatCoord) datasets.push({
+    label: "fatcat",
+    call: () => fatcat_lookup(`${fatcatCoord}:${coords[fatcatCoord]}`),
+    findings: (v) => (v ? [v] : []),
+    attestor: (f) => `attested by ${f.backend} (IA fatcat bulk export, 2024-02-18)`,
+  });
+  if (tarballsCoord) datasets.push({
+    label: "release tarballs",
+    call: () => tarballs_lookup(`${tarballsCoord}:${coords[tarballsCoord]}`),
+    findings: (v) => v || [],
+    attestor: (f) => `attested by ${TARBALL_ATTESTORS[f.backend] || f.backend}`,
+  });
+
+  if (applicable.length) result.append(srcSection);
+  if (datasets.length) result.append(claimSection);
+  if (!applicable.length && !datasets.length) {
     result.append(el("p", "note",
       "No published source speaks this hash scheme yet — sha1 and sha256 reach the most."));
     return;
@@ -300,45 +323,54 @@ async function resolveCoords(coords, file, token) {
     }
   });
 
-  const lookup = (async () => {
-    if (!fatcatCoord) return;
+  const known = new Set(Object.entries(coords).map(([s, h]) => `${s}:${h}`));
+  const extras = new Set();
+  let claimed = 0, settledLookups = 0;
+  const failures = [];
+  const lookups = datasets.map(async (src) => {
     try {
-      const finding = JSON.parse(await fatcat_lookup(`${fatcatCoord}:${coords[fatcatCoord]}`));
+      const findings = src.findings(JSON.parse(await src.call()));
       if (token !== runToken) return;
-      claimNote.remove();
-      if (!finding || !finding.claims.length) {
-        claimSection.append(el("p", "note", "No attribution found in the fatcat scholarly index."));
-        claimCard.remove();
-        return;
-      }
-      for (const c of finding.claims) {
-        const div = el("div", "claim");
-        div.append(el("div", null, c.statement));
-        if (c.url) {
-          const a = el("a", null, c.url);
-          a.href = c.url;
-          a.target = "_blank";
-          a.rel = "noopener";
-          div.append(a);
+      for (const f of findings) {
+        if (!f || !f.claims || !f.claims.length) continue;
+        claimed++;
+        for (const c of f.claims) {
+          const div = el("div", "claim");
+          div.append(el("div", null, c.statement));
+          if (c.url) {
+            const a = el("a", null, c.url);
+            a.href = c.url;
+            a.target = "_blank";
+            a.rel = "noopener";
+            div.append(a);
+          }
+          div.append(el("div", "attestor", src.attestor(f)));
+          claimCard.append(div);
         }
-        div.append(el("div", "attestor", `attested by ${finding.backend} (IA fatcat bulk export, 2024-02-18)`));
-        claimCard.append(div);
-      }
-      if (finding.coords && finding.coords.length > 1) {
-        const known = new Set(Object.entries(coords).map(([s, h]) => `${s}:${h}`));
-        const extra = finding.coords.filter((c) => !known.has(c));
-        if (extra.length) {
-          claimSection.append(el("p", "note", `same bytes, co-witnessed: ${extra.join("  ")}`));
-        }
+        for (const c of f.coords || []) if (!known.has(c)) extras.add(c);
       }
     } catch (e) {
       if (token !== runToken) return;
-      claimNote.className = "error";
-      claimNote.textContent = `fatcat lookup failed: ${e}`;
+      failures.push(`${src.label} lookup failed: ${e}`);
     }
-  })();
+    if (token !== runToken || ++settledLookups < datasets.length) return;
+    claimNote.remove();
+    if (failures.length) {
+      for (const msg of failures) claimSection.append(el("p", "error", msg));
+    }
+    if (!claimed) {
+      if (!failures.length) {
+        claimSection.append(el("p", "note",
+          "No attribution found in the published indexes (fatcat, release tarballs)."));
+      }
+      claimCard.remove();
+    } else if (extras.size) {
+      claimSection.append(el("p", "note",
+        `same bytes, co-witnessed: ${[...extras].join("  ")}`));
+    }
+  });
 
-  await Promise.allSettled([...probes, lookup]);
+  await Promise.allSettled([...probes, ...lookups]);
 }
 
 function renderCoords(coords, file) {

@@ -17,7 +17,7 @@ use blake2::Blake2s256;
 use bytes::Bytes;
 use hashdex::coord::{Coord, Scheme};
 use hashdex::range_store::RangeStore;
-use hashdex::{dcso, fatcat};
+use hashdex::{dcso, fatcat, tarballs};
 use md5::Md5;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use serde::Serialize;
@@ -259,12 +259,30 @@ async fn probe_filter_inner(name: &str, scheme: &str, coord: &str) -> Result<boo
         .all(|((_, mask), w)| u64::from_le_bytes(w[..8].try_into().unwrap()) & mask != 0))
 }
 
-// ---------------------------------------------------------------- fatcat
+// -------------------------------------------------------------- datasets
 
 /// Cold-open speculative suffix: length (via Content-Range) + footer +
-/// page-index region in one request. The data files' index region is
-/// ~4.8 MB; 8 MB covers it with margin.
+/// page-index region in one request. The fatcat data files' index
+/// region is ~4.8 MB; 8 MB covers it with margin.
 const SUFFIX: usize = 8 << 20;
+
+/// A published parquet dataset the page can point-look-up into. The
+/// session machinery (revision pin, opened files, miss feeding) is
+/// keyed per dataset; the lookup logic itself lives in the core crate.
+#[derive(Clone, Copy)]
+struct Dataset {
+    base: &'static str,
+    revision_api: &'static str,
+}
+
+const FATCAT: Dataset = Dataset {
+    base: fatcat::DATASET_BASE,
+    revision_api: fatcat::REVISION_API,
+};
+const TARBALLS: Dataset = Dataset {
+    base: tarballs::DATASET_BASE,
+    revision_api: tarballs::REVISION_API,
+};
 
 struct Opened {
     url: String,
@@ -273,30 +291,32 @@ struct Opened {
 }
 
 thread_local! {
-    static FATCAT_FILES: RefCell<HashMap<String, Rc<Opened>>> = RefCell::new(HashMap::new());
-    static REVISION: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Opened remote files, keyed by (dataset base, repo-relative path).
+    static OPENED: RefCell<HashMap<(&'static str, String), Rc<Opened>>> =
+        RefCell::new(HashMap::new());
+    static REVISIONS: RefCell<HashMap<&'static str, String>> = RefCell::new(HashMap::new());
 }
 
 /// The dataset revision to read, pinned once per page session so a
 /// mid-session republish can't tear a lookup. Falls back to "main".
-async fn pinned_revision() -> String {
-    if let Some(rev) = REVISION.with(|r| r.borrow().clone()) {
+async fn pinned_revision(ds: &Dataset) -> String {
+    if let Some(rev) = REVISIONS.with(|r| r.borrow().get(ds.revision_api).cloned()) {
         return rev;
     }
-    let rev = match fetch::get_json(fatcat::REVISION_API).await {
+    let rev = match fetch::get_json(ds.revision_api).await {
         Ok(v) => v["sha"].as_str().unwrap_or("main").to_string(),
         Err(_) => "main".to_string(),
     };
-    REVISION.with(|r| *r.borrow_mut() = Some(rev.clone()));
+    REVISIONS.with(|r| r.borrow_mut().insert(ds.revision_api, rev.clone()));
     rev
 }
 
-async fn ensure_open(path: &str) -> Result<()> {
-    if FATCAT_FILES.with(|f| f.borrow().contains_key(path)) {
+async fn ensure_open(ds: &Dataset, path: &str) -> Result<()> {
+    if OPENED.with(|f| f.borrow().contains_key(&(ds.base, path.to_string()))) {
         return Ok(());
     }
-    let rev = pinned_revision().await;
-    let url = format!("{}/{}/{}", fatcat::DATASET_BASE, rev, path);
+    let rev = pinned_revision(ds).await;
+    let url = format!("{}/{}/{}", ds.base, rev, path);
     let (total, start, bytes) = fetch::get_suffix(&url, SUFFIX).await?;
     let store = RangeStore::new(total);
     store.insert(start, Bytes::from(bytes));
@@ -317,35 +337,35 @@ async fn ensure_open(path: &str) -> Result<()> {
             },
         }
     };
-    FATCAT_FILES.with(|f| {
-        f.borrow_mut()
-            .insert(path.to_string(), Rc::new(Opened { url, store, meta }))
+    OPENED.with(|f| {
+        f.borrow_mut().insert(
+            (ds.base, path.to_string()),
+            Rc::new(Opened { url, store, meta }),
+        )
     });
     Ok(())
 }
 
-/// Resolve one coordinate against the fatcat file dataset. Returns the
-/// finding as JSON, or "null" for unsupported schemes and misses.
-#[wasm_bindgen]
-pub async fn fatcat_lookup(coord: String) -> Result<String, JsValue> {
-    fatcat_lookup_inner(&coord).await.map_err(err_js)
-}
-
-async fn fatcat_lookup_inner(coord: &str) -> Result<String> {
-    let coord = Coord::parse(coord)?;
-    if !fatcat::supports(coord.scheme) {
-        return Ok("null".to_string());
+/// The sync lookup over async fetches: run the whole lookup; when it
+/// stops on a missing range (or a data file a weak-digest map just
+/// revealed), fetch that and run it again. Identical in shape to the
+/// range_store test Driver, with awaited fetches.
+async fn drive_lookup<T>(
+    ds: &Dataset,
+    start_paths: &[String],
+    run: impl Fn(&dyn Fn(&str) -> Result<(Arc<RangeStore>, Arc<ParquetMetaData>)>) -> Result<T>,
+) -> Result<T> {
+    for path in start_paths {
+        ensure_open(ds, path).await?;
     }
-    for path in fatcat::start_paths(&coord) {
-        ensure_open(&path).await?;
-    }
-
-    // The sync lookup over async fetches: run the whole lookup; when
-    // it stops on a missing range (or a data file the weak-digest map
-    // just revealed), fetch that and run it again. Identical in shape
-    // to the range_store test Driver, with awaited fetches.
     for _ in 0..96 {
-        let files: HashMap<String, Rc<Opened>> = FATCAT_FILES.with(|f| f.borrow().clone());
+        let files: HashMap<String, Rc<Opened>> = OPENED.with(|f| {
+            f.borrow()
+                .iter()
+                .filter(|((base, _), _)| *base == ds.base)
+                .map(|((_, path), o)| (path.clone(), Rc::clone(o)))
+                .collect()
+        });
         let need_open: RefCell<Option<String>> = RefCell::new(None);
         let open = |path: &str| -> Result<(Arc<RangeStore>, Arc<ParquetMetaData>)> {
             match files.get(path) {
@@ -356,14 +376,14 @@ async fn fatcat_lookup_inner(coord: &str) -> Result<String> {
                 }
             }
         };
-        match fatcat::lookup_with(open, &coord) {
-            Ok(finding) => return Ok(serde_json::to_string(&finding)?),
+        match run(&open) {
+            Ok(out) => return Ok(out),
             Err(e) => {
                 // Take before awaiting: a borrow in the `if let`
                 // scrutinee would live across the await.
                 let pending = need_open.borrow_mut().take();
                 if let Some(path) = pending {
-                    ensure_open(&path).await?;
+                    ensure_open(ds, &path).await?;
                     continue;
                 }
                 let mut fed = false;
@@ -381,4 +401,43 @@ async fn fatcat_lookup_inner(coord: &str) -> Result<String> {
         }
     }
     bail!("lookup did not converge")
+}
+
+/// Resolve one coordinate against the fatcat file dataset. Returns the
+/// finding as JSON, or "null" for unsupported schemes and misses.
+#[wasm_bindgen]
+pub async fn fatcat_lookup(coord: String) -> Result<String, JsValue> {
+    fatcat_lookup_inner(&coord).await.map_err(err_js)
+}
+
+async fn fatcat_lookup_inner(coord: &str) -> Result<String> {
+    let coord = Coord::parse(coord)?;
+    if !fatcat::supports(coord.scheme) {
+        return Ok("null".to_string());
+    }
+    let finding = drive_lookup(&FATCAT, &fatcat::start_paths(&coord), |open| {
+        fatcat::lookup_with(|p| open(p), &coord)
+    })
+    .await?;
+    Ok(serde_json::to_string(&finding)?)
+}
+
+/// Resolve one coordinate against the release-tarballs dataset.
+/// Returns a JSON array of findings (one per witness row; empty =
+/// no hits), or "null" for unsupported schemes.
+#[wasm_bindgen]
+pub async fn tarballs_lookup(coord: String) -> Result<String, JsValue> {
+    tarballs_lookup_inner(&coord).await.map_err(err_js)
+}
+
+async fn tarballs_lookup_inner(coord: &str) -> Result<String> {
+    let coord = Coord::parse(coord)?;
+    if !tarballs::supports(coord.scheme) {
+        return Ok("null".to_string());
+    }
+    let findings = drive_lookup(&TARBALLS, &tarballs::start_paths(&coord), |open| {
+        tarballs::lookup_with(|p| open(p), &coord)
+    })
+    .await?;
+    Ok(serde_json::to_string(&findings)?)
 }

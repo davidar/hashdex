@@ -179,38 +179,20 @@ fn tarballs_parse(line: &str, row: &mut [u8]) -> Result<()> {
 }
 
 fn tarballs_finding(row: &[u8]) -> Finding {
-    let name = str_from(&row[49..121]);
-    let version = str_from(&row[121..177]);
-    let filename = str_from(&row[177..305]);
-    let loc = str_from(&row[305..497]);
-    let (backend, statement, url) = match row[48] {
-        1 => (
-            "debian",
-            format!(
-                "Debian sid packages these bytes as {filename} (source package {name} {version})"
-            ),
-            Some(format!("https://deb.debian.org/debian/{loc}/{filename}")),
-        ),
-        2 => (
-            "homebrew",
-            format!("Homebrew packages these bytes as {name} {version} (upstream source)"),
-            Some(loc),
-        ),
-        _ => (
-            "guix",
-            format!("GNU Guix packages these bytes as {filename}"),
-            Some(loc),
-        ),
-    };
-    let mut coords = vec![format!("sha256:{}", hex(&row[0..32]))];
-    if row[32..48].iter().any(|&b| b != 0) {
-        coords.push(format!("md5:{}", hex(&row[32..48])));
-    }
-    Finding {
-        backend: backend.into(),
-        claims: vec![Claim::new(statement, url)],
-        coords,
-    }
+    // Same renderer as the published-parquet lookups — one voice for
+    // the source, whatever the storage.
+    crate::tarballs::finding(&crate::tarballs::Row {
+        witness: TARBALLS_WITNESSES[(row[48] as usize).saturating_sub(1).min(2)],
+        name: &str_from(&row[49..121]),
+        version: &str_from(&row[121..177]),
+        filename: &str_from(&row[177..305]),
+        loc: &str_from(&row[305..497]),
+        sha256: hex(&row[0..32]),
+        md5: row[32..48]
+            .iter()
+            .any(|&b| b != 0)
+            .then(|| hex(&row[32..48])),
+    })
 }
 
 /// NUL-pad `s` into `out`; a "-" field means absent (stored empty).

@@ -13,6 +13,7 @@ pub mod fatcat;
 pub mod finding;
 pub mod parquet_index;
 pub mod range_store;
+pub mod tarballs;
 
 #[cfg(feature = "cli")]
 pub mod backends;

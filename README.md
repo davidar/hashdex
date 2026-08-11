@@ -144,7 +144,10 @@ One source is an exact inverted index instead of a filter:
   resolve offline to claims like "Debian sid packages these bytes as
   hello_2.12.3.orig.tar.gz" with a download URL — Guix's are
   content-addressed mirror URLs that name the hash itself. Debian rows
-  carry md5 alongside sha256, a single-witness crosswalk edge.
+  carry md5 alongside sha256, a single-witness crosswalk edge. The
+  same rows are published as page-indexed parquet
+  ([release-tarballs](https://huggingface.co/datasets/david-ar/release-tarballs))
+  for remote point lookups.
 
 ## Build
 
