@@ -1,0 +1,50 @@
+name: pages
+
+# Build the browser resolver (web/) to wasm and deploy it to GitHub
+# Pages. The site is just index.html + the wasm-bindgen pkg/ output —
+# lookups are range reads from the visitor's browser into the
+# published HF datasets, no server side.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: web
+      - name: install wasm-bindgen-cli (version pinned by web/Cargo.lock)
+        run: |
+          VER=$(awk '/^name = "wasm-bindgen"$/{getline; print}' web/Cargo.lock | cut -d'"' -f2)
+          curl -sSfL "https://github.com/rustwasm/wasm-bindgen/releases/download/${VER}/wasm-bindgen-${VER}-x86_64-unknown-linux-musl.tar.gz" | tar xz
+          echo "$PWD/wasm-bindgen-${VER}-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+      - run: ./build.sh
+        working-directory: web
+      - name: stage site
+        run: |
+          mkdir -p _site
+          cp web/index.html _site/
+          cp -r web/pkg _site/pkg
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4

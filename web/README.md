@@ -18,7 +18,9 @@ cargo install wasm-bindgen-cli   # version matching Cargo.lock's wasm-bindgen
 ```
 
 Serve the directory statically (`python3 -m http.server`) — `pkg/` and
-`index.html` are the whole deployment.
+`index.html` are the whole deployment. The live copy is GitHub Pages
+(https://davidar.github.io/hashdex/), rebuilt from master by
+`.github/workflows/pages.yml`.
 
 This crate is deliberately not a workspace member of the published
 `hashdex` crate; it depends on it by path with
