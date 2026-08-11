@@ -4,7 +4,9 @@
 do URL→hash dumps already exist, so we can invert them ourselves
 without ever fetching content? Every claim marked "verified" was
 checked by direct HTTP probe or document fetch (baseline sweep
-2026-08-01); UNVERIFIED flags are honest gaps, not oversights.*
+2026-08-01; second sweep 2026-08-12: install media, NSRL deep-dive,
+CIRCL demotion, ArchiveTeam corpus, per-distro package indexes);
+UNVERIFIED flags are honest gaps, not oversights.*
 
 **Admission rule for this list:** ingest cost must scale with metadata,
 never with content, and new-algorithm support must never imply re-fetch.
@@ -55,15 +57,26 @@ its own scheme).
   Rekor → this one dataset covers them in bulk; per-registry attestation
   endpoints become verification-only.
 
-### CIRCL hashlookup 🔀
+### CIRCL hashlookup 🔀 — demoted to hint layer (2026-08-12)
 - Aggregates NSRL + Windows builds + Ubuntu/CentOS/Fedora/Kali/OpenSUSE/
-  OpenBSD + CDNJS + Snap store. CC-BY 4.0, open-source server.
+  OpenBSD + CDNJS + Snap store — **published source list is incomplete**:
+  live lookups also return Debian and Alpine records (verified), and
+  some records carry no `source` field at all.
 - REST + DNS lookup (md5/sha1/sha256/sha512); bulk Bloom filter
   `https://cra.circl.lu/hashlookup/hashlookup-full.bloom` (956 MB,
   418M SHA-1 keys; anonymous direct fetch works but the host is slow
   — we mirror it on HF).
-- Bloom = membership only; metadata via API. Published filter dated
-  Oct 2023; recent binaries miss.
+- Bloom = membership only; metadata via API. Published filter frozen
+  since **Oct 2023** (docs claim monthly); live DB reports 6.4B keys,
+  NSRL 2023.09.2.
+- 🪤 **Records are keyed on SHA-1 internally** (kvrocks primary key;
+  md5/sha256 are secondary indexes into sha1 records) — a sha256
+  lookup of one SHAttered half returns the *other* half's record
+  verbatim, returned SHA-256 field not matching the query (verified
+  live 2026-08-12). Architectural, not a data glitch.
+- **Verdict: keep the mirrored bloom as a free corroborating filter;
+  never source claims from the API — go direct to its sources
+  (NSRL + the per-distro indexes below).**
 
 ---
 
@@ -100,10 +113,22 @@ Notes:
 
 - **Ubuntu** 🔀 — **richest cross-algorithm source in the family**:
   Packages/Sources stanzas carry **MD5+SHA1+SHA256+SHA512** (4-way, one
-  .xz index per suite/arch) + pool `Filename` → direct URL.
+  .xz index per suite/arch) + pool `Filename` → direct URL. Verified
+  2026-08-12 on noble binary-amd64: all four digests present per
+  stanza, 100% coverage (restricted 492/492); `Contents-*.gz` and
+  `.manifest` files confirmed hashless; no Ubuntu analogue of
+  dedup.debian.net exists.
   `old-releases.ubuntu.com` back to 2004. Launchpad API adds the full
   publication history incl. **all PPAs** (`binaryFileUrls` → url+sha1+
   sha256 per file) — API-only, paginated, no dump.
+- **Kali** — same Debian Packages format (verified 2026-08-12):
+  MD5+SHA1+SHA256 per .deb (3-way, no SHA512), `http.kali.org/kali/
+  dists/kali-rolling/<comp>/binary-<arch>/Packages.gz`. Zero marginal
+  parser cost next to Ubuntu/Debian.
+- **msys2** — `repo.msys2.org/<repo>/<arch>/<repo>.db.tar.zst`
+  (~0.5 MB each): `%SHA256SUM%` per `.pkg.tar.zst` artifact, 100%
+  coverage, ~10K rows across msys/mingw64/ucrt64/clang64/mingw32.
+  Verified 2026-08-12. A handful of GETs.
 - **Debian** 🔀 — current Packages: MD5+SHA256 (SHA1 dropped ~2016;
   pre-2016 indexes via snapshot.d.o carry all three). `Filename` → pool
   URL. **buildinfos.debian.net**: every buildd-built .deb since ~2016
@@ -120,6 +145,13 @@ Notes:
   Fedora Core. **Koji**: ~46.4M RPMs / 2.95M builds, every build ever
   (incl. never-shipped); `getRPMChecksums` → md5+sha256 🔀 but
   XMLRPC-per-RPM only, no dump.
+- **RPM repodata carries `<rpm:header-range>` per package** (verified
+  2026-08-12 on CentOS Stream 9, Alma 9, Rocky 9, openSUSE
+  Tumbleweed): primary.xml hands over the exact byte range for the
+  RPM header — the `fedora_headers.py` FILEDIGESTS range-GET
+  technique ports to all of them with zero discovery cost. filelists
+  .xml on all four = paths only, no digests (confirmed). openSUSE:
+  pkgid is **sha512** and repodata is `.zst` not `.gz`.
 - **Arch** 🔀 — repo .db files (sha256 only today); **Arch Linux
   Archive**: daily .db snapshots back to 2013, and 2013–~2022 DBs carry
   **MD5+SHA256** → historical 2-way edges. Archive keeps every package
@@ -141,9 +173,35 @@ Notes:
   objects, >600 TB; numtide/narwal promises published inventory dumps
   "soon" (UNVERIFIED). Bonus: nixpkgs fixed-output derivations map
   upstream source URL→SRI hash, greppable at repo scale.
-- **F-Droid** 🔀 — `index-v2.json` (54 MB, one GET): per APK **sha256 +
-  IPFS CIDv1** (a free cross-*namespace* edge) + source-tarball sha256;
-  `/archive/` index holds old versions.
+- **F-Droid** 🔀 — `index-v2.json`, GPG-signed (verified 2026-08-12:
+  repo 55.5 MB = 12.6K APK versions, archive 108.1 MB = 80.0K):
+  per APK **sha256 + IPFS CIDv1** (a free cross-*namespace* edge) +
+  source-tarball sha256 (~92.4K) — **~185K strong-digest rows in 2–3
+  GETs**, preimage verified raw bytes, claim URLs live
+  (`f-droid.org/repo|archive/<name>`). IzzyOnDroid third-party repo
+  speaks the same format (14 MB).
+- **Microsoft Update (via ArchiveTeam)** — `github.com/ArchiveTeam/
+  microsoftupdate-items` publishes the tracker item list:
+  `added/bin{1..28}.txt.zst` (~28 MB) = **419,130 unique
+  `bin:<base32-sha1>:<msdownload path>` rows** (RFC4648 base32 of raw
+  sha1, WARC-digest convention; preimage byte-verified twice, incl. a
+  hashless-filename 1999-era cabpool file — keys come from
+  Microsoft's own update metadata). Plus `raw/WUDrivers.csv.zst.*`
+  (197 MB): ~1.8M rows sha1 → vendor/models/hardware IDs/driver
+  version/date/size. Claim URL by construction:
+  `download.windowsupdate.com/<path>` — verified live even for 2004
+  files. The biggest Windows-binary gap-filler short of NSRL;
+  **sha1-only** (weak tier). The IA mirror collection (3,360 items,
+  ~36 TB, with CDX) is access-restricted — unusable.
+- **Snap store** — **negative** (verified 2026-08-12): per-revision
+  digest is **SHA3-384** (a scheme hdx doesn't mint), served only by
+  `/v2/snaps/info/<name>`; the find endpoint strips it and no
+  enumerate-all endpoint exists. Effectively unharvestable.
+- **cdnjs** — `github.com/cdnjs/SRIs` (MIT, ~228 MB): per-library/
+  per-version JSON of **per-contained-file SRI sha512** — the only
+  per-file web-asset corpus found, one git clone. ⚠️ Frozen at
+  2021-04-26; post-2021 = ~10^5–10^6 API calls (live API serves
+  per-version SRI but no bulk). Verified 2026-08-12.
 - **reproduce.debian.net** 🔀 — rebuilderd attestations: per rebuilt
   .deb **sha256+sha512** + GOOD/BAD verdict + direct pool URL; bulk
   package list in one request (~36k records/arch/release), attestation
@@ -151,16 +209,92 @@ Notes:
   the design calls for, live. (Arch's equivalent exists but its API
   was flaky/unverifiable.)
 
+### Install media / OS release images (2026-08-12 sweep)
+
+**Nobody aggregates ISO hashes** (verified: quickget ships per-distro
+checksum-endpoint *recipes* for ~100 OSes — code, not data; osinfo-db
+has URLs + volume-id regexes, zero hashes). But every distro publishes
+per-release checksum documents, and the majors' trees enumerate full
+history — so hashdex compiles the aggregate itself
+(`tools/install_media.py`, quickget-seeded catalog; the checksum
+document URL is the claim URL by construction). Verified endpoints:
+
+- **Ubuntu**: `releases.ubuntu.com/<ver>/SHA256SUMS` +
+  `old-releases.ubuntu.com/releases/<codename>/` (SHA256SUMS from
+  ~dapper on; warty–edgy are MD5SUMS-only). Also a **GPG-signed
+  simplestreams index** `releases.ubuntu.com/streams/v1/
+  com.ubuntu.releases:ubuntu.json` (+`:ubuntu-server`) — sha256 +
+  size + path per image incl. zsync/manifest sidecars, LTS products.
+- **Fedora**: `dl.fedoraproject.org/pub/fedora/linux/releases/<N>/
+  <Edition>/<arch>/iso/*-CHECKSUM` — but old release dirs on dl are
+  **empty stubs**; real history is `archives.fedoraproject.org/pub/
+  archive/fedora/linux/releases/<N>/…`, and pre-~F21 the CHECKSUM
+  sits in `<Edition>/<arch>/` with **no `iso/` subdir** (verified
+  F20). Oldest releases are SHA1SUM-era.
+- **Arch**: `archlinux.org/releng/releases/json/` — **every monthly
+  ISO ever in one GET**, sha256 (null for the oldest).
+- **Debian**: `cdimage.debian.org/debian-cd/current{,-live}/<arch>/
+  iso-*/SHA256SUMS`; archive under `/mirror/cdimage/archive/`.
+  SHA512SUMS also published (same dir, unjoined — one witness file
+  per scheme).
+- **Rocky**: `dl.rockylinux.org/vault/rocky/<ver>/isos/<arch>/
+  CHECKSUM` — vault = every point release. **Alma**:
+  `repo.almalinux.org/almalinux/<ver>/isos/<arch>/CHECKSUM`.
+- **Kali**: `cdimage.kali.org/kali-<ver>/SHA256SUMS` — full history.
+- **Mint**: `mirrors.kernel.org/linuxmint/stable/<ver>/sha256sum.txt`
+  (+ `linuxmint/debian/` for LMDE).
+- **OpenBSD**: `ftp.openbsd.org/pub/OpenBSD/<ver>/<arch>/SHA256`,
+  BSD-format hex (the CDN keeps ~3 releases; ftp.openbsd.org keeps
+  all). 🪤 parser gotcha: `<ver>/packages/<arch>/SHA256` digests are
+  **base64** while install-set files are hex, same tree.
+- **FreeBSD**: `download.freebsd.org/releases/<arch path>/ISO-IMAGES/
+  <ver>/CHECKSUM.SHA256-*`. **Void**: dated dirs
+  `repo-default.voidlinux.org/live/<YYYYMMDD>/sha256sum.txt`.
+  **Proxmox**: one cumulative `enterprise.proxmox.com/iso/SHA256SUMS`.
+  **Zorin**: purdue mirror `zorin-iso/<ver>/SHA256SUMS.txt`.
+  **CentOS Stream**: `mirror.stream.centos.org/<N>-stream/BaseOS/
+  <arch>/iso/*.SHA256SUM` sidecars.
+- Sidecar-per-file tail (deferred): openSUSE `.sha256` sidecars,
+  NixOS channels, Tails, KDE neon, haiku/ghostbsd/solus/openindiana;
+  SourceForge-hosted checksums (redirect chains); sha512-only
+  witnesses (EndeavourOS, Manjaro, Gentoo `.DIGESTS`, Mageia);
+  md5/sha1-only (Slackware, NetBSD, Trisquel) → weak tier.
+- Related finds: 203 MSDN Windows-ISO sha1s on the ArchiveTeam wiki
+  (`Microsoft` page); **Redump DATs** (`redump.org/downloads/`, 60
+  systems, crc32+md5+sha1 per disc image, no sha256, no artifact
+  URLs — preservation-grade attestor, weak tier). 🪤 BitTorrent v1
+  infohash/piece-sha1s are never whole-file digests; v2 per-file
+  pieces-root is a 16 KiB-leaf sha256 merkle (a potential future
+  scheme hdx could mint itself).
+
 ### Security / forensic hash sets
 
-- **NSRL RDS (NIST)** 🔀 — public domain, anonymous S3
-  (`s3.amazonaws.com/rds.nsrl.nist.gov/RDS/...`). RDSv3 SQLite; full DBs
-  annually (2026.03.1: modern 133 GB + legacy 46 GB + ios 17 GB + android
-  16 GB zipped), quarterly SQL-text deltas (~2 GB); "minimal" variants
-  ~43 GB total. Every row: **crc32+md5+sha1+sha256** → file name/size →
-  package/version → OS → manufacturer. ~1.5B rows, ~209.5M distinct
-  sha256. Bonus: separate **SHA-1→SHA-256 mapping, 16.8M rows, 1.1 GB**;
-  NSRL-CAID; block-hash sets. Redistribution "free and encouraged".
+- **NSRL RDS (NIST)** 🔀 — public domain-ish, anonymous S3
+  (`s3.amazonaws.com/rds.nsrl.nist.gov/RDS/rds_<ver>/`). RDSv3 SQLite
+  only (text format publication ended). Deep-dive verified 2026-08-12:
+  - **Minimal sets exist for all four corpora** (modern/legacy/android/
+    ios), 43.3 GB zipped / 327.6 GB unpacked total, **209,541,002
+    distinct sha256** (modern 72.9M + legacy 69.7M + android 34.2M +
+    ios 32.8M), 804M file rows. Full sets (211 GB zipped) add a
+    METADATA table: in-product **paths**, mtime, and `extractee_id` +
+    `recursion_level` 0–10 — NSRL digests containers AND their
+    extracted contents (covers tarball-tier + peek-inside at once).
+  - Schema (extracted from the live zip by range-read): `FILE(sha256,
+    sha1, md5, crc32, file_name, file_size, package_id)` ⋈
+    `PKG/OS/MFG` (product name, version, OS, vendor, language, app
+    type) — claims even in minimal; `DISTINCT_HASH` view = the 4-way
+    crosswalk table, pre-defined by NIST.
+  - Cadence: full each March; quarterly `.sql` deltas (modern_minimal
+    delta ~240 MB) applied to an *unmodified* prior full, verified via
+    published `dbhash` values.
+  - ⚠️ License clause: modified redistributions must **remove**
+    references to NIST as producer — word derived-artifact cards
+    carefully. ⚠️ Corpus is ~1-in-400k internally inconsistent
+    (verified: one sha1+md5 pair carrying two sha256 values) — never
+    let a single row weld clusters. Rows are UPPERCASE hex.
+  - 91 MB `RDS_2021.12.2_curated.zip` is the practical smoke-test DB.
+    The old sha1→sha256 mapping + block-hash zips 403 (and are
+    obsolete — RDSv3 carries sha256 natively). NSRL-CAID: excluded.
 - **MalwareBazaar (abuse.ch)** 🔀 — hourly full CSV export (auth-key since
   2025-06, free): sha256+sha1+md5+imphash+ssdeep+tlsh per row + malware
   family. ~1.1M samples. ⚠️ License no longer clearly CC0 post-Spamhaus
@@ -285,14 +419,47 @@ versioned static files by construction and skip the stability filter.)*
   is of truncated bytes); `robotstxt`/`crawldiagnostics` subsets mixed
   into CDX — filter by status; no revisit records (good: every capture
   carries a full digest).
-- **Internet Archive / Wayback** — **no bulk CDX, period** (~1T captures;
-  API-only, rate-limited; ARCH researcher service is paid/contract).
-  Wayback CDX has `warc/revisit` dedup records. Per-item route: 124.29M
-  public items (verified via Scrape API), each `_files.xml` /
-  Metadata API carries **md5+sha1+crc32 per file** 🔀 with deterministic
-  URLs — O(items) polite sweep ≈ months, or lazy/demand-driven.
-  **Archive Team census** (2015–2017, on archive.org): bulk
-  URL→(md5,sha1) for ~19M items — stale but real; no newer census found.
+- **Internet Archive / Wayback** — **no bulk CDX for wayback, period**
+  (~1T captures; API-only, rate-limited; ARCH researcher service is
+  paid/contract). Wayback CDX has `warc/revisit` dedup records.
+  Per-item route: 124.29M public items (verified via Scrape API), each
+  `_files.xml` / Metadata API carries **md5+sha1+crc32 per file** 🔀
+  with deterministic URLs — O(items) polite sweep ≈ months, or
+  lazy/demand-driven.
+- **IA census** (verified 2026-08-12) — `archive.org/details/
+  ia_census_201604`: `file_hashes_{md5,sha1}_20160411221100_public
+  .tsv.gz` (4,971 + 5,836 MiB), format `identifier \t filename \t
+  hash` (range-read verified), ~14.9M items; claim URL
+  `archive.org/download/<id>/<file>` by construction. Joining the two
+  files on (id,file) = two-hash single-witness rows, **both weak**.
+  Frozen April 2016 — the third and last census; the 2016/2017
+  ArchiveTeam census projects are identifier lists only.
+- **ArchiveTeam collections = hash-indexed via CDX** (verified
+  2026-08-12 with real bytes): every ArchiveBot item carries per-WARC
+  `.os.cdx.gz` sidecars **plus an item-level merged `.cdx.gz`**; CDX
+  `k` column = WARC payload digest, **base32 sha1**. archivebot
+  collection alone = 89,596 items. Rows: sha1 → URL + timestamp +
+  WARC path (wayback claim URL constructible). Weak tier; harvest =
+  ~90K polite GETs.
+- **IA bulk mechanics** (verified 2026-08-12): `s3.us.archive.org/
+  <identifier>/<file>` answers GET (307 → datanode, Range + CORS
+  open); Scrape API enumerates collections cursor-paged; blessed bulk
+  client is the `internetarchive` CLI (`ia download --itemlist
+  --glob`); every item also has a web-seeded torrent.
+- **codearchiver** (ArchiveTeam-adjacent, verified 2026-08-12) — each
+  git bundle in `archiveteam_codearchiver` has a sibling
+  `*_codearchiver_metadata.txt` on IA (range-readable): complete
+  `Object: <oid> blob|tree|commit|tag` inventory of the packfile +
+  upstream `Input URL`. 1,362 sidecars / 2.9 GB / ~10–13M **sha1_git
+  blob IDs**. Corpus (Linux kernel, codeaurora/Android,
+  twitter/the-algorithm) is largely inside SWH already —
+  second-witness value only. Source: `gitea.arpa.li/
+  JustAnotherArchivist/codearchiver` (GitHub mirrors 404).
+- **e621 db_export** — `static1.e621.net/data/db_export/posts.csv.gz`
+  (1.9 GB, daily, 4-day retention): ~5.5–6.6M rows md5 + tags + size
+  + ext; claim URL by construction `static1.e621.net/data/{m[0:2]}/
+  {m[2:4]}/{md5}.{ext}` (verified live). md5-only + adult art booru —
+  **attestor-taste call pending, not queued**.
 - **Fatcat / IA Scholar** 🔀 — the scholarly-PDF jackpot: `archive.org/details/fatcat_snapshots_and_exports`,
   item `fatcat_bulk_exports_2024-02-18` contains
   `file_hashes.tsv.gz` (14.23 GiB) — schema
@@ -399,10 +566,18 @@ in the query pattern (point lookups by digest prefix) needs one.
    availability claims by construction.
 3. **Wrapper traps confirmed in the wild**: Go H1 dirhash, VBMeta
    digests, OTS blinded commitments, Packagist unstable zipballs, Alpine
-   APKINDEX (control-segment-only SHA-1), Nix NAR-domain hashes. Each is
-   either its own crosswalk scheme or excluded. The lesson generalizes:
-   **never assume a hash in the wild is of the raw bytes — verify the
-   preimage definition per source before ingest.**
+   APKINDEX (2026-08-12, byte-verified twice: `C:Q1…` = sha1 of the
+   *compressed control tar.gz segment*; `.PKGINFO` `datahash` = sha256
+   of the *compressed data segment* — both unusable; real per-file
+   sha1 hides in data-segment PAX headers, full-download-only), Nix
+   NAR-domain hashes, BitTorrent v1 infohashes/piece-sha1s, Roblox CDN
+   paths (md5 of asset bytes, verified, but per-asset API only — no
+   dump). Encoding gotchas, same lesson: OpenBSD packages SHA256 files
+   are base64 while its install-set files are hex; Snap is SHA3-384
+   (foreign scheme, not a trap). Each is either its own crosswalk
+   scheme or excluded. The lesson generalizes: **never assume a hash
+   in the wild is of the raw bytes — verify the preimage definition
+   per source before ingest.**
 4. **The web-archive family shares one join key** (SHA-1 base32 payload
    digest) — CC, Wayback, Arquivo, EOT, Archive-It interoperate
    directly; it's also the family stuck hardest on SHA-1, which is where
