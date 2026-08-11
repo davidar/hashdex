@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hashdex</title>
+<link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><text y="13" font-size="13" font-family="monospace">%23</text></svg>'>
+<style>
+  :root {
+    --bg: #fafaf8; --fg: #1a1a1a; --dim: #6b6b6b; --line: #e2e2de;
+    --card: #ffffff; --accent: #2563eb; --ok: #16803c; --miss: #9a9a94;
+    --warn: #b45309; --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a; --fg: #e6e6e2; --dim: #9a9a94; --line: #2a2d33;
+      --card: #1b1e24; --accent: #7aa2f7; --ok: #4ade80; --miss: #6b6b6b;
+      --warn: #fbbf24;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.55 system-ui, sans-serif;
+  }
+  main { max-width: 44rem; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.5rem; margin: 0; letter-spacing: -0.02em; }
+  h1 a { color: inherit; text-decoration: none; }
+  .tagline { color: var(--dim); margin: 0.25rem 0 2rem; }
+  #drop {
+    border: 1.5px dashed var(--line); border-radius: 10px;
+    padding: 2.25rem 1.5rem; text-align: center; color: var(--dim);
+    cursor: pointer; transition: border-color 0.15s, background 0.15s;
+  }
+  #drop.hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 6%, transparent); }
+  #drop strong { color: var(--fg); font-weight: 600; }
+  .or { text-align: center; color: var(--dim); margin: 1rem 0; font-size: 0.9rem; }
+  #hashform { display: flex; gap: 0.5rem; }
+  #hashin {
+    flex: 1; font: 0.9rem var(--mono); padding: 0.6rem 0.75rem;
+    border: 1px solid var(--line); border-radius: 8px;
+    background: var(--card); color: var(--fg); min-width: 0;
+  }
+  #hashin:focus { outline: none; border-color: var(--accent); }
+  #hashform button {
+    font: inherit; padding: 0.6rem 1rem; border: none; border-radius: 8px;
+    background: var(--accent); color: #fff; cursor: pointer;
+  }
+  #result { margin-top: 2.25rem; }
+  section { margin-bottom: 1.75rem; }
+  section h2 {
+    font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--dim); margin: 0 0 0.6rem; font-weight: 600;
+  }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
+  .coordrow {
+    display: flex; gap: 0.75rem; padding: 0.45rem 0.9rem; align-items: baseline;
+    border-bottom: 1px solid var(--line); font-size: 0.85rem;
+  }
+  .coordrow:last-child { border-bottom: none; }
+  .coordrow .scheme { color: var(--dim); min-width: 6.5rem; font-family: var(--mono); }
+  .coordrow .hex {
+    font-family: var(--mono); word-break: break-all; cursor: pointer; flex: 1;
+  }
+  .coordrow .hex:hover { color: var(--accent); }
+  .srcrow {
+    display: flex; gap: 0.75rem; padding: 0.55rem 0.9rem; align-items: baseline;
+    border-bottom: 1px solid var(--line); font-size: 0.9rem;
+  }
+  .srcrow:last-child { border-bottom: none; }
+  .srcrow .mark { min-width: 1.1rem; text-align: center; }
+  .srcrow .mark.ok { color: var(--ok); }
+  .srcrow .mark.miss { color: var(--miss); }
+  .srcrow .mark.warn { color: var(--warn); }
+  .srcrow .name { font-weight: 600; min-width: 6.5rem; }
+  .srcrow .what { color: var(--dim); flex: 1; }
+  .srcrow.pending { opacity: 0.55; }
+  .claim { padding: 0.7rem 0.9rem; border-bottom: 1px solid var(--line); font-size: 0.92rem; }
+  .claim:last-child { border-bottom: none; }
+  .claim a { color: var(--accent); word-break: break-all; font-size: 0.82rem; }
+  .claim .attestor { color: var(--dim); font-size: 0.78rem; margin-top: 0.15rem; }
+  .note { color: var(--dim); font-size: 0.88rem; margin: 0.5rem 0 0; }
+  .error { color: var(--warn); font-size: 0.88rem; }
+  #status { color: var(--dim); font-size: 0.9rem; margin-top: 1rem; min-height: 1.4em; }
+  footer {
+    margin-top: 3rem; padding-top: 1.25rem; border-top: 1px solid var(--line);
+    color: var(--dim); font-size: 0.82rem;
+  }
+  footer a { color: var(--dim); }
+  progress { width: 100%; height: 4px; margin-top: 0.75rem; accent-color: var(--accent); }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1><a href="#" id="home">hashdex</a></h1>
+  <p class="tagline">See where a file already lives on the public web — without uploading it.</p>
+
+  <div id="drop" tabindex="0">
+    <strong>Drop a file here</strong> or click to choose one.<br>
+    It is hashed in your browser and never leaves this device.
+    <progress id="hashprog" class="hidden" max="1" value="0"></progress>
+  </div>
+  <input type="file" id="filein" class="hidden">
+
+  <p class="or">— or paste a hash —</p>
+  <form id="hashform">
+    <input id="hashin" placeholder="sha256:…, sha1:…, md5:…, SRI, SWHID, or bare hex"
+           autocomplete="off" spellcheck="false">
+    <button type="submit">Resolve</button>
+  </form>
+
+  <div id="status"></div>
+  <div id="result"></div>
+
+  <footer>
+    Lookups are HTTP range reads into <a href="https://huggingface.co/david-ar">hashdex&rsquo;s
+    published datasets</a> — bloom filter bits and parquet pages, a few KB each.
+    No server of ours is involved and file contents are never sent anywhere.
+    Filter hits are probabilistic; claims below carry their attestor.
+    Built on <a href="https://github.com/davidar/hashdex">hashdex</a>.
+  </footer>
+</main>
+
+<script type="module">
+import init, { parse_coord, Hasher, filter_list, probe_filter, fatcat_lookup }
+  from "./pkg/hashdex_web.js";
+
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+};
+
+// The digest is 32 bytes; a file shorter than its own name is
+// transcribed by its hash, not identified by it (the CLI's identity
+// floor). Never attribute those.
+const IDENTITY_FLOOR = 32;
+const CHUNK = 8 << 20;
+
+let FILTERS = [];
+let runToken = 0; // invalidates in-flight renders when a new resolve starts
+
+async function main() {
+  await init();
+  FILTERS = JSON.parse(filter_list());
+
+  $("drop").addEventListener("click", () => $("filein").click());
+  $("drop").addEventListener("dragover", (e) => { e.preventDefault(); $("drop").classList.add("hover"); });
+  $("drop").addEventListener("dragleave", () => $("drop").classList.remove("hover"));
+  $("drop").addEventListener("drop", (e) => {
+    e.preventDefault();
+    $("drop").classList.remove("hover");
+    const f = e.dataTransfer.files[0];
+    if (f) resolveFile(f);
+  });
+  $("filein").addEventListener("change", () => {
+    if ($("filein").files[0]) resolveFile($("filein").files[0]);
+  });
+  $("hashform").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const v = $("hashin").value.trim();
+    if (v) resolveHash(v);
+  });
+  $("home").addEventListener("click", (e) => {
+    e.preventDefault();
+    history.replaceState(null, "", location.pathname);
+    $("result").replaceChildren();
+    $("status").textContent = "";
+    $("hashin").value = "";
+  });
+  window.addEventListener("hashchange", fromFragment);
+  fromFragment();
+}
+
+function fromFragment() {
+  const frag = decodeURIComponent(location.hash.slice(1));
+  if (frag) resolveHash(frag, { fromFragment: true });
+}
+
+async function resolveFile(file) {
+  const token = ++runToken;
+  $("status").textContent = `hashing ${file.name} (${fmtBytes(file.size)})…`;
+  const prog = $("hashprog");
+  prog.classList.remove("hidden");
+  try {
+    const hasher = new Hasher(file.size);
+    for (let off = 0; off < file.size; off += CHUNK) {
+      const buf = await file.slice(off, off + CHUNK).arrayBuffer();
+      if (token !== runToken) return;
+      hasher.update(new Uint8Array(buf));
+      prog.value = Math.min(1, (off + CHUNK) / file.size);
+    }
+    const coords = JSON.parse(hasher.finish());
+    prog.classList.add("hidden");
+    if (token !== runToken) return;
+    if (file.size < IDENTITY_FLOOR) {
+      $("status").textContent = "";
+      $("result").replaceChildren();
+      renderCoords(coords, file);
+      $("result").append(el("p", "note",
+        `${file.name} is ${file.size} bytes — shorter than its own digest, ` +
+        `so a hash transcribes it rather than identifying it. Not resolving.`));
+      return;
+    }
+    history.replaceState(null, "", `#sha256:${coords.sha256}`);
+    await resolveCoords(coords, file, token);
+  } catch (e) {
+    prog.classList.add("hidden");
+    $("status").textContent = "";
+    showError(e);
+  }
+}
+
+async function resolveHash(input, opts = {}) {
+  const token = ++runToken;
+  let canonical;
+  try {
+    canonical = parse_coord(input);
+  } catch (e) {
+    showError(`not a recognizable hash: ${e}`);
+    return;
+  }
+  $("hashin").value = canonical;
+  if (!opts.fromFragment) history.replaceState(null, "", `#${canonical}`);
+  const [scheme, hex] = canonical.split(":");
+  await resolveCoords({ [scheme]: hex }, null, token);
+}
+
+// coords: {scheme: hex, …} — all six for a dropped file, one for a
+// pasted hash. Fans out over every applicable source in parallel and
+// renders each result as it lands.
+async function resolveCoords(coords, file, token) {
+  const result = $("result");
+  result.replaceChildren();
+  $("status").textContent = "";
+  renderCoords(coords, file);
+
+  const applicable = FILTERS.filter((f) => coords[f.scheme]);
+  const srcSection = el("section");
+  srcSection.append(el("h2", null, "membership filters"));
+  const srcCard = el("div", "card");
+  srcSection.append(srcCard);
+
+  // One row per source name; sha1+sha256 hits on the same source
+  // corroborate rather than duplicate (the CLI's dedup rule).
+  const rows = new Map();
+  for (const f of applicable) {
+    if (rows.has(f.name)) { rows.get(f.name).schemes.push(f.scheme); continue; }
+    const row = el("div", "srcrow pending");
+    const mark = el("span", "mark", "·");
+    row.append(mark, el("span", "name", f.name), el("span", "what", f.source));
+    srcCard.append(row);
+    rows.set(f.name, { row, mark, schemes: [f.scheme], matched: [], failed: [], settled: 0 });
+  }
+
+  const claimSection = el("section");
+  claimSection.append(el("h2", null, "attributions"));
+  const claimCard = el("div", "card");
+  const claimNote = el("p", "note", "asking the fatcat scholarly index…");
+  claimSection.append(claimCard, claimNote);
+
+  if (applicable.length) result.append(srcSection);
+  const fatcatCoord = ["sha256", "sha1", "md5"].find((s) => coords[s]);
+  if (fatcatCoord) result.append(claimSection);
+  if (!applicable.length && !fatcatCoord) {
+    result.append(el("p", "note",
+      "No published source speaks this hash scheme yet — sha1 and sha256 reach the most."));
+    return;
+  }
+
+  const probes = applicable.map(async (f) => {
+    const r = rows.get(f.name);
+    try {
+      const hit = await probe_filter(f.name, f.scheme, `${f.scheme}:${coords[f.scheme]}`);
+      if (hit) r.matched.push(f.scheme);
+    } catch (e) {
+      r.failed.push(`${f.scheme}: ${e}`);
+    }
+    if (token !== runToken) return;
+    if (++r.settled < r.schemes.length) return;
+    r.row.classList.remove("pending");
+    if (r.matched.length) {
+      r.mark.textContent = "✓";
+      r.mark.className = "mark ok";
+      r.row.querySelector(".what").textContent =
+        r.matched.length > 1 ? `${r.row.querySelector(".what").textContent} — corroborated (${r.matched.join(" + ")})`
+                             : r.row.querySelector(".what").textContent;
+    } else if (r.failed.length === r.schemes.length) {
+      r.mark.textContent = "!";
+      r.mark.className = "mark warn";
+      r.row.querySelector(".what").textContent = "unreachable right now";
+      r.row.title = r.failed.join("\n");
+    } else {
+      r.mark.textContent = "–";
+      r.mark.className = "mark miss";
+      r.row.style.opacity = 0.6;
+    }
+  });
+
+  const lookup = (async () => {
+    if (!fatcatCoord) return;
+    try {
+      const finding = JSON.parse(await fatcat_lookup(`${fatcatCoord}:${coords[fatcatCoord]}`));
+      if (token !== runToken) return;
+      claimNote.remove();
+      if (!finding || !finding.claims.length) {
+        claimSection.append(el("p", "note", "No attribution found in the fatcat scholarly index."));
+        claimCard.remove();
+        return;
+      }
+      for (const c of finding.claims) {
+        const div = el("div", "claim");
+        div.append(el("div", null, c.statement));
+        if (c.url) {
+          const a = el("a", null, c.url);
+          a.href = c.url;
+          a.target = "_blank";
+          a.rel = "noopener";
+          div.append(a);
+        }
+        div.append(el("div", "attestor", `attested by ${finding.backend} (IA fatcat bulk export, 2024-02-18)`));
+        claimCard.append(div);
+      }
+      if (finding.coords && finding.coords.length > 1) {
+        const known = new Set(Object.entries(coords).map(([s, h]) => `${s}:${h}`));
+        const extra = finding.coords.filter((c) => !known.has(c));
+        if (extra.length) {
+          claimSection.append(el("p", "note", `same bytes, co-witnessed: ${extra.join("  ")}`));
+        }
+      }
+    } catch (e) {
+      if (token !== runToken) return;
+      claimNote.className = "error";
+      claimNote.textContent = `fatcat lookup failed: ${e}`;
+    }
+  })();
+
+  await Promise.allSettled([...probes, lookup]);
+}
+
+function renderCoords(coords, file) {
+  const section = el("section");
+  section.append(el("h2", null, file ? `coordinates of ${file.name}` : "coordinate"));
+  const card = el("div", "card");
+  const order = ["sha256", "sha1", "md5", "sha512", "blake2s256", "sha1_git"];
+  for (const scheme of order) {
+    if (!coords[scheme]) continue;
+    card.append(coordRow(scheme, coords[scheme]));
+    if (scheme === "sha1_git") card.append(coordRow("swhid", `swh:1:cnt:${coords[scheme]}`));
+  }
+  section.append(card);
+  if (file) {
+    section.append(el("p", "note",
+      "Share this page's URL — it carries only the hash, never the file."));
+  }
+  $("result").append(section);
+}
+
+function coordRow(scheme, value) {
+  const row = el("div", "coordrow");
+  const hex = el("span", "hex", value);
+  hex.title = "click to copy";
+  hex.addEventListener("click", () => {
+    navigator.clipboard.writeText(scheme === "swhid" ? value : `${scheme}:${value}`);
+    hex.style.color = "var(--ok)";
+    setTimeout(() => (hex.style.color = ""), 350);
+  });
+  row.append(el("span", "scheme", scheme), hex);
+  return row;
+}
+
+function showError(e) {
+  const p = el("p", "error", String(e));
+  $("result").replaceChildren(p);
+}
+
+function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  const units = ["KiB", "MiB", "GiB"];
+  let u = -1;
+  do { n /= 1024; u++; } while (n >= 1024 && u < units.length - 1);
+  return `${n.toFixed(n < 10 ? 1 : 0)} ${units[u]}`;
+}
+
+main();
+</script>
+</body>
+</html>
