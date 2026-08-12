@@ -350,6 +350,37 @@ document URL is the claim URL by construction). Verified endpoints:
 - Defer: demand-driven probing fits the design better than a census here
   (this is the one family where the census failure mode looms).
 
+### Hugging Face Hub — ON ICE (scouted 2026-08-13)
+
+Every public LFS file = (sha256, repo, path, size) with a claim URL by
+construction (`huggingface.co/<repo>/resolve/main/<path>`). Target
+residue: model weights / GGUF / dataset shards on real disks. All
+facts live-verified 2026-08-13:
+
+- **No bulk LFS-oid dump exists** — that's why it's iced: file-level
+  hashes require crawling the repos ourselves.
+- Tree API `?recursive=true&expand=true` → `lfs.oid` (plain-hex
+  sha256) per file, one call per repo (≤1000 entries/page). API rate
+  bucket: PRO 2,500 req/5 min.
+- HEAD on any `/resolve/` URL → `X-Linked-ETag` = LFS sha256 (verified
+  byte-exact against our own published parquet). Resolver bucket is
+  ~5× larger (PRO 12,000/5 min) but costs one call per FILE — the
+  tree API wins at the measured 21 files/repo average.
+- **`cfahlgren1/hub-stats`** (HF staff, refreshed daily) is the free
+  enumeration layer: models.parquet = 2,982,220 public model repos
+  with complete per-repo filename lists (62.7M files), downloads, and
+  repo sha — pre-filter repos worth crawling without spending a
+  request, and diff repo shas for incremental re-harvests.
+  datasets.parquet (326 MB) covers dataset repos the same way.
+- Scale (models, measured from hub-stats): safetensors 6.2M, gguf
+  3.6M, pt 3.3M, bin 2.3M, pth 1.3M ≈ **17M weight files**. Tier-1
+  cut `downloadsAllTime ≥ 100` = 546,643 repos / 10.9M files ≈ 18 h
+  of tree calls at PRO quota (HF Job, in-DC); full 3M-repo sweep
+  ≈ 4.2 days.
+- Bonus when thawed: our own published datasets become rows — hdx
+  artifacts verify through the normal resolve path (see
+  `hdx index verify`, which already uses the same LFS-oid identity).
+
 ---
 
 ## Tier 2 — source code
