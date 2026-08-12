@@ -695,6 +695,7 @@ pub async fn scan(
 fn backend_for_filter(name: &str) -> Option<&'static str> {
     match name {
         "fatcat" => Some("fatcat"),
+        "tarballs" => Some("tarballs"),
         "circl" => Some(crate::backends::circl::NAME),
         "depsdev" => Some(crate::backends::depsdev::NAME),
         "rekor" => Some(crate::backends::rekor::NAME),

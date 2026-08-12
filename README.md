@@ -132,7 +132,7 @@ Filter hits are probabilistic (default p = 10⁻⁴) and per-source, so a
 scan line tells you *which* index knows the file. Confirm anything
 important with `hdx <hash>`.
 
-One source is an exact witness index instead of a filter:
+One source is an exact witness index rather than filter-only:
 
 - **Release tarballs** — every content-level source above indexes what
   is *inside* an archive, never the archive itself (Software Heritage
@@ -148,7 +148,9 @@ One source is an exact witness index instead of a filter:
   hello_2.12.3.orig.tar.gz" with a download URL — Guix's are
   content-addressed mirror URLs that name the hash itself. Debian rows
   carry md5 alongside sha256, a single-witness crosswalk edge.
-  `hdx index pull tarballs` (~25 MB) makes it local and offline.
+  A companion bloom (`hdx filters fetch tarballs`, 359 KiB) routes
+  scans to it; `hdx index pull tarballs` (~25 MB) makes the whole
+  index local and offline.
 
 ## Build
 

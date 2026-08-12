@@ -104,6 +104,14 @@ const REGISTRY: &[RegistryEntry] = &[
         huge: false,
     },
     RegistryEntry {
+        name: "tarballs",
+        scheme: "sha256",
+        urls: &["https://huggingface.co/datasets/david-ar/release-tarballs/resolve/main/tarballs.sha256.bloom"],
+        size: "359 KiB",
+        source: "Debian sid / Homebrew / Guix release-artifact checksums",
+        huge: false,
+    },
+    RegistryEntry {
         name: "swh",
         scheme: "sha256",
         urls: &["https://huggingface.co/datasets/david-ar/swh-content-bloom/resolve/main/2026-06-04/swh.sha256.bloom"],

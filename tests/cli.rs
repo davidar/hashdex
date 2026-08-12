@@ -721,7 +721,9 @@ fn fetch_registry_works_offline() {
     let out = env.hdx(&["filters", "fetch"]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let text = stdout(&out);
-    for name in ["circl", "fedora", "fatcat", "depsdev", "rekor", "swh"] {
+    for name in [
+        "circl", "fedora", "fatcat", "depsdev", "rekor", "swh", "tarballs",
+    ] {
         assert!(text.contains(name), "registry listing missing {name}");
     }
 
