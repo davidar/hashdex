@@ -1380,3 +1380,105 @@ fn peek_spools_streamed_iso() {
         "iso member missing through the spool path:\n{text}"
     );
 }
+
+/// A misbehaved zip inside a squashfs file triggers a LOCALIZED
+/// conservative retry: the squashfs file is re-derivable on its own,
+/// so only that one member is redone — the note names the member, not
+/// the image — and its siblings keep their verdicts.
+#[test]
+fn peek_retry_is_localized_to_the_squashfs_file() {
+    use std::io::Write as _;
+    let env = TestEnv::new("peeksquash");
+
+    let payload = b"hashoscope squashfs payload: known sibling bytes\n";
+    let payload_sha256 = {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(payload);
+        format!("{:x}", h.finalize())
+    };
+    let list = env.digest_list("digests.txt", &payload_sha256);
+    let out = env.hdx(&[
+        "filters",
+        "build",
+        "peeksrc",
+        "sha256",
+        list.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    // A zip whose second entry is hidden from the central directory —
+    // the same tampering as the stream test, this time nested inside a
+    // squashfs file so the retry has a cheap boundary to catch at.
+    let tampered_zip = {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        w.start_file("listed.txt", opts).unwrap();
+        w.write_all(payload).unwrap();
+        w.start_file("hidden.txt", opts).unwrap();
+        w.write_all(b"the directory never heard of me").unwrap();
+        let bytes = w.finish().unwrap().into_inner();
+        let eocd = bytes.len() - 22;
+        assert_eq!(&bytes[eocd..eocd + 4], &[0x50, 0x4b, 0x05, 0x06]);
+        let cd_size = u32::from_le_bytes(bytes[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
+        let cd_off = u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        let cd = &bytes[cd_off..cd_off + cd_size];
+        let second = 4 + cd[4..]
+            .windows(4)
+            .position(|w| w == [0x50, 0x4b, 0x01, 0x02])
+            .expect("second central record");
+        let mut t = bytes[..cd_off + second].to_vec();
+        let mut eocd_rec = bytes[eocd..].to_vec();
+        eocd_rec[8..10].copy_from_slice(&1u16.to_le_bytes());
+        eocd_rec[10..12].copy_from_slice(&1u16.to_le_bytes());
+        eocd_rec[12..16].copy_from_slice(&(second as u32).to_le_bytes());
+        t.extend_from_slice(&eocd_rec);
+        t
+    };
+
+    // squashfs: the tampered zip plus an honest sibling the filter
+    // knows, written with the same crate the binary reads with.
+    let squash = {
+        let header = backhand::NodeHeader::new(0o644, 0, 0, 0);
+        let mut w = backhand::FilesystemWriter::default();
+        w.push_file(&tampered_zip[..], "bad.zip", header).unwrap();
+        w.push_file(&payload[..], "sibling.txt", header).unwrap();
+        let mut img = std::io::Cursor::new(Vec::new());
+        w.write(&mut img).unwrap();
+        env.write("t.squashfs", &img.into_inner())
+    };
+
+    let out = env.hdx(&["--offline", "peek", squash.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let err = stderr(&out);
+    // The retry note names the squashfs member, not the image root.
+    assert!(
+        err.contains("re-reading") && err.contains("bad.zip"),
+        "expected a localized retry note naming the member: {err}"
+    );
+    assert!(
+        !err.contains(&format!("re-reading {} with spooling", squash.display())),
+        "retry must not redo the whole image: {err}"
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("listed.txt"),
+        "central-directory entry missing after localized retry:\n{text}"
+    );
+    assert!(
+        !text.contains("hidden.txt"),
+        "hidden entry must not survive the conservative re-walk:\n{text}"
+    );
+    assert!(
+        text.contains("sibling.txt") && text.contains("[peeksrc]"),
+        "sibling verdicts must survive the retry:\n{text}"
+    );
+    // Exactly one member line for the zip — the abandoned first
+    // attempt must not leave a duplicate.
+    assert_eq!(
+        text.matches("bad.zip —").count(),
+        1,
+        "discarded slots leaked into the listing:\n{text}"
+    );
+}

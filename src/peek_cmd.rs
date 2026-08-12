@@ -19,7 +19,7 @@ use crate::filter::NamedFilter;
 use crate::finding::Finding;
 use crate::peek_pool::{Member, Pool};
 use crate::peek_source::View;
-use crate::peek_walk::{RetryConservative, Walk, MAX_MEMBERS};
+use crate::peek_walk::{Walk, MAX_MEMBERS};
 use crate::scan_cmd::{
     human, local_verdicts, online_probe, s, FileResult, Ticker, IDENTITY_MIN_BYTES,
 };
@@ -84,49 +84,46 @@ pub async fn peek(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| root.display().to_string());
-        // A zip walked speculatively from a stream can turn out
-        // misbehaved; the root is then re-descended once with
-        // stream-fed zips spooled (`RetryConservative`).
-        let mut conservative = false;
-        loop {
-            let mut probe_order: Vec<&NamedFilter> = filters.iter().collect();
-            probe_order.sort_by_key(|f| f.bytes);
-            let pool = Pool::new(probe_order, &ticker, threads);
-            let result = std::thread::scope(|scope| {
-                for _ in 0..threads {
-                    scope.spawn(|| pool.worker());
-                }
-                let mut walk = Walk {
-                    pool: &pool,
-                    slots: 0,
-                    truncated: false,
-                    conservative,
-                };
-                let r = View::of_file(root).and_then(|view| {
-                    walk.process_ranged(view, root.display().to_string(), &name, 0)
-                });
-                if r.is_ok() {
-                    // Only a complete descent closed every member; an
-                    // aborted one just lets the queue drain.
-                    pool.wait_idle();
-                }
-                pool.close();
-                r.map(|()| walk.truncated)
-            });
-            match result {
-                Ok(trunc) => {
-                    truncated |= trunc;
-                    members.extend(pool.members.into_inner().unwrap().into_iter().flatten());
-                    break;
-                }
-                Err(e) if e.downcast_ref::<RetryConservative>().is_some() && !conservative => {
-                    ticker.clear();
-                    eprintln!("note: {e}; re-reading {} with spooling", root.display());
-                    conservative = true;
-                }
-                Err(e) => return Err(e),
+        // Misbehaved stream zips are handled inside the walk: the
+        // nearest re-derivable ancestor (ranged member, spool, or
+        // squashfs file) discards just that subtree and redoes it
+        // conservatively, so no error escapes to this level short of
+        // a genuinely unreadable file.
+        let mut probe_order: Vec<&NamedFilter> = filters.iter().collect();
+        probe_order.sort_by_key(|f| f.bytes);
+        let pool = Pool::new(probe_order, &ticker, threads);
+        let (trunc, discarded) = std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| pool.worker());
+            }
+            let mut walk = Walk {
+                pool: &pool,
+                slots: 0,
+                truncated: false,
+                conservative: false,
+                discarded: Vec::new(),
+            };
+            let r = View::of_file(root)
+                .and_then(|view| walk.process_ranged(view, root.display().to_string(), &name, 0));
+            if r.is_ok() {
+                // Only a complete descent closed every member; an
+                // aborted one just lets the queue drain.
+                pool.wait_idle();
+            }
+            pool.close();
+            r.map(|()| (walk.truncated, walk.discarded))
+        })?;
+        truncated |= trunc;
+        let mut sealed = pool.members.into_inner().unwrap();
+        // Subtrees abandoned by conservative retries: straggler seals
+        // may have landed in these slots after the discard — clear
+        // them now that the workers have joined.
+        for range in discarded {
+            for slot in range {
+                sealed[slot] = None;
             }
         }
+        members.extend(sealed.into_iter().flatten());
     }
     ticker.clear();
 

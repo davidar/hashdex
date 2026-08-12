@@ -311,6 +311,9 @@ impl MetaClose {
         if let Some(n) = note {
             self.build.add_note(n);
         }
+        // The dead-member arithmetic (see `discard`) counts a member
+        // as sure-to-seal exactly when its meta was closed.
+        pool.metas_closed.fetch_add(1, Ordering::AcqRel);
         self.build.finish_part(pool);
     }
 }
@@ -338,6 +341,16 @@ pub(crate) struct Pool<'f> {
     pub(crate) members: Mutex<Vec<Option<Member>>>,
     created: AtomicUsize,
     sealed: AtomicUsize,
+    /// Metadata closes, incremented by `MetaClose::close`. A member
+    /// whose meta closed always seals eventually (its feed is closed
+    /// by the walker or a read task); one whose meta was dropped in
+    /// an unwind never will. The walker differences this against
+    /// `created` to count the dead exactly.
+    metas_closed: AtomicUsize,
+    /// Members abandoned by a conservative retry whose handles were
+    /// dropped un-closed — they will never seal, and wait_idle must
+    /// not hold out for them.
+    dead: AtomicUsize,
     idle_m: Mutex<()>,
     idle_cv: Condvar,
     probe_order: Vec<&'f NamedFilter>,
@@ -361,6 +374,8 @@ impl<'f> Pool<'f> {
             members: Mutex::new(Vec::new()),
             created: AtomicUsize::new(0),
             sealed: AtomicUsize::new(0),
+            metas_closed: AtomicUsize::new(0),
+            dead: AtomicUsize::new(0),
             idle_m: Mutex::new(()),
             idle_cv: Condvar::new(),
             probe_order,
@@ -448,9 +463,15 @@ impl<'f> Pool<'f> {
     fn acquire(&self, n: usize) {
         let mut b = self.budget.lock().unwrap();
         // An oversized single chunk is allowed through an empty budget
-        // rather than deadlocking on an unreachable ceiling.
-        while *b > 0 && *b + n as i64 > BUDGET {
-            b = self.budget_cv.wait(b).unwrap();
+        // rather than deadlocking on an unreachable ceiling; a closed
+        // pool stops enforcing the budget entirely — shutdown must
+        // never wait on hashers that may already have exited.
+        while *b > 0 && *b + n as i64 > BUDGET && !self.closed.load(Ordering::Acquire) {
+            b = self
+                .budget_cv
+                .wait_timeout(b, std::time::Duration::from_millis(100))
+                .unwrap()
+                .0;
         }
         *b += n as i64;
     }
@@ -556,11 +577,33 @@ impl<'f> Pool<'f> {
         feed.close(self);
     }
 
-    /// Block until every member created so far has been sealed. Only
-    /// call after a descent that closed all its handles.
+    /// Metadata closes so far — captured by the walker before a
+    /// subtree so a retry can compute the exact number of abandoned
+    /// members afterwards.
+    pub(crate) fn metas_closed(&self) -> usize {
+        self.metas_closed.load(Ordering::Acquire)
+    }
+
+    /// Members that will never seal (their handles were dropped
+    /// un-closed in a retry unwind). The count must be EXACT — an
+    /// overestimate would let `wait_idle` return while genuine
+    /// members' read tasks are still in flight, and closing the pool
+    /// cancels reads.
+    pub(crate) fn add_dead(&self, n: usize) {
+        self.dead.fetch_add(n, Ordering::AcqRel);
+        let _g = self.idle_m.lock().unwrap();
+        self.idle_cv.notify_all();
+    }
+
+    /// Block until every member that still can seal has sealed. Only
+    /// call after the descent returned (nothing is being created).
     pub(crate) fn wait_idle(&self) {
         let mut g = self.idle_m.lock().unwrap();
-        while self.sealed.load(Ordering::Acquire) < self.created.load(Ordering::Acquire) {
+        loop {
+            let expected = self.created.load(Ordering::Acquire) - self.dead.load(Ordering::Acquire);
+            if self.sealed.load(Ordering::Acquire) >= expected {
+                return;
+            }
             g = self.idle_cv.wait(g).unwrap();
         }
     }

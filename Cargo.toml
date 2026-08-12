@@ -75,6 +75,9 @@ backhand = { version = "0.25.1", default-features = false, features = ["gzip", "
 
 [dev-dependencies]
 ar = "0.9.0"
+# The peek tests build a tiny squashfs fixture with the same crate the
+# binary reads it with.
+backhand = { version = "0.25.1", default-features = false, features = ["gzip", "zstd", "xz"] }
 flate2 = "1"
 # The CLI tests write tiny fixture datasets (the same page-oriented
 # parquet the published repos hold) into their scratch cache dirs.

@@ -27,13 +27,19 @@ const HEAD: usize = 512;
 /// the cache — and the walk resumes where it left off.
 const SQUASHFS_FRAG_CAP: u64 = 256 << 20;
 
-/// A zip walked speculatively from its stream turned out misbehaved
-/// (local headers disagree with the central directory, or the stream
-/// walk failed outright). The whole root is re-descended with
-/// stream-fed zips spooled — the root file is seekable, so everything
-/// is re-derivable.
+/// A zip walked speculatively from its stream turned out misbehaved:
+/// local headers disagree with the central directory, or the stream
+/// walk failed outright (data-descriptor entries — common in jars —
+/// carry no lengths in their local headers). The error unwinds to the
+/// nearest re-derivable boundary — the enclosing ranged member, spool,
+/// or squashfs file — which discards just that subtree and re-walks it
+/// conservatively, with stream-fed zips spooled.
 #[derive(Debug)]
 pub(crate) struct RetryConservative(pub String);
+
+fn is_retry(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RetryConservative>().is_some()
+}
 
 impl std::fmt::Display for RetryConservative {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -159,11 +165,11 @@ fn drain(r: &mut dyn Read) {
 }
 
 /// Child-walk errors become notes on the parent — except the
-/// conservative-retry marker, which must reach the root.
+/// conservative-retry marker, which must reach a retry boundary.
 fn swallow(r: Result<()>, what: &str) -> Result<Option<String>> {
     match r {
         Ok(()) => Ok(None),
-        Err(e) if e.downcast_ref::<RetryConservative>().is_some() => Err(e),
+        Err(e) if is_retry(&e) => Err(e),
         Err(e) => Ok(Some(format!("{what}: {e}"))),
     }
 }
@@ -176,8 +182,12 @@ pub(crate) struct Walk<'a, 'f> {
     pub(crate) slots: usize,
     pub(crate) truncated: bool,
     /// Spool stream-fed zips instead of walking them speculatively —
-    /// the retry mode after a `RetryConservative`.
+    /// set for the scope of a subtree being redone after a
+    /// `RetryConservative`.
     pub(crate) conservative: bool,
+    /// Slot ranges abandoned by conservative retries; cleared from the
+    /// member table after the pool drains.
+    pub(crate) discarded: Vec<std::ops::Range<usize>>,
 }
 
 impl Walk<'_, '_> {
@@ -222,7 +232,7 @@ impl Walk<'_, '_> {
             let mut src = std::io::Cursor::new(head).chain(r);
             let view = spool_stream(&mut src, |b| feed.push(pool, b))?;
             feed.close(pool);
-            let (children, note) = self.descend_seekable(kind, &view, &path, name, depth)?;
+            let (children, note) = self.descend_retrying(kind, &view, &path, name, depth)?;
             meta.close(pool, children, note);
             return Ok(());
         }
@@ -457,10 +467,54 @@ impl Walk<'_, '_> {
                 )),
             )
         } else {
-            self.descend_seekable(kind, &view, &path, name, depth)?
+            self.descend_retrying(kind, &view, &path, name, depth)?
         };
         meta.close(pool, children, note);
         Ok(())
+    }
+
+    /// Descend a seekable member, and — because its view can be
+    /// re-walked at will — serve as a retry boundary: if a zip
+    /// somewhere below turned out misbehaved, discard just this
+    /// subtree and redo it conservatively instead of letting the
+    /// error unwind any further.
+    fn descend_retrying(
+        &mut self,
+        kind: Kind,
+        view: &View,
+        path: &str,
+        name: &str,
+        depth: usize,
+    ) -> Result<(usize, Option<String>)> {
+        let start = self.slots;
+        let metas = self.pool.metas_closed();
+        match self.descend_seekable(kind, view, path, name, depth) {
+            Err(e) if is_retry(&e) && !self.conservative => {
+                eprintln!("note: {e}; re-reading {path} with spooling");
+                self.discard(start, metas);
+                self.conservative = true;
+                let redo = self.descend_seekable(kind, view, path, name, depth);
+                self.conservative = false;
+                redo
+            }
+            r => r,
+        }
+    }
+
+    /// The slots allocated since `start` belong to an abandoned
+    /// subtree: remember them for clearing, and tell the pool exactly
+    /// how many will never seal — the members whose metadata was never
+    /// closed (every meta close between the captured count and now was
+    /// a member of this subtree, because the walker is single-threaded
+    /// and was only ever inside it). The count must be exact: too high
+    /// and wait_idle abandons live read tasks, too low and it hangs.
+    fn discard(&mut self, start: usize, metas_at_start: usize) {
+        if start < self.slots {
+            let created = self.slots - start;
+            let closed = self.pool.metas_closed() - metas_at_start;
+            self.pool.add_dead(created - closed);
+            self.discarded.push(start..self.slots);
+        }
     }
 
     /// Walk the inside of a seekable container (a ranged member or a
@@ -908,14 +962,38 @@ impl Walk<'_, '_> {
                 let name = full.trim_start_matches('/');
                 *children += 1;
                 let leaf = name.rsplit('/').next().unwrap_or(name).to_string();
+                let child_path = format!("{path}!{name}");
+                let start = self.slots;
+                let metas = self.pool.metas_closed();
                 let mut reader = backhand::FilesystemReaderFile::new(&fs, f).reader();
-                self.process_stream(
+                let r = self.process_stream(
                     &mut reader,
                     Some(size),
-                    format!("{path}!{name}"),
+                    child_path.clone(),
                     &leaf,
                     depth + 1,
-                )?;
+                );
+                match r {
+                    // A squashfs file is re-derivable on its own — a
+                    // misbehaved zip inside it costs one file redone,
+                    // not the whole image.
+                    Err(e) if is_retry(&e) && !self.conservative => {
+                        eprintln!("note: {e}; re-reading {child_path} with spooling");
+                        self.discard(start, metas);
+                        self.conservative = true;
+                        let mut again = backhand::FilesystemReaderFile::new(&fs, f).reader();
+                        let redo = self.process_stream(
+                            &mut again,
+                            Some(size),
+                            child_path,
+                            &leaf,
+                            depth + 1,
+                        );
+                        self.conservative = false;
+                        redo?;
+                    }
+                    r => r?,
+                }
                 if f.frag_index() != 0xffff_ffff {
                     frag_bytes += size;
                 }
