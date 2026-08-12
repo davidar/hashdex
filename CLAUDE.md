@@ -24,7 +24,12 @@ hdx scan <paths>      # scan against filters + attribute what it can
                       #   census; --online consents to third-party APIs).
                       #   A named container FILE gets the hashoscope:
                       #   full recursive descent (tar/zip/deb/rpm/cpio/
-                      #   squashfs/iso — 7z detected, not descended)
+                      #   squashfs/iso — 7z detected, not descended).
+                      #   Unknown containers under dir roots descend
+                      #   too (demand-driven; default = in-place
+                      #   formats only, --deep adds compressed
+                      #   wrappers, --shallow none); descents cache
+                      #   content-addressed in local.db and replay
 hdx index pull tarballs           # local copy of a published dataset
                                   #   (same parquet, mmap'd; resolution
                                   #   is remote range reads by default)

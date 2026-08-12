@@ -2,6 +2,7 @@ use crate::coord::Scheme;
 use crate::filter::NamedFilter;
 use crate::local_index::{CachedEntry, LocalIndex};
 use crate::peek_pool::{Digests, Member, Pool};
+pub use crate::peek_walk::Descent;
 use crate::peek_walk::Walk;
 use crate::report::{self, Class};
 use anyhow::{Context, Result};
@@ -30,6 +31,12 @@ pub struct ScanOptions {
     /// Probe every filter even when a smaller one already matched
     /// (full attribution at the cost of big-filter page faults).
     pub probe_all: bool,
+    /// How far the walk follows containers it discovers under
+    /// directory roots. Descent is demand-driven: a container a
+    /// filter already recognizes is not entered — its identity is
+    /// settled. Explicitly named container files always descend in
+    /// Full, whatever this says.
+    pub descent: Descent,
     /// Consent to tell third-party APIs about matched digests.
     /// Dataset-transport backends (range reads over our own published
     /// parquet — nobody is told anything) are probed whenever
@@ -143,6 +150,97 @@ fn to_fresh(r: &FileResult) -> crate::local_index::FreshEntry {
         r.sha1,
         r.sha256,
     )
+}
+
+/// Storage key for the member cache: descents under different
+/// policies produce different trees, so they cache separately.
+fn descent_key(d: Descent) -> i64 {
+    match d {
+        Descent::None => -1,
+        Descent::Cheap => 0,
+        Descent::Full => 1,
+    }
+}
+
+/// Rebuild a cached descent as members under `container_slot`. The
+/// structure and digests replay verbatim; bloom matches are probed
+/// fresh (filters change — knowledge is query-time policy). Probing
+/// is the expensive half (big-filter page faults), and a fresh
+/// descent spreads it over every pool worker — the replay must not
+/// pay it serially, so it probes on a worker team first and fills
+/// slots (order-sensitive: parents before children) afterwards.
+fn materialize_cached(
+    pool: &Pool,
+    container_slot: usize,
+    base_path: &str,
+    base_depth: usize,
+    rows: &[crate::local_index::CachedMember],
+    probe_all: bool,
+    threads: usize,
+) {
+    let matched: Vec<Vec<String>> = {
+        let out: Mutex<Vec<Option<Vec<String>>>> = Mutex::new(vec![None; rows.len()]);
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads.min(rows.len()).max(1) {
+                scope.spawn(|| loop {
+                    // Chunked so the big-filter mmap faults batch per
+                    // thread instead of ping-ponging the cursor.
+                    let start = next.fetch_add(256, Ordering::Relaxed);
+                    if start >= rows.len() {
+                        break;
+                    }
+                    let end = (start + 256).min(rows.len());
+                    let mut chunk: Vec<Option<Vec<String>>> = Vec::with_capacity(end - start);
+                    for m in &rows[start..end] {
+                        chunk.push(Some(if m.size >= IDENTITY_MIN_BYTES {
+                            pool.probe(&m.sha1, &m.sha256, probe_all).0
+                        } else {
+                            Vec::new()
+                        }));
+                    }
+                    out.lock().unwrap()[start..end].swap_with_slice(&mut chunk);
+                });
+            }
+        });
+        out.into_inner()
+            .unwrap()
+            .into_iter()
+            .map(|v| v.expect("every row probed"))
+            .collect()
+    };
+    let mut slot_of: Vec<usize> = Vec::with_capacity(rows.len());
+    for (m, matched) in rows.iter().zip(matched) {
+        let mslot = pool.reserve();
+        let parent = Some(match m.parent {
+            Some(p) => slot_of[p],
+            None => container_slot,
+        });
+        slot_of.push(mslot.idx());
+        pool.fill_slot(
+            mslot,
+            Member {
+                path: format!("{base_path}!{}", m.rel),
+                depth: base_depth + m.depth,
+                parent,
+                ord: m.ord,
+                kind: crate::peek_walk::Kind::intern_label(&m.kind),
+                size: m.size,
+                fs: false,
+                digests: Some(Digests {
+                    md5: m.md5,
+                    sha1: m.sha1,
+                    sha256: m.sha256,
+                    sha512: m.sha512,
+                    blake2s: m.blake2s,
+                    sha1_git: m.sha1_git,
+                }),
+                matched,
+                children: m.children,
+                note: m.note.clone(),
+            },
+        );
+    }
 }
 
 /// Walk paths, hash every regular file (sha1 + sha256 in one pass), check
@@ -421,6 +519,13 @@ pub async fn scan(
         for _ in 0..threads {
             workers.push(scope.spawn(|| {
                 let mut buf = vec![0u8; 1 << 20];
+                // Read-only handle to the member cache (replay);
+                // absent index or --no-cache = no replay.
+                let rix = if opts.no_index {
+                    None
+                } else {
+                    LocalIndex::open_read().ok()
+                };
                 loop {
                     // Bind before matching: a `match recv()` scrutinee
                     // would hold the receiver lock through the whole
@@ -430,16 +535,85 @@ pub async fn scan(
                     match job {
                         Job::Root(path) => {
                             // The hashoscope path: full recursive
-                            // descent, all six schemes per member.
-                            match walk.walk_root(&path) {
-                                Ok(()) => seen
-                                    .lock()
-                                    .unwrap()
-                                    .push(path.to_string_lossy().into_owned()),
-                                Err(e) => unreadable
-                                    .lock()
-                                    .unwrap()
-                                    .push(format!("{}: {e}", path.display())),
+                            // descent, all six schemes per member —
+                            // unless an unchanged copy (index hit by
+                            // size+mtime) has a complete cached
+                            // descent to replay.
+                            let pstr = path.to_string_lossy().into_owned();
+                            let replay = (!opts.rehash)
+                                .then(|| cached_ref.get(pstr.as_str()))
+                                .flatten()
+                                .filter(|e| {
+                                    std::fs::metadata(&path).is_ok_and(|md| {
+                                        let mtime = md
+                                            .modified()
+                                            .ok()
+                                            .and_then(|t| {
+                                                t.duration_since(std::time::UNIX_EPOCH).ok()
+                                            })
+                                            .map(|d| d.as_nanos() as i64)
+                                            .unwrap_or(0);
+                                        md.len() == e.size && mtime == e.mtime_ns
+                                    })
+                                })
+                                .and_then(|e| {
+                                    let cd = rix
+                                        .as_ref()?
+                                        .load_container(&e.sha256, descent_key(Descent::Full))
+                                        .ok()
+                                        .flatten()?;
+                                    Some((e, cd))
+                                });
+                            match replay {
+                                Some((e, (c, rows))) => {
+                                    let slot = pool.reserve();
+                                    materialize_cached(
+                                        &pool,
+                                        slot.idx(),
+                                        &pstr,
+                                        0,
+                                        &rows,
+                                        opts.probe_all,
+                                        threads,
+                                    );
+                                    let matched = if e.size >= IDENTITY_MIN_BYTES {
+                                        pool.probe(&e.sha1, &e.sha256, opts.probe_all).0
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    reused.fetch_add(1, Ordering::Relaxed);
+                                    pool.fill_slot(
+                                        slot,
+                                        Member {
+                                            path: pstr.clone(),
+                                            depth: 0,
+                                            parent: None,
+                                            ord: 0,
+                                            kind: crate::peek_walk::Kind::intern_label(&c.kind),
+                                            size: e.size,
+                                            fs: true,
+                                            digests: Some(Digests {
+                                                md5: None,
+                                                sha1: e.sha1,
+                                                sha256: e.sha256,
+                                                sha512: None,
+                                                blake2s: None,
+                                                sha1_git: None,
+                                            }),
+                                            matched,
+                                            children: c.children,
+                                            note: c.note.clone(),
+                                        },
+                                    );
+                                    seen.lock().unwrap().push(pstr);
+                                }
+                                None => match walk.walk_root(&path) {
+                                    Ok(()) => seen.lock().unwrap().push(pstr),
+                                    Err(e) => unreadable
+                                        .lock()
+                                        .unwrap()
+                                        .push(format!("{}: {e}", path.display())),
+                                },
                             }
                         }
                         Job::File {
@@ -464,14 +638,65 @@ pub async fn scan(
                                     .unwrap()
                                     .push(r.path.to_string_lossy().into_owned());
                                 let slot = pool.reserve();
+                                let display = path.display().to_string();
+                                // Demand-driven descent: only containers
+                                // no filter recognized are worth opening —
+                                // a bloom hit settles the file's identity
+                                // at the container level. A complete
+                                // cached descent (content-addressed by
+                                // this exact sha256) replays instead of
+                                // re-reading the container.
+                                let descend = opts.descent != Descent::None
+                                    && matched.is_empty()
+                                    && r.size >= IDENTITY_MIN_BYTES;
+                                let replay = if descend && !opts.rehash {
+                                    rix.as_ref().and_then(|ix| {
+                                        ix.load_container(&r.sha256, descent_key(opts.descent))
+                                            .ok()
+                                            .flatten()
+                                    })
+                                } else {
+                                    None
+                                };
+                                let (children, note, kind) = if let Some((c, rows)) = replay {
+                                    materialize_cached(
+                                        &pool,
+                                        slot.idx(),
+                                        &display,
+                                        depth,
+                                        &rows,
+                                        opts.probe_all,
+                                        threads,
+                                    );
+                                    (
+                                        c.children,
+                                        c.note.clone(),
+                                        crate::peek_walk::Kind::intern_label(&c.kind),
+                                    )
+                                } else if descend {
+                                    let name = path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_default();
+                                    walk.descend_within(
+                                        &path,
+                                        &display,
+                                        &name,
+                                        slot.idx(),
+                                        depth,
+                                        opts.descent,
+                                    )
+                                } else {
+                                    (0, None, "file")
+                                };
                                 pool.fill_slot(
                                     slot,
                                     Member {
-                                        path: path.display().to_string(),
+                                        path: display,
                                         depth,
                                         parent,
                                         ord,
-                                        kind: "file",
+                                        kind,
                                         size: r.size,
                                         fs: true,
                                         digests: Some(Digests {
@@ -483,8 +708,8 @@ pub async fn scan(
                                             sha1_git: None,
                                         }),
                                         matched,
-                                        children: 0,
-                                        note: None,
+                                        children,
+                                        note,
                                     },
                                 );
                             }
@@ -710,23 +935,54 @@ pub async fn scan(
         }
     }
 
-    // Tree sections first: every explicitly named container file
-    // renders its full descent, hashoscope style.
-    if in_tree.iter().any(|t| *t) {
-        let rollups = report::rollups(&members, &classes);
-        for &i in report::tree_order(&members).iter().filter(|&&i| in_tree[i]) {
+    // Tree machinery, shared by both render sections: DFS order (a
+    // node's subtree is the contiguous run after it), position index,
+    // recursive rollups.
+    let rollups = report::rollups(&members, &classes);
+    let order = report::tree_order(&members);
+    let mut pos: Vec<usize> = vec![0; members.len()];
+    for (p, &i) in order.iter().enumerate() {
+        pos[i] = p;
+    }
+    let render_subtree = |i: usize| {
+        let base = members[i].depth;
+        let mut j = pos[i];
+        loop {
+            let k = order[j];
             if opts.json {
                 println!(
                     "{}",
-                    report::member_json(&members[i], &evidence[i], &rollups[i])
+                    report::member_json(&members[k], &evidence[k], &rollups[k])
                 );
             } else {
-                report::render_tree_line(&members[i], &evidence[i], &rollups[i], opts.verbose);
+                report::render_tree_line(
+                    &members[k],
+                    &evidence[k],
+                    &rollups[k],
+                    opts.verbose,
+                    base,
+                );
+            }
+            j += 1;
+            if j >= order.len() || members[order[j]].depth <= base {
+                break;
             }
         }
+    };
+
+    // Tree sections first: every explicitly named container file
+    // renders its full descent, hashoscope style.
+    for &i in order
+        .iter()
+        .filter(|&&i| in_tree[i] && members[i].parent.is_none())
+    {
+        ticker.clear();
+        render_subtree(i);
     }
 
-    // Flat listing over the filesystem files, sorted by path.
+    // Flat listing over the filesystem files, sorted by path. A
+    // container the walk descended renders as a tree block in its
+    // sorted position — its rollup line plus its members.
     let mut flat: Vec<usize> = (0..members.len())
         .filter(|&i| members[i].fs && members[i].digests.is_some() && !in_tree[i])
         .collect();
@@ -741,12 +997,18 @@ pub async fn scan(
             ListMode::All => true,
             ListMode::Known => !m.matched.is_empty(),
             ListMode::Unknown => m.matched.is_empty(),
-            ListMode::Attributed => has_claims || has_consistent,
+            // Descended containers (children > 0) were unknown at the
+            // container level — their rollup is the payload.
+            ListMode::Attributed => has_claims || has_consistent || m.children > 0,
         };
         if !show {
             continue;
         }
         ticker.clear();
+        if m.children > 0 {
+            render_subtree(i);
+            continue;
+        }
         // Every consistent match is via sha1 — the only weak digest
         // scan mints (md5 joins when an md5-only source needs it).
         const WEAK_VIA: &str = "sha1";
@@ -843,6 +1105,80 @@ pub async fn scan(
                     if let Some(url) = url {
                         println!("             {:<12} → {url}", "");
                     }
+                }
+            }
+        }
+    }
+
+    // Persist fresh descents into the content-addressed member cache:
+    // the next scan that meets these exact bytes replays them without
+    // reading the container. Truncated walks never cache (an
+    // incomplete tree must not masquerade as the whole).
+    if !truncated {
+        if let Some(ix) = &mut index {
+            for i in 0..members.len() {
+                let m = &members[i];
+                if !m.fs || m.children == 0 {
+                    continue;
+                }
+                let Some(dg) = m.digests.as_ref() else {
+                    continue;
+                };
+                let key = if in_tree[i] {
+                    descent_key(Descent::Full)
+                } else {
+                    descent_key(opts.descent)
+                };
+                if ix.has_container(&dg.sha256, key) {
+                    continue; // replayed or identical content: rows exist
+                }
+                let base_depth = m.depth;
+                let prefix = m.path.len() + 1; // past the '!' separator
+                let mut local_of: HashMap<usize, usize> = HashMap::new();
+                let mut rows: Vec<crate::local_index::CachedMember> = Vec::new();
+                let mut j = pos[i] + 1;
+                while j < order.len() && members[order[j]].depth > base_depth {
+                    let k = order[j];
+                    let n = &members[k];
+                    let nd = n.digests.as_ref().expect("nested members carry digests");
+                    local_of.insert(k, rows.len());
+                    rows.push(crate::local_index::CachedMember {
+                        rel: n.path.get(prefix..).unwrap_or("").to_string(),
+                        parent: match n.parent {
+                            Some(p) if p == i => None,
+                            Some(p) => Some(local_of[&p]),
+                            None => None,
+                        },
+                        ord: n.ord,
+                        depth: n.depth - base_depth,
+                        kind: n.kind.to_string(),
+                        size: n.size,
+                        children: n.children,
+                        note: n.note.clone(),
+                        md5: nd.md5,
+                        sha1: nd.sha1,
+                        sha256: nd.sha256,
+                        sha512: nd.sha512,
+                        blake2s: nd.blake2s,
+                        sha1_git: nd.sha1_git,
+                    });
+                    j += 1;
+                }
+                if rows.len() >= 50_000 {
+                    // No silent phases: a big store is visible work.
+                    eprintln!(
+                        "caching {} members of {} in the local index…",
+                        rows.len(),
+                        m.path
+                    );
+                }
+                let container = crate::local_index::CachedContainer {
+                    kind: m.kind.to_string(),
+                    children: m.children,
+                    note: m.note.clone(),
+                };
+                if let Err(e) = ix.store_container(&dg.sha256, key, &container, &rows) {
+                    eprintln!("warning: member-cache write failed for {}: {e}", m.path);
                 }
             }
         }

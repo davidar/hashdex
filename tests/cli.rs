@@ -934,6 +934,226 @@ fn scan_mixes_directory_and_container_roots() {
     );
 }
 
+/// Demand-driven descent policy for files discovered under directory
+/// roots: by default only in-place-readable containers (zip here) are
+/// entered, and only when unknown — a bloom-matched container stays
+/// closed, a .tar.gz needs --deep, and --shallow keeps everything
+/// closed.
+#[test]
+fn scan_descent_policy_notches() {
+    use std::io::Write as _;
+    let env = TestEnv::new("descent");
+    let payload = b"descent-policy payload: bytes hiding inside containers\n";
+
+    let tarball = |name: &str| {
+        let mut buf = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
+            let mut b = tar::Builder::new(enc);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, name, &payload[..]).unwrap();
+            let enc = b.into_inner().unwrap();
+            enc.finish().unwrap();
+        }
+        buf
+    };
+    let dir = env.work().join("tree");
+    std::fs::create_dir_all(&dir).unwrap();
+    // An unknown zip: cheap-descendable.
+    let zip_bytes = {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        w.start_file("inside-zip.bin", opts).unwrap();
+        w.write_all(payload).unwrap();
+        w.finish().unwrap().into_inner()
+    };
+    std::fs::write(dir.join("mystery.zip"), &zip_bytes).unwrap();
+    // An unknown .tar.gz: compressed wrapper, --deep territory.
+    std::fs::write(dir.join("wrapped.tar.gz"), tarball("inside-tgz.bin")).unwrap();
+    // A KNOWN tarball: its own sha256 is in a filter, so its identity
+    // is settled and it must not be entered even by --deep.
+    let known_tgz = tarball("inside-known.bin");
+    let known_sha256 = {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(&known_tgz);
+        format!("{:x}", h.finalize())
+    };
+    std::fs::write(dir.join("known.tar.gz"), &known_tgz).unwrap();
+    let list = env.digest_list("digests.txt", &known_sha256);
+    let out = env.hdx(&[
+        "filters",
+        "build",
+        "knownsrc",
+        "sha256",
+        list.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    // Default (cheap): the zip opens, the wrappers stay closed.
+    let out = env.hdx(&["--offline", "scan", "--list", "all", dir.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("inside-zip.bin"),
+        "zip not descended:\n{text}"
+    );
+    assert!(
+        !text.contains("inside-tgz.bin"),
+        "cheap descent must not decompress a .tar.gz:\n{text}"
+    );
+    assert!(
+        !text.contains("inside-known.bin"),
+        "a filter-matched container must not be entered:\n{text}"
+    );
+
+    // --deep: the unknown wrapper opens too; the known one still not.
+    let out = env.hdx(&[
+        "--offline",
+        "scan",
+        "--deep",
+        "--list",
+        "all",
+        dir.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("inside-tgz.bin"),
+        "--deep must descend the .tar.gz:\n{text}"
+    );
+    assert!(
+        !text.contains("inside-known.bin"),
+        "demand-driven: known containers stay closed under --deep too:\n{text}"
+    );
+
+    // --shallow: nothing opens.
+    let out = env.hdx(&[
+        "--offline",
+        "scan",
+        "--shallow",
+        "--list",
+        "all",
+        dir.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        !text.contains("inside-zip.bin"),
+        "--shallow must not descend anything:\n{text}"
+    );
+
+    // Explicitly naming the known tarball still gets the full
+    // hashoscope — pointing at it is the demand.
+    let known_path = dir.join("known.tar.gz");
+    let out = env.hdx(&["--offline", "scan", known_path.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("inside-known.bin"),
+        "explicit file roots always descend:\n{text}"
+    );
+
+    // The flags exclude each other.
+    let out = env.hdx(&["scan", "--deep", "--shallow", dir.to_str().unwrap()]);
+    assert!(!out.status.success());
+}
+
+/// The content-addressed member cache: a descended container's member
+/// tree replays on later scans without re-reading the container —
+/// proven by corrupting the container's bytes in place (size and
+/// mtime preserved, so the index still vouches for it) and watching
+/// the members survive. Bloom matches are recomputed on replay
+/// (a filter built AFTER the descent still tags cached members), and
+/// --rehash forces a real re-read.
+#[test]
+fn scan_member_cache_replays_descents() {
+    use std::io::Write as _;
+    let env = TestEnv::new("membercache");
+    let payload = b"member-cache payload: cached bytes with a late filter\n";
+    let payload_sha256 = {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(payload);
+        format!("{:x}", h.finalize())
+    };
+    let dir = env.work().join("tree");
+    std::fs::create_dir_all(&dir).unwrap();
+    let zip_bytes = {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        w.start_file("cached-member.bin", opts).unwrap();
+        w.write_all(payload).unwrap();
+        w.finish().unwrap().into_inner()
+    };
+    let zpath = dir.join("box.zip");
+    std::fs::write(&zpath, &zip_bytes).unwrap();
+
+    // First scan: descends, lists the member, caches the tree.
+    let out = env.hdx(&["--offline", "scan", "--list", "all", dir.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("cached-member.bin"),
+        "{}",
+        stdout(&out)
+    );
+
+    // A filter that knows the member arrives AFTER the descent.
+    let list = env.digest_list("digests.txt", &payload_sha256);
+    let out = env.hdx(&[
+        "filters",
+        "build",
+        "latesrc",
+        "sha256",
+        list.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    // Corrupt the container in place — same size, mtime restored — so
+    // any attempt to actually re-read it would find zeros (not a zip).
+    let mtime = std::fs::metadata(&zpath).unwrap().modified().unwrap();
+    std::fs::write(&zpath, vec![0u8; zip_bytes.len()]).unwrap();
+    let f = std::fs::File::options().write(true).open(&zpath).unwrap();
+    f.set_modified(mtime).unwrap();
+    drop(f);
+
+    // Second scan: the member is still there (replay — the zeros were
+    // never read) AND wears the late filter's tag (blooms recomputed).
+    let out = env.hdx(&["--offline", "scan", "--list", "all", dir.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("cached-member.bin"),
+        "cached descent did not replay:\n{text}"
+    );
+    assert!(
+        text.contains("[latesrc]"),
+        "replayed member missing the late filter's tag:\n{text}"
+    );
+
+    // --rehash forces the real read: zeros sniff as nothing, so the
+    // member disappears.
+    let out = env.hdx(&[
+        "--offline",
+        "scan",
+        "--rehash",
+        "--list",
+        "all",
+        dir.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        !text.contains("cached-member.bin"),
+        "--rehash must re-read, not replay:\n{text}"
+    );
+}
+
 #[test]
 fn fetch_registry_works_offline() {
     let env = TestEnv::new("fetch");

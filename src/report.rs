@@ -166,15 +166,18 @@ pub(crate) fn tree_order(members: &[Member]) -> Vec<usize> {
 }
 
 /// Render one member's tree line (indent, leaf name, size, kind,
-/// rollup verdict, tags) plus its note and claims.
+/// rollup verdict, tags) plus its note and claims. `base` is the
+/// depth rendered at indent zero — a container discovered deep in a
+/// directory walk renders its subtree relative to itself.
 pub(crate) fn render_tree_line(
     m: &Member,
     evidence: &Evidence,
     rollup: &Option<Rollup>,
     verbose: bool,
+    base: usize,
 ) {
     let (identified, consistent) = evidence;
-    let indent = "  ".repeat(m.depth);
+    let indent = "  ".repeat(m.depth.saturating_sub(base));
     let leaf = m.path.rsplit('!').next().unwrap_or(&m.path);
     let mut line = format!("{indent}{leaf} — {}", human(m.size));
     if m.kind != "file" {

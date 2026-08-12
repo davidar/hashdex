@@ -77,6 +77,16 @@ enum Command {
         /// Rehash every file even if the local index has a fresh entry
         #[arg(long)]
         rehash: bool,
+        /// Descend into every unknown container found under directory
+        /// roots, compressed wrappers included (default: only
+        /// containers readable in place — tar, zip, ar, cpio,
+        /// squashfs, iso; a .tar.gz stays closed)
+        #[arg(long, conflicts_with = "shallow")]
+        deep: bool,
+        /// Never descend into containers found under directory roots
+        /// (explicitly named container files still descend fully)
+        #[arg(long)]
+        shallow: bool,
         /// Membership only — the classic bloom-filter census: no
         /// resolution, no probes, fastest
         #[arg(long)]
@@ -202,6 +212,8 @@ async fn main() -> Result<()> {
                 paths,
                 list,
                 rehash,
+                deep,
+                shallow,
                 no_resolve,
                 verbose,
                 probe_all,
@@ -230,6 +242,11 @@ async fn main() -> Result<()> {
                 json: cli.json,
                 no_index: cli.no_cache,
                 rehash: *rehash,
+                descent: match (*deep, *shallow) {
+                    (true, _) => scan_cmd::Descent::Full,
+                    (_, true) => scan_cmd::Descent::None,
+                    _ => scan_cmd::Descent::Cheap,
+                },
                 resolve: !*no_resolve,
                 verbose: *verbose,
                 probe_all: *probe_all,

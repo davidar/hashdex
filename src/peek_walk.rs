@@ -71,6 +71,35 @@ pub(crate) enum Kind {
 }
 
 impl Kind {
+    /// Re-intern a label that round-tripped through storage (the
+    /// member cache keeps kind as TEXT; Member wants &'static str).
+    /// Unknown strings degrade to "file".
+    pub(crate) fn intern_label(s: &str) -> &'static str {
+        for k in [
+            Kind::Gzip,
+            Kind::Xz,
+            Kind::Zstd,
+            Kind::Bzip2,
+            Kind::Tar,
+            Kind::Zip,
+            Kind::Ar,
+            Kind::Rpm,
+            Kind::Cpio,
+            Kind::SquashFs,
+            Kind::SevenZ,
+            Kind::Iso,
+        ] {
+            if k.label() == s {
+                return k.label();
+            }
+        }
+        if s == "dir" {
+            "dir"
+        } else {
+            "file"
+        }
+    }
+
     pub(crate) fn label(self) -> &'static str {
         match self {
             Kind::Gzip => "gzip",
@@ -189,6 +218,39 @@ pub(crate) struct Walk<'a, 'f> {
     pub(crate) threads: usize,
 }
 
+/// How far a walk follows containers it meets. Explicitly named
+/// container files always descend in Full (pointing hdx at a
+/// container IS the demand); files discovered during a directory
+/// walk follow scan's policy flags.
+#[derive(Clone, Copy, PartialEq, Default)]
+pub enum Descent {
+    /// Never enter containers (scan --shallow).
+    None,
+    /// Enter only containers readable in place — no spooling, no
+    /// decompression of the container stream itself: tar, zip, ar,
+    /// cpio, squashfs, iso. A `.tar.gz` stays closed (the wrapper
+    /// would need decompressing); an rpm too (its payload is always
+    /// behind compression). Scan's default.
+    Cheap,
+    /// Enter everything peek's walk understands, compressed wrappers
+    /// included (scan --deep, and every explicitly named container).
+    #[default]
+    Full,
+}
+
+impl Descent {
+    pub(crate) fn enters(self, kind: Kind) -> bool {
+        match self {
+            Descent::None => false,
+            Descent::Full => true,
+            Descent::Cheap => matches!(
+                kind,
+                Kind::Tar | Kind::Zip | Kind::Ar | Kind::Cpio | Kind::SquashFs | Kind::Iso
+            ),
+        }
+    }
+}
+
 /// Per-descent state, owned by whichever thread walks the subtree:
 /// the conservative flag (spool stream zips instead of walking them
 /// speculatively — set while redoing a subtree after a
@@ -197,12 +259,17 @@ pub(crate) struct Walk<'a, 'f> {
 /// `count` bounds the members of ONE root descent (shared by every
 /// worker walking the same container tree) — the cap is per descended
 /// container, not per pool, so a multi-million-file disk scan never
-/// trips it.
+/// trips it. `descent` is the policy for THIS subtree.
 #[derive(Default)]
 pub(crate) struct Ctx {
     conservative: bool,
     slots: Vec<usize>,
     count: std::sync::Arc<AtomicUsize>,
+    descent: Descent,
+    /// Tree depth of this descent's root: MAX_DEPTH bounds container
+    /// NESTING, so a container found sixteen directories down must
+    /// measure from itself, not from the filesystem root.
+    base_depth: usize,
 }
 
 impl Walk<'_, '_> {
@@ -223,6 +290,58 @@ impl Walk<'_, '_> {
             self.discard(&mut ctx, 0);
         }
         r
+    }
+
+    /// Sniff a disk file already hashed by a scan worker and — if the
+    /// policy enters its format — walk its inside as children of the
+    /// worker's own member slot. The worker seals its member with the
+    /// returned (children, note, kind) afterwards, so the container
+    /// keeps its place in the directory tree and its two-scheme
+    /// digests; only nested members mint the full six. Errors become
+    /// notes: a bad container must not abort a disk scan.
+    pub(crate) fn descend_within(
+        &self,
+        path: &std::path::Path,
+        member_path: &str,
+        name: &str,
+        slot: usize,
+        depth: usize,
+        policy: Descent,
+    ) -> (usize, Option<String>, &'static str) {
+        let view = match View::of_file(path) {
+            Ok(v) => v,
+            Err(e) => return (0, Some(format!("unreadable for descent: {e}")), "file"),
+        };
+        let mut head = vec![0u8; HEAD];
+        let Ok(got) = view.read_full_at(&mut head, 0) else {
+            return (0, None, "file");
+        };
+        head.truncate(got);
+        let mut kind = sniff(&head, name);
+        if kind == Kind::Plain && view.len() >= 32774 {
+            let mut magic = [0u8; 5];
+            if matches!(view.read_full_at(&mut magic, 32769), Ok(5)) && &magic == b"CD001" {
+                kind = Kind::Iso;
+            }
+        }
+        if kind == Kind::Plain {
+            return (0, None, "file");
+        }
+        if !policy.enters(kind) {
+            return (0, None, kind.label());
+        }
+        let mut ctx = Ctx {
+            descent: policy,
+            base_depth: depth,
+            ..Ctx::default()
+        };
+        match self.descend_retrying(kind, &view, member_path, name, depth, slot, &mut ctx) {
+            Ok((children, note)) => (children, note, kind.label()),
+            Err(e) => {
+                self.discard(&mut ctx, 0);
+                (0, Some(format!("descent failed: {e}")), kind.label())
+            }
+        }
     }
 
     /// Hash and descend a member whose bytes only flow forward.
@@ -286,14 +405,18 @@ impl Walk<'_, '_> {
         head.truncate(got);
         let kind = sniff(&head, name);
 
-        let too_deep = depth >= MAX_DEPTH && !matches!(kind, Kind::Plain | Kind::SevenZ);
+        let too_deep = depth.saturating_sub(ctx.base_depth) >= MAX_DEPTH
+            && !matches!(kind, Kind::Plain | Kind::SevenZ);
+        // A container the policy doesn't enter is hashed and labeled
+        // but not walked (Cheap stops at compressed wrappers).
+        let enter = ctx.descent.enters(kind);
 
         // Seek-needing containers fed by a stream have to spool; the
         // spool then descends exactly like a ranged member, so their
         // children can be views over the spool.
         let spools =
             matches!(kind, Kind::SquashFs | Kind::Iso) || (kind == Kind::Zip && ctx.conservative);
-        if !too_deep && spools {
+        if !too_deep && enter && spools {
             let mut src = std::io::Cursor::new(head).chain(r);
             let view = match spool_stream(&mut src, |b| feed.push(pool, b)) {
                 Ok(v) => v,
@@ -329,6 +452,9 @@ impl Walk<'_, '_> {
                     "nested deeper than {MAX_DEPTH} levels — not descended"
                 )),
             ))
+        } else if !enter && kind != Kind::Plain {
+            drain(&mut tee);
+            Ok((0, None))
         } else {
             self.stream_arms(kind, &mut tee, &path, name, depth, own, ctx)
         };
@@ -581,7 +707,8 @@ impl Walk<'_, '_> {
         let own = meta.slot();
         pool.read_task(view.clone(), feed);
 
-        let too_deep = depth >= MAX_DEPTH && !matches!(kind, Kind::Plain | Kind::SevenZ);
+        let too_deep = depth.saturating_sub(ctx.base_depth) >= MAX_DEPTH
+            && !matches!(kind, Kind::Plain | Kind::SevenZ);
         let res = if too_deep {
             Ok((
                 0,
@@ -589,6 +716,8 @@ impl Walk<'_, '_> {
                     "nested deeper than {MAX_DEPTH} levels — not descended"
                 )),
             ))
+        } else if !ctx.descent.enters(kind) && kind != Kind::Plain {
+            Ok((0, None))
         } else {
             self.descend_retrying(kind, &view, &path, name, depth, own, ctx)
         };
@@ -1208,6 +1337,8 @@ impl Walk<'_, '_> {
             let batch_slots: Mutex<Vec<usize>> = Mutex::new(Vec::new());
             let conservative = ctx.conservative;
             let count = &ctx.count;
+            let ctx_descent = ctx.descent;
+            let ctx_base_depth = ctx.base_depth;
             if !batch.is_empty() {
                 std::thread::scope(|scope| {
                     for _ in 0..self.threads.min(batch.len()) {
@@ -1222,6 +1353,8 @@ impl Walk<'_, '_> {
                                 conservative,
                                 slots: vec![slot],
                                 count: count.clone(),
+                                descent: ctx_descent,
+                                base_depth: ctx_base_depth,
                             };
                             let mut reader =
                                 backhand::FilesystemReaderFile::new(&fs, item.file).reader();
