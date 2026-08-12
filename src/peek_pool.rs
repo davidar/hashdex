@@ -75,6 +75,11 @@ impl Digests {
 pub struct Member {
     pub path: String,
     pub depth: usize,
+    /// Slot of the enclosing member (None for a root). Rollups walk
+    /// these chains and rendering rebuilds the tree from them, so
+    /// nothing downstream depends on the slot order of the member
+    /// table.
+    pub parent: Option<usize>,
     pub kind: &'static str,
     pub size: u64,
     pub digests: Digests,
@@ -157,6 +162,7 @@ struct Build {
 struct Meta {
     path: String,
     depth: usize,
+    parent: Option<usize>,
     kind: &'static str,
     children: usize,
     note: Option<String>,
@@ -217,6 +223,7 @@ impl Build {
         let member = Member {
             path: meta.path,
             depth: meta.depth,
+            parent: meta.parent,
             kind: meta.kind,
             size,
             digests,
@@ -302,6 +309,12 @@ pub(crate) struct MetaClose {
 }
 
 impl MetaClose {
+    /// The member's slot — the walker passes it as the parent of
+    /// everything it creates while descending this member.
+    pub(crate) fn slot(&self) -> usize {
+        self.build.slot
+    }
+
     pub(crate) fn close(self, pool: &Pool, children: usize, note: Option<String>) {
         {
             let mut meta = self.build.meta.lock().unwrap();
@@ -388,6 +401,7 @@ impl<'f> Pool<'f> {
         &self,
         path: String,
         depth: usize,
+        parent: Option<usize>,
         kind: &'static str,
         len: Option<u64>,
     ) -> (MetaClose, Feed) {
@@ -415,6 +429,7 @@ impl<'f> Pool<'f> {
             meta: Mutex::new(Some(Meta {
                 path,
                 depth,
+                parent,
                 kind,
                 children: 0,
                 note: None,

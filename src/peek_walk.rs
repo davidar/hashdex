@@ -200,6 +200,7 @@ impl Walk<'_, '_> {
         path: String,
         name: &str,
         depth: usize,
+        parent: Option<usize>,
     ) -> Result<()> {
         if self.slots >= MAX_MEMBERS {
             self.truncated = true;
@@ -219,7 +220,8 @@ impl Walk<'_, '_> {
         let kind = sniff(&head, name);
         self.slots += 1;
         let pool = self.pool;
-        let (meta, mut feed) = pool.member(path.clone(), depth, kind.label(), len);
+        let (meta, mut feed) = pool.member(path.clone(), depth, parent, kind.label(), len);
+        let own = meta.slot();
 
         let too_deep = depth >= MAX_DEPTH && !matches!(kind, Kind::Plain | Kind::SevenZ);
 
@@ -232,7 +234,7 @@ impl Walk<'_, '_> {
             let mut src = std::io::Cursor::new(head).chain(r);
             let view = spool_stream(&mut src, |b| feed.push(pool, b))?;
             feed.close(pool);
-            let (children, note) = self.descend_retrying(kind, &view, &path, name, depth)?;
+            let (children, note) = self.descend_retrying(kind, &view, &path, name, depth, own)?;
             meta.close(pool, children, note);
             return Ok(());
         }
@@ -270,6 +272,7 @@ impl Walk<'_, '_> {
                     format!("{path}!{child}"),
                     &child,
                     depth + 1,
+                    Some(own),
                 );
                 children = 1;
                 tee = dec.into_inner();
@@ -285,6 +288,7 @@ impl Walk<'_, '_> {
                     format!("{path}!{child}"),
                     &child,
                     depth + 1,
+                    Some(own),
                 );
                 children = 1;
                 tee = dec.into_inner();
@@ -300,6 +304,7 @@ impl Walk<'_, '_> {
                     format!("{path}!{child}"),
                     &child,
                     depth + 1,
+                    Some(own),
                 );
                 children = 1;
                 tee = dec.finish().into_inner();
@@ -315,6 +320,7 @@ impl Walk<'_, '_> {
                     format!("{path}!{child}"),
                     &child,
                     depth + 1,
+                    Some(own),
                 );
                 children = 1;
                 tee = dec.into_inner();
@@ -351,6 +357,7 @@ impl Walk<'_, '_> {
                                 format!("{path}!{ename}"),
                                 &leaf,
                                 depth + 1,
+                                Some(own),
                             )?;
                         }
                     }
@@ -380,13 +387,14 @@ impl Walk<'_, '_> {
                         format!("{path}!{ename}"),
                         &ename,
                         depth + 1,
+                        Some(own),
                     )?;
                 }
                 tee = archive.into_inner()?;
                 drain(&mut tee);
             }
             Kind::Cpio => {
-                match self.cpio_stream(&mut tee, &path, depth, &mut children) {
+                match self.cpio_stream(&mut tee, &path, depth, own, &mut children) {
                     Ok(n) => note = n,
                     Err(e) if e.downcast_ref::<RetryConservative>().is_some() => return Err(e),
                     Err(e) => note = Some(format!("cpio walk stopped: {e}")),
@@ -406,6 +414,7 @@ impl Walk<'_, '_> {
                             format!("{path}!payload"),
                             "payload",
                             depth + 1,
+                            Some(own),
                         )?;
                     }
                     Err(e) => note = Some(format!("rpm header parse failed: {e}")),
@@ -415,7 +424,7 @@ impl Walk<'_, '_> {
             Kind::Zip => {
                 // Optimistic streaming walk over the local headers,
                 // reconciled against the central directory at the end.
-                let (n, walk_note) = self.zip_speculative(&mut tee, &path, depth)?;
+                let (n, walk_note) = self.zip_speculative(&mut tee, &path, depth, own)?;
                 children = n;
                 note = walk_note;
                 drain(&mut tee);
@@ -436,6 +445,7 @@ impl Walk<'_, '_> {
         path: String,
         name: &str,
         depth: usize,
+        parent: Option<usize>,
     ) -> Result<()> {
         if self.slots >= MAX_MEMBERS {
             self.truncated = true;
@@ -455,7 +465,8 @@ impl Walk<'_, '_> {
         }
         self.slots += 1;
         let pool = self.pool;
-        let (meta, feed) = pool.member(path.clone(), depth, kind.label(), Some(view.len()));
+        let (meta, feed) = pool.member(path.clone(), depth, parent, kind.label(), Some(view.len()));
+        let own = meta.slot();
         pool.read_task(view.clone(), feed);
 
         let too_deep = depth >= MAX_DEPTH && !matches!(kind, Kind::Plain | Kind::SevenZ);
@@ -467,7 +478,7 @@ impl Walk<'_, '_> {
                 )),
             )
         } else {
-            self.descend_retrying(kind, &view, &path, name, depth)?
+            self.descend_retrying(kind, &view, &path, name, depth, own)?
         };
         meta.close(pool, children, note);
         Ok(())
@@ -485,15 +496,16 @@ impl Walk<'_, '_> {
         path: &str,
         name: &str,
         depth: usize,
+        own: usize,
     ) -> Result<(usize, Option<String>)> {
         let start = self.slots;
         let metas = self.pool.metas_closed();
-        match self.descend_seekable(kind, view, path, name, depth) {
+        match self.descend_seekable(kind, view, path, name, depth, own) {
             Err(e) if is_retry(&e) && !self.conservative => {
                 eprintln!("note: {e}; re-reading {path} with spooling");
                 self.discard(start, metas);
                 self.conservative = true;
-                let redo = self.descend_seekable(kind, view, path, name, depth);
+                let redo = self.descend_seekable(kind, view, path, name, depth, own);
                 self.conservative = false;
                 redo
             }
@@ -528,6 +540,7 @@ impl Walk<'_, '_> {
         path: &str,
         name: &str,
         depth: usize,
+        own: usize,
     ) -> Result<(usize, Option<String>)> {
         let mut children = 0usize;
         let note = match kind {
@@ -546,6 +559,7 @@ impl Walk<'_, '_> {
                     format!("{path}!{child}"),
                     &child,
                     depth + 1,
+                    Some(own),
                 );
                 swallow(r, "decompression stopped")?
             }
@@ -560,6 +574,7 @@ impl Walk<'_, '_> {
                     format!("{path}!{child}"),
                     &child,
                     depth + 1,
+                    Some(own),
                 );
                 swallow(r, "decompression stopped")?
             }
@@ -573,6 +588,7 @@ impl Walk<'_, '_> {
                     format!("{path}!{child}"),
                     &child,
                     depth + 1,
+                    Some(own),
                 );
                 swallow(r, "decompression stopped")?
             }
@@ -586,10 +602,11 @@ impl Walk<'_, '_> {
                     format!("{path}!{child}"),
                     &child,
                     depth + 1,
+                    Some(own),
                 );
                 swallow(r, "decompression stopped")?
             }
-            Kind::Tar => self.tar_ranged(view, path, depth, &mut children)?,
+            Kind::Tar => self.tar_ranged(view, path, depth, own, &mut children)?,
             Kind::Ar => {
                 let mut note = None;
                 let mut archive = ar::Archive::new(BufReader::new(view.rewound()));
@@ -612,11 +629,12 @@ impl Walk<'_, '_> {
                         format!("{path}!{ename}"),
                         &ename,
                         depth + 1,
+                        Some(own),
                     )?;
                 }
                 note
             }
-            Kind::Cpio => match self.cpio_ranged(view, path, depth, &mut children) {
+            Kind::Cpio => match self.cpio_ranged(view, path, depth, own, &mut children) {
                 Ok(n) => n,
                 Err(e) if e.downcast_ref::<RetryConservative>().is_some() => return Err(e),
                 Err(e) => Some(format!("cpio walk stopped: {e}")),
@@ -633,6 +651,7 @@ impl Walk<'_, '_> {
                             format!("{path}!payload"),
                             "payload",
                             depth + 1,
+                            Some(own),
                         )?;
                         None
                     }
@@ -640,15 +659,15 @@ impl Walk<'_, '_> {
                 }
             }
             Kind::Zip => swallow(
-                self.zip_ranged(view, path, depth, &mut children),
+                self.zip_ranged(view, path, depth, own, &mut children),
                 "zip parse failed",
             )?,
             Kind::SquashFs => swallow(
-                self.squashfs_ranged(view, path, depth, &mut children),
+                self.squashfs_ranged(view, path, depth, own, &mut children),
                 "squashfs parse failed",
             )?,
             Kind::Iso => swallow(
-                self.iso_ranged(view, path, depth, &mut children),
+                self.iso_ranged(view, path, depth, own, &mut children),
                 "iso9660 parse failed",
             )?,
         };
@@ -662,6 +681,7 @@ impl Walk<'_, '_> {
         view: &View,
         path: &str,
         depth: usize,
+        own: usize,
         children: &mut usize,
     ) -> Result<Option<String>> {
         let mut note = None;
@@ -705,11 +725,18 @@ impl Walk<'_, '_> {
                             format!("{path}!{ename}"),
                             &leaf,
                             depth + 1,
+                            Some(own),
                         )?;
                     } else {
                         let pos = entry.raw_file_position();
                         let sub = view.slice(&[(pos, size)]);
-                        self.process_ranged(sub, format!("{path}!{ename}"), &leaf, depth + 1)?;
+                        self.process_ranged(
+                            sub,
+                            format!("{path}!{ename}"),
+                            &leaf,
+                            depth + 1,
+                            Some(own),
+                        )?;
                     }
                 }
             }
@@ -727,6 +754,7 @@ impl Walk<'_, '_> {
         view: &View,
         path: &str,
         depth: usize,
+        own: usize,
         children: &mut usize,
     ) -> Result<()> {
         let pool = self.pool;
@@ -746,6 +774,7 @@ impl Walk<'_, '_> {
                         let (meta, feed) = pool.member(
                             format!("{path}!{index_name}"),
                             depth + 1,
+                            Some(own),
                             Kind::Plain.label(),
                             Some(0),
                         );
@@ -772,7 +801,13 @@ impl Walk<'_, '_> {
                 Some(data_start) => {
                     drop(f);
                     let sub = view.slice(&[(data_start, size)]);
-                    self.process_ranged(sub, format!("{path}!{name}"), &leaf, depth + 1)?;
+                    self.process_ranged(
+                        sub,
+                        format!("{path}!{name}"),
+                        &leaf,
+                        depth + 1,
+                        Some(own),
+                    )?;
                 }
                 None => {
                     self.process_stream(
@@ -781,6 +816,7 @@ impl Walk<'_, '_> {
                         format!("{path}!{name}"),
                         &leaf,
                         depth + 1,
+                        Some(own),
                     )?;
                 }
             }
@@ -798,6 +834,7 @@ impl Walk<'_, '_> {
         tee: &mut Tee<'_, '_, '_>,
         path: &str,
         depth: usize,
+        own: usize,
     ) -> Result<(usize, Option<String>)> {
         let mut children = 0usize;
         let mut streamed: Vec<(String, u32)> = Vec::new();
@@ -820,6 +857,7 @@ impl Walk<'_, '_> {
                             format!("{path}!{name}"),
                             &leaf,
                             depth + 1,
+                            Some(own),
                         )?;
                     }
                     // zf's Drop advances the stream past the entry.
@@ -850,6 +888,7 @@ impl Walk<'_, '_> {
         r: &mut Tee<'_, '_, '_>,
         path: &str,
         depth: usize,
+        own: usize,
         children: &mut usize,
     ) -> Result<Option<String>> {
         loop {
@@ -875,6 +914,7 @@ impl Walk<'_, '_> {
                     format!("{path}!{name}"),
                     &leaf,
                     depth + 1,
+                    Some(own),
                 )?;
                 drain(&mut data);
             } else {
@@ -889,6 +929,7 @@ impl Walk<'_, '_> {
         view: &View,
         path: &str,
         depth: usize,
+        own: usize,
         children: &mut usize,
     ) -> Result<Option<String>> {
         let mut pos = 0u64;
@@ -921,7 +962,7 @@ impl Walk<'_, '_> {
                 *children += 1;
                 let leaf = name.rsplit('/').next().unwrap_or(&name).to_string();
                 let sub = view.slice(&[(data_off, filesize)]);
-                self.process_ranged(sub, format!("{path}!{name}"), &leaf, depth + 1)?;
+                self.process_ranged(sub, format!("{path}!{name}"), &leaf, depth + 1, Some(own))?;
             }
             pos = data_off + filesize + data_pad;
         }
@@ -934,6 +975,7 @@ impl Walk<'_, '_> {
         view: &View,
         path: &str,
         depth: usize,
+        own: usize,
         children: &mut usize,
     ) -> Result<()> {
         let mut done = 0usize;
@@ -972,6 +1014,7 @@ impl Walk<'_, '_> {
                     child_path.clone(),
                     &leaf,
                     depth + 1,
+                    Some(own),
                 );
                 match r {
                     // A squashfs file is re-derivable on its own — a
@@ -988,6 +1031,7 @@ impl Walk<'_, '_> {
                             child_path,
                             &leaf,
                             depth + 1,
+                            Some(own),
                         );
                         self.conservative = false;
                         redo?;
@@ -1021,6 +1065,7 @@ impl Walk<'_, '_> {
         view: &View,
         path: &str,
         depth: usize,
+        own: usize,
         children: &mut usize,
     ) -> Result<()> {
         const SECTOR: u64 = 2048;
@@ -1048,7 +1093,7 @@ impl Walk<'_, '_> {
             }
         }
         let (lba, size) = root.context("no primary volume descriptor")?;
-        self.iso_dir(view, lba, size, path, "", depth, children)
+        self.iso_dir(view, lba, size, path, "", depth, own, children)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1060,6 +1105,7 @@ impl Walk<'_, '_> {
         path: &str,
         prefix: &str,
         depth: usize,
+        own: usize,
         children: &mut usize,
     ) -> Result<()> {
         anyhow::ensure!(size < 64 << 20, "directory extent implausibly large");
@@ -1106,7 +1152,13 @@ impl Walk<'_, '_> {
         for (name, extents) in files {
             *children += 1;
             let sub = view.slice(&extents);
-            self.process_ranged(sub, format!("{path}!{prefix}{name}"), &name, depth + 1)?;
+            self.process_ranged(
+                sub,
+                format!("{path}!{prefix}{name}"),
+                &name,
+                depth + 1,
+                Some(own),
+            )?;
         }
         for (name, sub_lba, sub_size) in dirs {
             self.iso_dir(
@@ -1116,6 +1168,7 @@ impl Walk<'_, '_> {
                 path,
                 &format!("{prefix}{name}/"),
                 depth,
+                own,
                 children,
             )?;
         }

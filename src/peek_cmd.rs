@@ -103,8 +103,9 @@ pub async fn peek(
                 conservative: false,
                 discarded: Vec::new(),
             };
-            let r = View::of_file(root)
-                .and_then(|view| walk.process_ranged(view, root.display().to_string(), &name, 0));
+            let r = View::of_file(root).and_then(|view| {
+                walk.process_ranged(view, root.display().to_string(), &name, 0, None)
+            });
             if r.is_ok() {
                 // Only a complete descent closed every member; an
                 // aborted one just lets the queue drain.
@@ -123,7 +124,18 @@ pub async fn peek(
                 sealed[slot] = None;
             }
         }
-        members.extend(sealed.into_iter().flatten());
+        // Parent pointers are pool-local slots; renumber them into the
+        // combined table as the surviving members move over. A
+        // survivor's parent always survives — discards drop whole
+        // subtrees, never a member without its descendants.
+        let mut remap: Vec<Option<usize>> = vec![None; sealed.len()];
+        for (slot, m) in sealed.into_iter().enumerate() {
+            if let Some(mut m) = m {
+                remap[slot] = Some(members.len());
+                m.parent = m.parent.map(|p| remap[p].expect("parent survived discard"));
+                members.push(m);
+            }
+        }
     }
     ticker.clear();
 
@@ -238,26 +250,24 @@ pub async fn peek(
         rendered.push((m, identified, consistent, class));
     }
 
-    // A container's verdict is recursive: roll up every LEAF
-    // descendant (members are in DFS order, so a member's subtree is
-    // the run of deeper entries that follows it). Wrapper
-    // pseudo-members and nested containers don't count against the
-    // rollup — their own bytes being unindexed says nothing about
-    // what they hold.
-    let rollups: Vec<Option<Rollup>> = (0..rendered.len())
-        .map(|i| {
-            let (m, ..) = &rendered[i];
-            if m.children == 0 {
-                return None;
-            }
-            let mut r = Rollup::default();
-            for (d, .., class) in rendered.iter().skip(i + 1) {
-                if d.depth <= m.depth {
-                    break;
-                }
-                if d.children > 0 {
-                    continue;
-                }
+    // A container's verdict is recursive: every LEAF descendant, at
+    // any depth, rolls up into every enclosing container — each leaf
+    // walks its parent chain once. Wrapper pseudo-members and nested
+    // containers don't count against the rollup — their own bytes
+    // being unindexed says nothing about what they hold.
+    let mut rollups: Vec<Option<Rollup>> = rendered
+        .iter()
+        .map(|(m, ..)| (m.children > 0).then(Rollup::default))
+        .collect();
+    for i in 0..rendered.len() {
+        let (m, .., class) = &rendered[i];
+        if m.children > 0 {
+            continue;
+        }
+        let class = *class;
+        let mut up = m.parent;
+        while let Some(p) = up {
+            if let Some(r) = rollups[p].as_mut() {
                 r.total += 1;
                 match class {
                     Class::Identified | Class::Consistent | Class::Membership => r.known += 1,
@@ -265,14 +275,35 @@ pub async fn peek(
                     Class::Floor => r.floor += 1,
                 }
             }
-            Some(r)
-        })
-        .collect();
+            up = rendered[p].0.parent;
+        }
+    }
+
+    // Output order is the tree's: children lists rebuilt from the
+    // parent pointers (per-parent order is allocation order — any one
+    // container is walked by a single thread), depth-first from the
+    // roots. Nothing here depends on the member table's own order.
+    let order: Vec<usize> = {
+        let mut kids: Vec<Vec<usize>> = vec![Vec::new(); rendered.len()];
+        let mut stack: Vec<usize> = Vec::new();
+        for (i, (m, ..)) in rendered.iter().enumerate().rev() {
+            match m.parent {
+                Some(p) => kids[p].push(i),
+                None => stack.push(i),
+            }
+        }
+        let mut order = Vec::with_capacity(rendered.len());
+        while let Some(i) = stack.pop() {
+            order.push(i);
+            stack.extend(std::mem::take(&mut kids[i]));
+        }
+        order
+    };
 
     if opts.json {
-        let out: Vec<serde_json::Value> = rendered
+        let out: Vec<serde_json::Value> = order
             .iter()
-            .zip(&rollups)
+            .map(|&i| (&rendered[i], &rollups[i]))
             .map(|((m, identified, consistent, _), rollup)| {
                 let mut v = json!({
                     "path": m.path,
@@ -308,7 +339,9 @@ pub async fn peek(
         return Ok(());
     }
 
-    for ((m, identified, consistent, _), rollup) in rendered.iter().zip(&rollups) {
+    for ((m, identified, consistent, _), rollup) in
+        order.iter().map(|&i| (&rendered[i], &rollups[i]))
+    {
         let indent = "  ".repeat(m.depth);
         let leaf = m.path.rsplit('!').next().unwrap_or(&m.path);
         let mut line = format!("{indent}{leaf} — {}", human(m.size));
