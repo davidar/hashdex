@@ -60,6 +60,7 @@ metadata, full stop.
 | `hdx coords <file> [--lookup]` | mint all six coordinates of a local file (md5, sha1, sha256, sha512, blake2s256, git blob); recorded as a local crosswalk observation |
 | `hdx locate <hash>` | find local files by digest (inverse of `hdx <hash>`) |
 | `hdx index pull <name>` | download a published claim dataset (fatcat, tarballs) for local + offline resolution — by default hdx range-reads the published parquet on demand; `hdx index rm` frees the copy |
+| `hdx index verify [name]` | hash pulled copies and check them byte-for-byte against the published repo's own hash index (LFS sha256 per file); drifted files are quarantined and re-downloaded on the next pull |
 | `hdx filters fetch [names\|--all]` | download published membership filters (no args: list what's available) |
 | `hdx filters build <name> <scheme> <files>` | build a DCSO-format bloom from hex digest lines |
 | `hdx filters fold <name>` | halve a filter's size in place, trading false-positive rate for space |

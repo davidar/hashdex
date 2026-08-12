@@ -519,6 +519,15 @@ fn local_dataset_lifecycle_and_offline_resolve() {
     assert!(stderr(&out).contains("unknown dataset"));
     assert!(stderr(&out).contains("fatcat"));
 
+    // verify rejects unknown names and never-pulled datasets before
+    // touching the network
+    let out = env.hdx(&["index", "verify", "nope"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("unknown dataset"));
+    let out = env.hdx(&["index", "verify", "tarballs"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("no local copy"));
+
     // offline miss: exit 1, honest message
     let absent = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
     let out = env.hdx(&["--offline", absent]);

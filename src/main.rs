@@ -130,6 +130,12 @@ enum IndexAction {
         /// Dataset name
         name: String,
     },
+    /// Hash local dataset copies and check them against the published
+    /// repo's own hash index (LFS sha256 per file)
+    Verify {
+        /// Dataset name (default: every pulled dataset)
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -267,6 +273,7 @@ async fn main() -> Result<()> {
             IndexAction::Pull { name } => index_cmd::pull(&client, name).await?,
             IndexAction::List => index_cmd::list()?,
             IndexAction::Rm { name } => index_cmd::rm(name)?,
+            IndexAction::Verify { name } => index_cmd::verify(&client, name.as_deref()).await?,
         },
         (Some(Command::Filters { action }), _) => match action {
             FilterAction::Fetch { names, all, from } => {

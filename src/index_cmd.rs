@@ -32,13 +32,22 @@ fn maybe_auth(req: reqwest::RequestBuilder, url: &str) -> reqwest::RequestBuilde
     }
 }
 
+struct RemoteFile {
+    path: String,
+    size: u64,
+    /// LFS oid = the file's sha256. Absent only for git-stored files
+    /// (under the LFS threshold), where `oid` is the git blob sha1.
+    sha256: Option<String>,
+    git_oid: String,
+}
+
 /// The repo's parquet files at one revision, via the Hub tree API
 /// (following Link pagination).
 async fn list_remote_files(
     client: &reqwest::Client,
     spec: &Spec,
     revision: &str,
-) -> Result<Vec<(String, u64)>> {
+) -> Result<Vec<RemoteFile>> {
     let mut url = spec.tree_api(revision);
     let mut files = Vec::new();
     loop {
@@ -67,7 +76,12 @@ async fn list_remote_files(
                 && path.ends_with(".parquet")
                 && (path.starts_with("data/") || path.starts_with("maps/"))
             {
-                files.push((path.to_string(), e["size"].as_u64().unwrap_or(0)));
+                files.push(RemoteFile {
+                    path: path.to_string(),
+                    size: e["size"].as_u64().unwrap_or(0),
+                    sha256: e["lfs"]["oid"].as_str().map(str::to_string),
+                    git_oid: e["oid"].as_str().unwrap_or_default().to_string(),
+                });
             }
         }
         match next {
@@ -75,7 +89,7 @@ async fn list_remote_files(
             None => break,
         }
     }
-    files.sort();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
 
@@ -101,7 +115,7 @@ pub async fn pull(client: &reqwest::Client, name: &str) -> Result<()> {
     if files.is_empty() {
         bail!("no parquet files under data/ or maps/ in {}", spec.repo);
     }
-    let total: u64 = files.iter().map(|(_, s)| s).sum();
+    let total: u64 = files.iter().map(|f| f.size).sum();
     let dir = datasets::datasets_dir().join(spec.name);
     eprintln!(
         "pulling {name} ({} files, {}) from hf.co/datasets/{} @ {}",
@@ -128,7 +142,7 @@ pub async fn pull(client: &reqwest::Client, name: &str) -> Result<()> {
     };
     let mut last_tick = std::time::Instant::now();
     let mut done_bytes = 0u64;
-    for (path, size) in &files {
+    for RemoteFile { path, size, .. } in &files {
         let dest = dir.join(path);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
@@ -189,6 +203,278 @@ pub async fn pull(client: &reqwest::Client, name: &str) -> Result<()> {
         dir.display()
     );
     Ok(())
+}
+
+/// `hdx index verify [name]`: hash every file of a pulled dataset and
+/// compare against the repo's LFS oids (= sha256 of the published
+/// bytes) at the pinned revision. The local copy is supposed to BE the
+/// published file, so any difference is drift worth naming: bitrot,
+/// truncation, or a repo that changed under the pin.
+pub async fn verify(client: &reqwest::Client, name: Option<&str>) -> Result<()> {
+    let specs: Vec<&'static Spec> = match name {
+        Some(n) => vec![find_spec(n)?],
+        None => datasets::SPECS.to_vec(),
+    };
+    let mut checked = 0usize;
+    let mut drifted = 0usize;
+    for spec in specs {
+        let dir = datasets::datasets_dir().join(spec.name);
+        let pin = match std::fs::read_to_string(dir.join("revision")) {
+            Ok(p) => p.trim().to_string(),
+            Err(_) => {
+                if name.is_some() {
+                    bail!("{} has no local copy — nothing to verify", spec.name);
+                }
+                continue;
+            }
+        };
+
+        // Prefer the pinned revision: it names the exact bytes pull
+        // installed. A copy installed by hand carries no real pin, and
+        // history rewrites (squashes) can kill old revisions — main is
+        // the only tree left in either case.
+        let is_sha = pin.len() == 40 && pin.bytes().all(|b| b.is_ascii_hexdigit());
+        let (files, against) = if !is_sha {
+            eprintln!(
+                "{}: local copy wasn't installed by pull (marker {pin:?}) — \
+                 verifying against main",
+                spec.name
+            );
+            (
+                list_remote_files(client, spec, "main").await?,
+                "main".to_string(),
+            )
+        } else {
+            match list_remote_files(client, spec, &pin).await {
+                Ok(f) => (f, pin.clone()),
+                Err(e) if format!("{e:?}").contains("404") => {
+                    eprintln!(
+                        "{}: pinned revision {} is no longer addressable (history \
+                         rewritten?) — verifying against main",
+                        spec.name,
+                        &pin[..pin.len().min(12)]
+                    );
+                    (
+                        list_remote_files(client, spec, "main").await?,
+                        "main".into(),
+                    )
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        println!(
+            "verifying {} against hf.co/datasets/{} @ {}",
+            spec.name,
+            spec.repo,
+            &against[..against.len().min(12)]
+        );
+
+        let mut local_seen = std::collections::HashSet::new();
+        let mut quarantine: Vec<PathBuf> = Vec::new();
+        let mut missing = 0usize;
+        for f in &files {
+            local_seen.insert(dir.join(&f.path));
+            checked += 1;
+            let dest = dir.join(&f.path);
+            let meta = match dest.metadata() {
+                Ok(m) => m,
+                Err(_) => {
+                    println!("  {} — MISSING locally", f.path);
+                    drifted += 1;
+                    missing += 1;
+                    continue;
+                }
+            };
+            if meta.len() != f.size {
+                println!(
+                    "  {} — SIZE MISMATCH (local {}, published {})",
+                    f.path,
+                    human(meta.len()),
+                    human(f.size)
+                );
+                drifted += 1;
+                quarantine.push(dest);
+                continue;
+            }
+            let ok = match &f.sha256 {
+                Some(want) => {
+                    let got = hash_file_sha256(&dest, &f.path)?;
+                    if &got == want {
+                        true
+                    } else {
+                        println!(
+                            "  {} — MISMATCH (local sha256 {}…, published {}…)",
+                            f.path,
+                            &got[..12],
+                            &want[..want.len().min(12)]
+                        );
+                        false
+                    }
+                }
+                // Small git-stored file: no LFS oid, but the tree oid
+                // is the git blob sha1 — the same sha1_git coordinate
+                // hdx mints, so compare that instead.
+                None => {
+                    let got = hash_file_git_blob(&dest)?;
+                    if got == f.git_oid {
+                        true
+                    } else {
+                        println!(
+                            "  {} — MISMATCH (local git blob {}…, published {}…)",
+                            f.path,
+                            &got[..12],
+                            &f.git_oid[..f.git_oid.len().min(12)]
+                        );
+                        false
+                    }
+                }
+            };
+            if ok {
+                println!("  {} — ok ({})", f.path, human(f.size));
+            } else {
+                drifted += 1;
+                quarantine.push(dest);
+            }
+        }
+
+        // Files the published revision doesn't have are never read by
+        // resolution (lookups open expected paths only) — name the
+        // debris, don't fail on it.
+        for entry in walkdir::WalkDir::new(&dir).into_iter().flatten() {
+            let p = entry.path();
+            if !entry.file_type().is_file() || local_seen.contains(p) {
+                continue;
+            }
+            match p.extension().and_then(|e| e.to_str()) {
+                Some("parquet") => println!(
+                    "  note: {} is not in the published revision (stale leftover, \
+                     safe to delete)",
+                    p.strip_prefix(&dir).unwrap_or(p).display()
+                ),
+                Some("part") => println!(
+                    "  note: leftover partial download {} (safe to delete)",
+                    p.strip_prefix(&dir).unwrap_or(p).display()
+                ),
+                Some("drifted") => println!(
+                    "  note: previously quarantined {} (safe to delete)",
+                    p.strip_prefix(&dir).unwrap_or(p).display()
+                ),
+                _ => {}
+            }
+        }
+
+        // A drifted file must not keep serving wrong bytes, and a
+        // local copy with a hole must not keep serving absence proofs:
+        // quarantine the bad files and drop the completeness pin so
+        // resolution falls back to remote range reads. A re-pull
+        // re-downloads exactly what's gone (pull's size-based resume
+        // would otherwise keep a size-preserving corruption).
+        if !quarantine.is_empty() || missing > 0 {
+            for p in &quarantine {
+                let q = p.with_extension("parquet.drifted");
+                std::fs::rename(p, &q).with_context(|| format!("quarantine {}", p.display()))?;
+            }
+            let _ = std::fs::remove_file(dir.join("revision"));
+            if !quarantine.is_empty() {
+                println!(
+                    "  {} drifted file{} quarantined as *.drifted (safe to delete)",
+                    quarantine.len(),
+                    if quarantine.len() == 1 { "" } else { "s" },
+                );
+            }
+            println!(
+                "  the local copy is unpinned — resolution falls back to remote range \
+                 reads; `hdx index pull {}` reinstalls",
+                spec.name
+            );
+        }
+
+        // A moved main is not drift — the pin still names real bytes —
+        // but it is worth a line.
+        if against == pin {
+            if let Ok(v) = revision_of(client, spec).await {
+                if v != pin {
+                    println!(
+                        "  note: the repo has moved on since this pull (main @ {}) — \
+                         `hdx index pull {}` to update",
+                        &v[..v.len().min(12)],
+                        spec.name
+                    );
+                }
+            }
+        }
+    }
+    if checked == 0 {
+        println!("no local dataset copies to verify — `hdx index pull <name>` installs one");
+    } else if drifted == 0 {
+        println!(
+            "{checked} file{} verified — every local byte matches the published dataset{}",
+            if checked == 1 { "" } else { "s" },
+            if name.is_none() { "s" } else { "" }
+        );
+    } else {
+        bail!("{drifted} of {checked} files FAILED verification");
+    }
+    Ok(())
+}
+
+async fn revision_of(client: &reqwest::Client, spec: &Spec) -> Result<String> {
+    let rev_api = spec.revision_api();
+    let v: serde_json::Value = maybe_auth(client.get(&rev_api), &rev_api)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(v["sha"].as_str().context("no sha")?.to_string())
+}
+
+fn hash_file_sha256(path: &std::path::Path, label: &str) -> Result<String> {
+    use sha2::Digest;
+    let tty = {
+        use std::io::IsTerminal;
+        std::io::stderr().is_terminal()
+    };
+    let mut file = std::fs::File::open(path)?;
+    let total = file.metadata()?.len();
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 8 << 20];
+    let mut done = 0u64;
+    let mut last_tick = std::time::Instant::now();
+    loop {
+        use std::io::Read;
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        done += n as u64;
+        if tty && last_tick.elapsed().as_millis() >= 100 {
+            last_tick = std::time::Instant::now();
+            eprint!(
+                "\r  {label} — hashing {} / {}   ",
+                human(done),
+                human(total)
+            );
+        }
+    }
+    if tty {
+        eprint!("\r\x1b[2K");
+    }
+    Ok(hex_lower(&hasher.finalize()))
+}
+
+fn hash_file_git_blob(path: &std::path::Path) -> Result<String> {
+    use sha1::Digest;
+    let bytes = std::fs::read(path)?;
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(format!("blob {}\0", bytes.len()).as_bytes());
+    hasher.update(&bytes);
+    Ok(hex_lower(&hasher.finalize()))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// `hdx index list`: every known dataset and its local state.

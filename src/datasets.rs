@@ -43,8 +43,11 @@ impl Spec {
         )
     }
     pub fn tree_api(&self, revision: &str) -> String {
+        // expand=true adds LFS metadata per entry; lfs.oid is the
+        // file's sha256, which is what `hdx index verify` checks
+        // local copies against.
         format!(
-            "https://huggingface.co/api/datasets/{}/tree/{revision}?recursive=true",
+            "https://huggingface.co/api/datasets/{}/tree/{revision}?recursive=true&expand=true",
             self.repo
         )
     }
