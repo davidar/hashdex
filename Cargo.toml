@@ -31,6 +31,17 @@ cli = [
     "dep:memmap2",
     "dep:flate2",
     "dep:futures",
+    # peek (the hashoscope): container-format readers, all pure Rust
+    # except liblzma/zstd (static C; zstd already proven in the tree
+    # via parquet). backhand's lzo feature is GPL — never enable it.
+    "dep:tar",
+    "dep:zip",
+    "dep:ar",
+    "dep:zstd",
+    "dep:bzip2",
+    "dep:tempfile",
+    "dep:liblzma",
+    "dep:backhand",
 ]
 
 [dependencies]
@@ -53,11 +64,23 @@ memmap2 = { version = "0.9", optional = true }
 flate2 = { version = "1", optional = true }
 parquet = { version = "59.1.0", default-features = false, features = ["zstd"] }
 bytes = "1.12.1"
+tar = { version = "0.4.46", optional = true }
+zip = { version = "8.6.0", optional = true, default-features = false, features = ["bzip2", "deflate", "zstd"] }
+ar = { version = "0.9.0", optional = true }
+zstd = { version = "0.13.3", optional = true }
+bzip2 = { version = "0.6.1", optional = true }
+tempfile = { version = "3.27.0", optional = true }
+liblzma = { version = "0.4.8", optional = true }
+backhand = { version = "0.25.1", default-features = false, features = ["gzip", "zstd", "xz"], optional = true }
 
 [dev-dependencies]
+ar = "0.9.0"
+flate2 = "1"
 # The CLI tests write tiny fixture datasets (the same page-oriented
 # parquet the published repos hold) into their scratch cache dirs.
 parquet = { version = "59.1.0", default-features = false }
+tar = "0.4.46"
+zip = "8.6.0"
 
 [profile.release]
 lto = true

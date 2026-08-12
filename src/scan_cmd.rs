@@ -45,7 +45,7 @@ const SWH_ANON_CAP: usize = 100;
 /// Filters at least this big are probed only for files no smaller filter
 /// recognized: each probe of a bigger-than-RAM mmap is a random page
 /// fault, and known-file corroboration isn't worth disk seeks.
-const EXPENSIVE_FILTER_BYTES: u64 = 2 << 30;
+pub(crate) const EXPENSIVE_FILTER_BYTES: u64 = 2 << 30;
 
 /// A file smaller than the digest that names it cannot be identified
 /// BY that digest: the name carries more information than the content,
@@ -55,7 +55,7 @@ const EXPENSIVE_FILTER_BYTES: u64 = 2 << 30;
 /// Sub-digest files keep their true membership tags but are never
 /// attributed or probed; explicit `hdx <hash>` lookups still render
 /// every witness.
-const IDENTITY_MIN_BYTES: u64 = 32; // = the sha256 digest's length
+pub(crate) const IDENTITY_MIN_BYTES: u64 = 32; // = the sha256 digest's length
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum ListMode {
@@ -122,14 +122,14 @@ impl Ticker {
     }
 }
 
-struct FileResult {
-    path: PathBuf,
-    size: u64,
-    mtime_ns: i64,
-    sha1: [u8; 20],
-    sha256: [u8; 32],
-    from_index: bool,
-    matched: Vec<String>, // filter names
+pub(crate) struct FileResult {
+    pub(crate) path: PathBuf,
+    pub(crate) size: u64,
+    pub(crate) mtime_ns: i64,
+    pub(crate) sha1: [u8; 20],
+    pub(crate) sha256: [u8; 32],
+    pub(crate) from_index: bool,
+    pub(crate) matched: Vec<String>, // filter names
 }
 
 fn to_fresh(r: &FileResult) -> crate::local_index::FreshEntry {
@@ -486,51 +486,7 @@ pub async fn scan(
         let evidence = resolver
             .as_ref()
             .filter(|_| r.size >= IDENTITY_MIN_BYTES)
-            .map(|(datasets, cache)| {
-                let sha256 = crate::coord::Coord {
-                    scheme: Scheme::Sha256,
-                    digest: r.sha256.to_vec(),
-                };
-                let sha1 = crate::coord::Coord {
-                    scheme: Scheme::Sha1,
-                    digest: r.sha1.to_vec(),
-                };
-                let local = |c: &crate::coord::Coord| -> Vec<crate::finding::Finding> {
-                    datasets.iter().flat_map(|d| d.lookup(c)).collect()
-                };
-                let ev = crate::walk::walk(&[sha256.clone(), sha1], &local, cache.as_ref());
-                let mut identified = Vec::new();
-                let mut consistent = Vec::new();
-                let mut seen: HashSet<String> = HashSet::new();
-                for cl in crate::walk::cluster(ev, &sha256).clusters {
-                    for f in cl.findings {
-                        let key = serde_json::to_string(&f).unwrap_or_default();
-                        if cl.primary {
-                            if seen.insert(key) {
-                                identified.push(f);
-                            }
-                            continue;
-                        }
-                        let coords: Vec<crate::coord::Coord> = f
-                            .coords
-                            .iter()
-                            .filter_map(|c| crate::coord::Coord::parse(c).ok())
-                            .collect();
-                        let contradicted = coords.iter().any(|c| match c.scheme {
-                            Scheme::Sha256 => c.digest[..] != r.sha256[..],
-                            Scheme::Sha1 => c.digest[..] != r.sha1[..],
-                            _ => false,
-                        });
-                        let weak_match = coords
-                            .iter()
-                            .any(|c| c.scheme == Scheme::Sha1 && c.digest[..] == r.sha1[..]);
-                        if !contradicted && weak_match && seen.insert(key) {
-                            consistent.push(f);
-                        }
-                    }
-                }
-                (identified, consistent)
-            });
+            .map(|(datasets, cache)| local_verdicts(&r.sha256, &r.sha1, datasets, cache.as_ref()));
         let has_claims = evidence
             .as_ref()
             .is_some_and(|(id, _)| id.iter().any(|f| !f.claims.is_empty()));
@@ -769,6 +725,63 @@ pub async fn scan(
 
 /// Which network backend answers for a membership filter's source.
 /// Filters without a backend (steam, fedora, …) resolve offline only.
+/// The per-digest local resolution recipe shared by scan and peek:
+/// walk from both seeds, cluster on the strong digest, and split the
+/// witness rows into the two verdict tiers of the weak-digest policy —
+/// identified (the row's cluster contains the file's sha256) and
+/// consistent (weak match, no co-stated scheme contradicts a locally
+/// minted digest; a contradicted row describes other bytes).
+pub(crate) fn local_verdicts(
+    sha256_digest: &[u8; 32],
+    sha1_digest: &[u8; 20],
+    datasets: &[crate::datasets::LocalDataset],
+    cache: Option<&crate::cache::Cache>,
+) -> (Vec<crate::finding::Finding>, Vec<crate::finding::Finding>) {
+    let sha256 = crate::coord::Coord {
+        scheme: Scheme::Sha256,
+        digest: sha256_digest.to_vec(),
+    };
+    let sha1 = crate::coord::Coord {
+        scheme: Scheme::Sha1,
+        digest: sha1_digest.to_vec(),
+    };
+    let local = |c: &crate::coord::Coord| -> Vec<crate::finding::Finding> {
+        datasets.iter().flat_map(|d| d.lookup(c)).collect()
+    };
+    let ev = crate::walk::walk(&[sha256.clone(), sha1], &local, cache);
+    let mut identified = Vec::new();
+    let mut consistent = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for cl in crate::walk::cluster(ev, &sha256).clusters {
+        for f in cl.findings {
+            let key = serde_json::to_string(&f).unwrap_or_default();
+            if cl.primary {
+                if seen.insert(key) {
+                    identified.push(f);
+                }
+                continue;
+            }
+            let coords: Vec<crate::coord::Coord> = f
+                .coords
+                .iter()
+                .filter_map(|c| crate::coord::Coord::parse(c).ok())
+                .collect();
+            let contradicted = coords.iter().any(|c| match c.scheme {
+                Scheme::Sha256 => c.digest[..] != sha256_digest[..],
+                Scheme::Sha1 => c.digest[..] != sha1_digest[..],
+                _ => false,
+            });
+            let weak_match = coords
+                .iter()
+                .any(|c| c.scheme == Scheme::Sha1 && c.digest[..] == sha1_digest[..]);
+            if !contradicted && weak_match && seen.insert(key) {
+                consistent.push(f);
+            }
+        }
+    }
+    (identified, consistent)
+}
+
 fn backend_for_filter(name: &str) -> Option<&'static str> {
     match name {
         "fatcat" => Some("fatcat"),
@@ -786,7 +799,7 @@ fn backend_for_filter(name: &str) -> Option<&'static str> {
 /// fired: the bloom hit is the demand that justifies the single probe
 /// (DESIGN.md admission rule). Hits land in the durable cache, so
 /// reruns only pay for digests never probed before.
-async fn online_probe(
+pub(crate) async fn online_probe(
     results: &[FileResult],
     filters: &[NamedFilter],
     selection: Option<&[String]>,
@@ -1013,7 +1026,7 @@ fn examine(
 }
 
 /// Pluralizing suffix: `{n} file{}` with `s(n)`.
-fn s(n: usize) -> &'static str {
+pub(crate) fn s(n: usize) -> &'static str {
     if n == 1 {
         ""
     } else {
@@ -1021,15 +1034,15 @@ fn s(n: usize) -> &'static str {
     }
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn hex_upper(bytes: &[u8]) -> String {
+pub(crate) fn hex_upper(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 
-fn human(bytes: u64) -> String {
+pub(crate) fn human(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = bytes as f64;
     let mut u = 0;

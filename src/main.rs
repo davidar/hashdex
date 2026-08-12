@@ -95,6 +95,24 @@ enum Command {
               conflicts_with = "no_resolve")]
         online: Option<String>,
     },
+    /// Peek inside container files (the hashoscope): recursively hash
+    /// every nested member — through tarballs, debs, rpms, zips,
+    /// wheels, squashfs, nested any way — and identify each one the
+    /// way scan identifies files on disk
+    Peek {
+        /// Container files to descend into
+        files: Vec<PathBuf>,
+        /// Full citation blocks per member instead of compact lines
+        #[arg(short, long)]
+        verbose: bool,
+        /// Also tell third-party APIs (circl, depsdev, rekor, swh)
+        /// about matched digests — dataset-transport backends are
+        /// probed by default and disclose nothing.
+        /// Optionally restrict: --online=circl,swh
+        #[arg(long, value_name = "BACKENDS", num_args = 0..=1,
+              default_missing_value = "", require_equals = true)]
+        online: Option<String>,
+    },
     /// Find local files by digest (from the index hdx scan maintains)
     Locate {
         /// sha1 or sha256 hash (any common spelling)
@@ -241,6 +259,35 @@ async fn main() -> Result<()> {
                 },
             };
             scan_cmd::scan(paths, &filters, &sopts, &client, &opts).await?;
+        }
+        (
+            Some(Command::Peek {
+                files,
+                verbose,
+                online,
+            }),
+            _,
+        ) => {
+            if files.is_empty() {
+                anyhow::bail!("hdx peek: no files given");
+            }
+            if online.is_some() && cli.offline {
+                eprintln!("note: --offline wins over --online; skipping network probes");
+            }
+            let popts = hashdex::peek_cmd::Options {
+                verbose: *verbose,
+                json: cli.json,
+                online: match (online, cli.offline) {
+                    (Some(list), false) => Some(
+                        list.split(',')
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                    ),
+                    _ => None,
+                },
+            };
+            hashdex::peek_cmd::peek(files, &popts, &opts, &client).await?;
         }
         (Some(Command::Locate { hash }), _) => {
             let coord = Coord::parse(hash)?;

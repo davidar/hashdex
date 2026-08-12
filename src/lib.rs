@@ -34,6 +34,8 @@ pub mod index_cmd;
 #[cfg(feature = "cli")]
 pub mod local_index;
 #[cfg(feature = "cli")]
+pub mod peek_cmd;
+#[cfg(feature = "cli")]
 pub mod resolve;
 #[cfg(feature = "cli")]
 pub mod scan_cmd;

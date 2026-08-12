@@ -961,3 +961,203 @@ fn scan_online_conflicts_with_no_resolve() {
         stderr(&out)
     );
 }
+
+/// The hashoscope: peek descends gzip→tar and ar→gzip→tar chains,
+/// tags members against filters, honors the identity floor, and
+/// reports containers it cannot enter. Fixtures are built with the
+/// same crates the binary uses — the test proves the walk, not the
+/// format libraries.
+#[test]
+fn peek_descends_containers() {
+    use std::io::Write as _;
+    let env = TestEnv::new("peek");
+
+    // Member content with a known digest, plus a sub-floor member.
+    let payload = b"hashoscope test payload: the bytes inside the container\n";
+    let payload_sha256 = {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(payload);
+        format!("{:x}", h.finalize())
+    };
+
+    // t.tar.gz: dir/payload.txt (identifiable) + tiny (below floor)
+    let tgz = {
+        let mut tarball = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut tarball, flate2::Compression::default());
+            let mut b = tar::Builder::new(enc);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "dir/payload.txt", &payload[..])
+                .unwrap();
+            let mut h = tar::Header::new_gnu();
+            h.set_size(2);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "dir/tiny", &b"a\n"[..]).unwrap();
+            b.into_inner().unwrap().finish().unwrap();
+        }
+        env.write("t.tar.gz", &tarball)
+    };
+
+    // d.ar: deb-shaped — debian-binary + data.tar.gz (nested chain)
+    let deb = {
+        let mut inner = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut inner, flate2::Compression::default());
+            let mut b = tar::Builder::new(enc);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "usr/share/doc/payload.txt", &payload[..])
+                .unwrap();
+            b.into_inner().unwrap().finish().unwrap();
+        }
+        let mut arbytes = Vec::new();
+        {
+            let mut b = ar::Builder::new(&mut arbytes);
+            b.append(
+                &ar::Header::new(b"debian-binary".to_vec(), 4),
+                &b"2.0\n"[..],
+            )
+            .unwrap();
+            b.append(
+                &ar::Header::new(b"data.tar.gz".to_vec(), inner.len() as u64),
+                &inner[..],
+            )
+            .unwrap();
+        }
+        env.write("d.ar", &arbytes)
+    };
+
+    // A filter that knows the payload digest (padded per the bloom
+    // sizing gotcha), installed as "peeksrc".
+    let list = env.digest_list("digests.txt", &payload_sha256);
+    let out = env.hdx(&[
+        "filters",
+        "build",
+        "peeksrc",
+        "sha256",
+        list.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    // Tarball: container line, decompressed pseudo-member, tagged member,
+    // floor member.
+    let out = env.hdx(&["--offline", "peek", tgz.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("t.tar.gz"), "{text}");
+    assert!(
+        text.contains("t.tar —"),
+        "no decompressed pseudo-member:\n{text}"
+    );
+    assert!(text.contains("payload.txt"), "{text}");
+    assert!(text.contains("[peeksrc]"), "member not tagged:\n{text}");
+    assert!(text.contains("below identity floor"), "{text}");
+
+    // Deb-shaped ar: the nested chain ar→gz→tar reaches the same bytes.
+    let out = env.hdx(&["--offline", "--json", "peek", deb.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    let members = v["members"].as_array().unwrap();
+    let deep = members
+        .iter()
+        .find(|m| {
+            m["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("usr/share/doc/payload.txt")
+        })
+        .expect("nested member missing");
+    assert_eq!(deep["depth"], 3, "ar→gz→tar should be three levels down");
+    assert!(
+        deep["filters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "peeksrc"),
+        "nested member not tagged: {deep}"
+    );
+    assert!(
+        deep["coords"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c.as_str().unwrap().contains(&payload_sha256)),
+        "sha256 coordinate missing: {deep}"
+    );
+
+    // cpio (newc, hand-rolled parser): one file + trailer.
+    let mut cpio = Vec::new();
+    let name = b"member.txt\0";
+    write!(
+        cpio,
+        "070701{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+        1,
+        0o100644,
+        0,
+        0,
+        1,
+        0,
+        payload.len(),
+        0,
+        0,
+        0,
+        0,
+        name.len(),
+        0
+    )
+    .unwrap();
+    cpio.extend_from_slice(name);
+    while (cpio.len()) % 4 != 0 {
+        cpio.push(0);
+    }
+    cpio.extend_from_slice(payload);
+    while (cpio.len()) % 4 != 0 {
+        cpio.push(0);
+    }
+    let trailer = b"TRAILER!!!\0";
+    write!(
+        cpio,
+        "070701{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        trailer.len(),
+        0
+    )
+    .unwrap();
+    cpio.extend_from_slice(trailer);
+    while cpio.len() % 4 != 0 {
+        cpio.push(0);
+    }
+    let cpio_file = env.write("t.cpio", &cpio);
+    let out = env.hdx(&["--offline", "peek", cpio_file.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("member.txt"), "{text}");
+    assert!(
+        text.contains("[peeksrc]"),
+        "cpio member not tagged:\n{text}"
+    );
+
+    // Errors: no files; a directory.
+    let out = env.hdx(&["peek"]);
+    assert!(!out.status.success());
+    let out = env.hdx(&["--offline", "peek", env.work().to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("not a file"), "{}", stderr(&out));
+}

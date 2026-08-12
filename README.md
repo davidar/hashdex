@@ -57,6 +57,7 @@ metadata, full stop.
 |---|---|
 | `hdx <hash>` | resolve: local walk over pulled datasets + observation store, then live backends (hex, base32, SRI, SWHID, `scheme:hex`); `--offline` skips the network |
 | `hdx scan <paths>` | scan + attribute: hash files (persisted updatedb-style, so rescans are stat-only), check membership filters, cite what the indexes can name. `--no-resolve` = membership census only; `-v` = full citation blocks; `--list unknown\|known\|all` = per-file lines |
+| `hdx peek <files>` | the hashoscope: recursively descend into containers — gzip/xz/zstd/bzip2, tar, zip, ar/deb, rpm, cpio, squashfs, nested any way — hashing every member in one streaming pass and identifying each like `scan` does. A pristine tarball no index has seen usually contains hundreds of files the indexes know |
 | `hdx coords <file> [--lookup]` | mint all six coordinates of a local file (md5, sha1, sha256, sha512, blake2s256, git blob); recorded as a local crosswalk observation |
 | `hdx locate <hash>` | find local files by digest (inverse of `hdx <hash>`) |
 | `hdx index pull <name>` | download a published claim dataset (fatcat, tarballs) for local + offline resolution — by default hdx range-reads the published parquet on demand; `hdx index rm` frees the copy |

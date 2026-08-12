@@ -19,6 +19,9 @@ cargo test
 hdx <hash>            # resolve (hex, base32, SRI, SWHID, scheme:hex);
                       #   local walk first, then network (--offline to skip)
 hdx coords <file>     # mint all six coordinates of local files
+hdx peek <file>       # hashoscope: recursively hash + identify every
+                      #   nested member of a container (tar/zip/deb/
+                      #   rpm/cpio/squashfs; iso/7z recognized only)
 hdx scan <dir>        # scan against filters + attribute what it can
                       #   (dataset probes by default; --no-resolve =
                       #   census; --online consents to third-party APIs)
