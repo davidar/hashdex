@@ -1201,3 +1201,182 @@ fn peek_descends_containers() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("not a file"), "{}", stderr(&out));
 }
+
+/// Zips take three routes through peek: a seekable root walks the
+/// central directory directly (stored entries as range views), a
+/// stream-fed zip is walked speculatively from its local headers and
+/// reconciled against the central directory, and a MISBEHAVED stream
+/// zip (here: a local entry hidden from the central directory)
+/// triggers one conservative re-descent that spools and trusts only
+/// the central directory.
+#[test]
+fn peek_zip_speculative_and_conservative() {
+    use std::io::Write as _;
+    let env = TestEnv::new("peekzip");
+
+    let payload = b"hashoscope zip payload: bytes the filter knows\n";
+    let payload_sha256 = {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(payload);
+        format!("{:x}", h.finalize())
+    };
+    let list = env.digest_list("digests.txt", &payload_sha256);
+    let out = env.hdx(&[
+        "filters",
+        "build",
+        "peeksrc",
+        "sha256",
+        list.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    // A well-formed zip: one stored entry (readable as a range view)
+    // and one deflated entry (streamed).
+    let zip_bytes = {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        w.start_file("stored.txt", stored).unwrap();
+        w.write_all(payload).unwrap();
+        let deflated = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        w.start_file("deflated.txt", deflated).unwrap();
+        w.write_all(payload).unwrap();
+        w.finish().unwrap().into_inner()
+    };
+
+    // Root zip = seekable: both entries attributed, no retry.
+    let zip_file = env.write("t.zip", &zip_bytes);
+    let out = env.hdx(&["--offline", "peek", zip_file.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("stored.txt"), "{text}");
+    assert!(text.contains("deflated.txt"), "{text}");
+    assert_eq!(
+        text.matches("[peeksrc]").count(),
+        2,
+        "both zip entries should carry the filter tag:\n{text}"
+    );
+
+    // The same zip behind gzip = stream-fed: the speculative walk must
+    // agree with the central directory and NOT trigger a re-descent.
+    let zgz = {
+        let mut gz = Vec::new();
+        let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+        enc.write_all(&zip_bytes).unwrap();
+        enc.finish().unwrap();
+        env.write("t.zip.gz", &gz)
+    };
+    let out = env.hdx(&["--offline", "peek", zgz.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("stored.txt"), "{text}");
+    assert!(text.contains("deflated.txt"), "{text}");
+    assert!(
+        !stderr(&out).contains("re-reading"),
+        "well-formed stream zip must not retry: {}",
+        stderr(&out)
+    );
+
+    // Misbehave: drop the second entry's central-directory record so a
+    // local entry exists that the directory never mentions. The
+    // speculative walk sees it, the reconcile fails, and the whole
+    // root re-descends conservatively (central directory only).
+    let tampered = {
+        let eocd = zip_bytes.len() - 22;
+        assert_eq!(&zip_bytes[eocd..eocd + 4], &[0x50, 0x4b, 0x05, 0x06]);
+        let cd_size =
+            u32::from_le_bytes(zip_bytes[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
+        let cd_off =
+            u32::from_le_bytes(zip_bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        let cd = &zip_bytes[cd_off..cd_off + cd_size];
+        let second = 4 + cd[4..]
+            .windows(4)
+            .position(|w| w == [0x50, 0x4b, 0x01, 0x02])
+            .expect("second central record");
+        let mut out = zip_bytes[..cd_off + second].to_vec();
+        let mut eocd_rec = zip_bytes[eocd..].to_vec();
+        eocd_rec[8..10].copy_from_slice(&1u16.to_le_bytes());
+        eocd_rec[10..12].copy_from_slice(&1u16.to_le_bytes());
+        eocd_rec[12..16].copy_from_slice(&(second as u32).to_le_bytes());
+        out.extend_from_slice(&eocd_rec);
+        out
+    };
+    let tgz = {
+        let mut gz = Vec::new();
+        let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+        enc.write_all(&tampered).unwrap();
+        enc.finish().unwrap();
+        env.write("bad.zip.gz", &gz)
+    };
+    let out = env.hdx(&["--offline", "peek", tgz.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("re-reading"),
+        "hidden entry must trigger the conservative retry: {err}"
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("stored.txt"),
+        "central-directory entry missing after retry:\n{text}"
+    );
+    assert!(
+        !text.contains("deflated.txt"),
+        "hidden entry must not be listed as a member:\n{text}"
+    );
+}
+
+/// A seek-needing container behind compression (here: an iso in gzip)
+/// still works — it spools, and its members resolve as views over the
+/// spool.
+#[test]
+fn peek_spools_streamed_iso() {
+    use std::io::Write as _;
+    let env = TestEnv::new("peekspool");
+
+    let payload = b"hashoscope iso payload: bytes inside the image\n";
+    // Minimal iso: PVD at sector 16, terminator, root dir with one file.
+    let mut img = vec![0u8; 22 * 2048];
+    let pvd = 16 * 2048;
+    img[pvd] = 1;
+    img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+    img[pvd + 6] = 1;
+    let r = pvd + 156;
+    img[r] = 34;
+    img[r + 2..r + 6].copy_from_slice(&20u32.to_le_bytes());
+    img[r + 10..r + 14].copy_from_slice(&2048u32.to_le_bytes());
+    img[r + 25] = 0x02;
+    img[r + 32] = 1;
+    let term = 17 * 2048;
+    img[term] = 255;
+    img[term + 1..term + 6].copy_from_slice(b"CD001");
+    img[term + 6] = 1;
+    let d = 20 * 2048;
+    let name = b"PAYLOAD.TXT;1";
+    img[d] = (33 + name.len()) as u8;
+    img[d + 2..d + 6].copy_from_slice(&21u32.to_le_bytes());
+    img[d + 10..d + 14].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    img[d + 32] = name.len() as u8;
+    img[d + 33..d + 33 + name.len()].copy_from_slice(name);
+    img[21 * 2048..21 * 2048 + payload.len()].copy_from_slice(payload);
+
+    let gz = {
+        let mut gz = Vec::new();
+        let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+        enc.write_all(&img).unwrap();
+        enc.finish().unwrap();
+        // The unwrapped pseudo-member is a stream, so the iso is
+        // recognized by its name (the CD001 magic at 32769 is out of
+        // sniffing reach for streams) and spooled to walk.
+        env.write("image.iso.gz", &gz)
+    };
+    let out = env.hdx(&["--offline", "peek", gz.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("PAYLOAD.TXT"),
+        "iso member missing through the spool path:\n{text}"
+    );
+}
