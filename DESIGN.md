@@ -336,6 +336,16 @@ weak digest claimed by two such clusters is a surfaced collision.
 Since backends returning no crosswalk coordinates are common, their
 unanchored findings never count as distinct contents.
 
+Scan verdicts follow the same policy, per witness row: a row whose
+cluster carries the file's own strong digest *identifies* it; a row
+matching only on weak digests — with no contradiction on any scheme
+the row co-states against a locally-minted digest — renders as
+*consistent with*, marked with the scheme that matched and counted
+separately from identified attributions (a contradicted row
+describes other bytes and stays out of both tiers). Weak-only
+sources (md5/sha1-keyed indexes) are admissible precisely because
+the consistent tier never presents them as verified identity.
+
 **For published cluster indexes (if/when they ship), precompute that
 same closure and ship the evidence.** Two artifacts: the
 **coordinate index** ((scheme, digest) → cluster ID(s), plural for

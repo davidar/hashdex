@@ -68,7 +68,16 @@ pub static TARBALLS: Spec = Spec {
     start_paths: crate::tarballs::start_paths,
 };
 
-pub static SPECS: &[&Spec] = &[&FATCAT, &TARBALLS];
+pub static CENSUS: Spec = Spec {
+    name: "ia-census",
+    repo: "david-ar/ia-census-2016",
+    approx_size: "~11 GB",
+    suffix: 8 << 20,
+    supports: crate::census::supports,
+    start_paths: crate::census::start_paths,
+};
+
+pub static SPECS: &[&Spec] = &[&FATCAT, &TARBALLS, &CENSUS];
 
 pub fn spec(name: &str) -> Option<&'static Spec> {
     SPECS.iter().find(|s| s.name == name).copied()
@@ -91,6 +100,7 @@ where
     match name {
         "fatcat" => crate::fatcat::lookup_with(open, coord),
         "tarballs" => crate::tarballs::lookup_with(open, coord),
+        "ia-census" => crate::census::lookup_with(open, coord),
         _ => Ok(Vec::new()),
     }
 }

@@ -160,7 +160,7 @@ pub async fn resolve(client: &Client, coord: &Coord, opts: &Options) -> Result<R
 
     let datasets = crate::datasets::open_all();
     let local = |c: &Coord| -> Vec<Finding> { datasets.iter().flat_map(|d| d.lookup(c)).collect() };
-    let mut evidence = walk::walk(coord, &local, cache.as_ref());
+    let mut evidence = walk::walk(std::slice::from_ref(coord), &local, cache.as_ref());
 
     // With --no-cache the fresh findings never reached the store, so
     // the walk can't have seen them; merge them in (dedup by identity).

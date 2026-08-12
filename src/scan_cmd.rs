@@ -458,6 +458,7 @@ pub async fn scan(
 
     let mut known = 0usize;
     let mut attributed = 0usize;
+    let mut consistent_files = 0usize;
     let mut membership_only = 0usize;
     let mut known_bytes = 0u64;
     let mut total_bytes = 0u64;
@@ -472,45 +473,84 @@ pub async fn scan(
         }
         // Attributed listing needs the evidence to decide visibility,
         // so the walk runs for every file whenever we resolve — except
-        // sub-digest-size files, which are never attributed. Evidence
-        // is clustered and only PRIMARY clusters (those containing the
-        // file's own sha256) attribute: claims reached solely through
-        // weak-digest links are about other bytes that happen to share
-        // an md5/sha1 — "consistent with", never this file's identity.
+        // sub-digest-size files, which are never attributed. The walk
+        // is seeded with every digest scan minted (sha256 AND sha1 —
+        // weak-keyed sources are only reachable via the weak seed).
+        // Verdicts per witness row (the approved weak-digest policy):
+        //   identified — the row's cluster contains the file's sha256;
+        //   consistent — the row matches only on weak digests, and NO
+        //     scheme it co-states contradicts a locally-minted digest
+        //     (a contradicted row describes other bytes → related,
+        //     silently);
+        // both tiers count as known, reported separately.
         let evidence = resolver
             .as_ref()
             .filter(|_| r.size >= IDENTITY_MIN_BYTES)
             .map(|(datasets, cache)| {
-                let coord = crate::coord::Coord {
+                let sha256 = crate::coord::Coord {
                     scheme: Scheme::Sha256,
                     digest: r.sha256.to_vec(),
+                };
+                let sha1 = crate::coord::Coord {
+                    scheme: Scheme::Sha1,
+                    digest: r.sha1.to_vec(),
                 };
                 let local = |c: &crate::coord::Coord| -> Vec<crate::finding::Finding> {
                     datasets.iter().flat_map(|d| d.lookup(c)).collect()
                 };
-                let ev = crate::walk::walk(&coord, &local, cache.as_ref());
-                crate::walk::cluster(ev, &coord)
-                    .clusters
-                    .into_iter()
-                    .filter(|cl| cl.primary)
-                    .flat_map(|cl| cl.findings)
-                    .collect::<Vec<crate::finding::Finding>>()
+                let ev = crate::walk::walk(&[sha256.clone(), sha1], &local, cache.as_ref());
+                let mut identified = Vec::new();
+                let mut consistent = Vec::new();
+                let mut seen: HashSet<String> = HashSet::new();
+                for cl in crate::walk::cluster(ev, &sha256).clusters {
+                    for f in cl.findings {
+                        let key = serde_json::to_string(&f).unwrap_or_default();
+                        if cl.primary {
+                            if seen.insert(key) {
+                                identified.push(f);
+                            }
+                            continue;
+                        }
+                        let coords: Vec<crate::coord::Coord> = f
+                            .coords
+                            .iter()
+                            .filter_map(|c| crate::coord::Coord::parse(c).ok())
+                            .collect();
+                        let contradicted = coords.iter().any(|c| match c.scheme {
+                            Scheme::Sha256 => c.digest[..] != r.sha256[..],
+                            Scheme::Sha1 => c.digest[..] != r.sha1[..],
+                            _ => false,
+                        });
+                        let weak_match = coords
+                            .iter()
+                            .any(|c| c.scheme == Scheme::Sha1 && c.digest[..] == r.sha1[..]);
+                        if !contradicted && weak_match && seen.insert(key) {
+                            consistent.push(f);
+                        }
+                    }
+                }
+                (identified, consistent)
             });
         let has_claims = evidence
             .as_ref()
-            .is_some_and(|ev| ev.iter().any(|f| !f.claims.is_empty()));
+            .is_some_and(|(id, _)| id.iter().any(|f| !f.claims.is_empty()));
+        let has_consistent = evidence
+            .as_ref()
+            .is_some_and(|(_, co)| co.iter().any(|f| !f.claims.is_empty()));
         if has_claims {
             attributed += 1;
+        } else if has_consistent {
+            consistent_files += 1;
         }
         // Known = a filter matched OR the walk produced a claim: index
         // rows (tarballs, cached observations) are witness-grade
         // evidence, stronger than a probabilistic bloom hit — a file
         // can't be both attributed and "unknown".
-        if !r.matched.is_empty() || has_claims {
+        if !r.matched.is_empty() || has_claims || has_consistent {
             known += 1;
             known_bytes += r.size;
         }
-        if resolver.is_some() && !r.matched.is_empty() && !has_claims {
+        if resolver.is_some() && !r.matched.is_empty() && !has_claims && !has_consistent {
             membership_only += 1;
         }
         let show = match opts.list {
@@ -518,10 +558,15 @@ pub async fn scan(
             ListMode::All => true,
             ListMode::Known => !r.matched.is_empty(),
             ListMode::Unknown => r.matched.is_empty(),
-            ListMode::Attributed => has_claims || file_roots.contains(r.path.as_path()),
+            ListMode::Attributed => {
+                has_claims || has_consistent || file_roots.contains(r.path.as_path())
+            }
         };
         if show {
             ticker.clear();
+            // Every consistent match is via sha1 — the only weak digest
+            // scan mints (md5 joins when an md5-only source needs it).
+            const WEAK_VIA: &str = "sha1";
             if opts.json {
                 let mut obj = json!({
                     "path": r.path.display().to_string(),
@@ -531,65 +576,89 @@ pub async fn scan(
                     "known": !r.matched.is_empty(),
                     "filters": r.matched,
                 });
-                if let Some(evidence) = &evidence {
-                    obj["resolved"] = evidence
+                if let Some((identified, consistent)) = &evidence {
+                    obj["resolved"] = identified
+                        .iter()
+                        .map(|f| json!({"backend": f.backend, "claims": f.claims}))
+                        .collect();
+                    obj["consistent"] = consistent
                         .iter()
                         .map(|f| {
-                            json!({
-                                "backend": f.backend,
-                                "claims": f.claims,
-                            })
+                            json!({"backend": f.backend, "claims": f.claims, "via": [WEAK_VIA]})
                         })
                         .collect();
                 }
                 println!("{obj}");
             } else {
-                let tag = if !r.matched.is_empty() {
-                    r.matched.join(",")
-                } else if has_claims {
-                    // No filter fired but the local walk attributed it
-                    // (index-only sources like tarballs have no bloom):
-                    // name the attestors, don't call it unknown.
-                    let mut backends: Vec<&str> = evidence
+                let backends_of = |fs: &[crate::finding::Finding]| {
+                    let mut backends: Vec<&str> = fs
                         .iter()
-                        .flatten()
                         .filter(|f| !f.claims.is_empty())
                         .map(|f| f.backend.as_str())
                         .collect();
                     backends.sort_unstable();
                     backends.dedup();
                     backends.join(",")
+                };
+                let tag = if !r.matched.is_empty() {
+                    r.matched.join(",")
+                } else if has_claims {
+                    // No filter fired but the local walk attributed it
+                    // (index-only sources like tarballs have no bloom):
+                    // name the attestors, don't call it unknown.
+                    evidence.as_ref().map(|(id, _)| backends_of(id)).unwrap()
+                } else if has_consistent {
+                    evidence.as_ref().map(|(_, co)| backends_of(co)).unwrap()
                 } else {
                     "unknown".to_string()
                 };
                 println!("{:<12} {}", tag, r.path.display());
-                if let Some(evidence) = &evidence {
+                if let Some((identified, consistent)) = &evidence {
+                    // Weak-only matches never present as identity: their
+                    // lines carry the tier and the scheme that matched.
+                    let prefix = format!("consistent ({WEAK_VIA}): ");
+                    // (identity-tier?, backend, statement, url) —
+                    // identified claims always outrank consistent ones.
+                    let lines: Vec<(bool, &str, String, &Option<String>)> = identified
+                        .iter()
+                        .flat_map(|f| {
+                            f.claims.iter().map(move |c| {
+                                (true, f.backend.as_str(), c.statement.clone(), &c.url)
+                            })
+                        })
+                        .chain(consistent.iter().flat_map(|f| {
+                            f.claims.iter().map(|c| {
+                                (
+                                    false,
+                                    f.backend.as_str(),
+                                    format!("{prefix}{}", c.statement),
+                                    &c.url,
+                                )
+                            })
+                        }))
+                        .collect();
                     if opts.verbose {
                         const SHOWN: usize = 3;
-                        for f in evidence.iter().take(SHOWN) {
-                            let Some(claim) = f.claims.first() else {
-                                continue;
-                            };
-                            println!("             {:<12} {}", f.backend, claim.statement);
-                            if let Some(url) = &claim.url {
+                        for (_, backend, statement, url) in lines.iter().take(SHOWN) {
+                            println!("             {backend:<12} {statement}");
+                            if let Some(url) = url {
                                 println!("             {:<12} → {url}", "");
                             }
                         }
-                        if evidence.len() > SHOWN {
-                            println!("             … and {} more claims", evidence.len() - SHOWN);
+                        if lines.len() > SHOWN {
+                            println!("             … and {} more claims", lines.len() - SHOWN);
                         }
-                    } else if let Some((backend, claim)) = evidence
+                    } else if let Some((_, backend, statement, url)) = lines
                         .iter()
-                        .flat_map(|f| f.claims.iter().map(move |c| (&f.backend, c)))
-                        .max_by_key(|(_, c)| (c.url.is_some(), c.statement.len()))
+                        .max_by_key(|(id, _, s, url)| (*id, url.is_some(), s.len()))
                     {
                         // Compact default: the most informative single
                         // claim (URL-bearing beats bare join keys) WITH
                         // its URL — the URL is usually the payload the
                         // user is after (wayback copy, SWH archive).
                         // -v for the full multi-claim blocks.
-                        println!("             {:<12} {}", backend, claim.statement);
-                        if let Some(url) = &claim.url {
+                        println!("             {backend:<12} {statement}");
+                        if let Some(url) = url {
                             println!("             {:<12} → {url}", "");
                         }
                     }
@@ -615,17 +684,25 @@ pub async fn scan(
     });
     if resolver.is_some() {
         summary["attributed"] = json!(attributed);
+        summary["consistent"] = json!(consistent_files);
         summary["membership_only"] = json!(membership_only);
     }
     if opts.json {
         println!("{summary}");
     } else {
         eprintln!();
-        let attribution = if resolver.is_some() {
+        let mut attribution = if resolver.is_some() {
             format!(", {attributed} attributed")
         } else {
             String::new()
         };
+        if consistent_files > 0 {
+            // Weak-digest tier: matched on sha1 only — the headline
+            // "known" includes these, but never as verified identity.
+            attribution.push_str(&format!(
+                ", {consistent_files} consistent (weak digests only)"
+            ));
+        }
         println!(
             "{scanned} file{} ({}) — {known} known ({}){attribution}, {} unknown",
             s(scanned),
@@ -696,6 +773,7 @@ fn backend_for_filter(name: &str) -> Option<&'static str> {
     match name {
         "fatcat" => Some("fatcat"),
         "tarballs" => Some("tarballs"),
+        "ia-census" => Some("ia-census"),
         "circl" => Some(crate::backends::circl::NAME),
         "depsdev" => Some(crate::backends::depsdev::NAME),
         "rekor" => Some(crate::backends::rekor::NAME),

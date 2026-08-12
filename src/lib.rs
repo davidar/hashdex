@@ -7,6 +7,7 @@
 //! a browser page drives the same lookup logic over fetch-based range
 //! reads.
 
+pub mod census;
 pub mod coord;
 pub mod dcso;
 pub mod fatcat;

@@ -688,6 +688,132 @@ fn scan_does_not_attribute_across_weak_digests() {
     );
 }
 
+/// Install a tiny ia-census dataset (data sharded by first sha1
+/// nibble + md5 map), the layout `hdx index pull ia-census` produces.
+fn install_census_dataset(env: &TestEnv, rows: &[(&str, &str, &str, &str)]) {
+    use std::collections::BTreeMap;
+    let root = env.root.join("cache/hashdex/datasets/ia-census");
+    let mut by_nibble: BTreeMap<char, Vec<(&str, &str, &str, &str)>> = BTreeMap::new();
+    for r in rows {
+        by_nibble
+            .entry(r.0.chars().next().unwrap())
+            .or_default()
+            .push(*r);
+    }
+    for (nibble, mut rows) in by_nibble {
+        rows.sort_by_key(|r| r.0);
+        write_parquet(
+            &root.join(format!("data/census-{nibble}.parquet")),
+            "message census {
+                required binary sha1 (UTF8);
+                required binary md5 (UTF8);
+                required binary identifier (UTF8);
+                required binary filename (UTF8);
+            }",
+            vec![
+                Col::req_str(rows.iter().map(|r| r.0.to_string()).collect()),
+                Col::req_str(rows.iter().map(|r| r.1.to_string()).collect()),
+                Col::req_str(rows.iter().map(|r| r.2.to_string()).collect()),
+                Col::req_str(rows.iter().map(|r| r.3.to_string()).collect()),
+            ],
+        );
+    }
+    let mut pairs: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| (r.1.to_string(), r.0.to_string()))
+        .collect();
+    pairs.sort();
+    write_parquet(
+        &root.join("maps/md5.parquet"),
+        "message map {
+            required binary md5 (UTF8);
+            required binary sha1 (UTF8);
+        }",
+        vec![
+            Col::req_str(pairs.iter().map(|p| p.0.clone()).collect()),
+            Col::req_str(pairs.iter().map(|p| p.1.clone()).collect()),
+        ],
+    );
+    std::fs::write(root.join("revision"), "test-fixture").unwrap();
+}
+
+/// The weak-digest tier: a census row matching the file's sha1 (and
+/// contradicting nothing) renders as "consistent (sha1)" with its
+/// claim URL and counts separately from identified attributions — a
+/// row that co-states a DIFFERENT sha256 alongside the matching sha1
+/// describes other bytes and must stay silent.
+#[test]
+fn scan_weak_digest_consistent_tier() {
+    let env = TestEnv::new("weaktier");
+    // Filenames are stored percent-encoded, as in the real dump.
+    install_census_dataset(
+        &env,
+        &[(
+            FOX_SHA1,
+            FOX_MD5,
+            "fox-item.2016",
+            "the%20fox%20%281%29%20%23video.mkv",
+        )],
+    );
+    // A poisoned witness: matches fox's sha1 but claims different
+    // sha256 bytes — the SHAttered shape, must not surface at all.
+    install_fatcat_dataset(&env, &[(FOX_SHA1, &"7".repeat(64), &"6".repeat(32))]);
+    env.write("fox.txt", b"the quick brown fox jumps over the lazy dog\n");
+
+    let out = env.hdx(&["scan", env.work().to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("consistent (sha1): Internet Archive item fox-item.2016"),
+        "no consistent-tier line:\n{text}"
+    );
+    // Statement decodes the stored name; the URL keeps it verbatim.
+    assert!(
+        text.contains("held these bytes as the fox (1) #video.mkv"),
+        "statement not decoded:\n{text}"
+    );
+    assert!(
+        text.contains("archive.org/download/fox-item.2016/the%20fox%20%281%29%20%23video.mkv"),
+        "claim URL missing/re-encoded:\n{text}"
+    );
+    assert!(
+        text.contains("1 consistent (weak digests only)"),
+        "summary split missing:\n{text}"
+    );
+    assert!(
+        !text.contains("fatcat") && !text.contains("scholarly"),
+        "sha256-contradicted row surfaced:\n{text}"
+    );
+
+    // JSON: the tier is machine-readable and distinct from resolved.
+    let out = env.hdx(&["scan", env.work().to_str().unwrap(), "--json"]);
+    let text = stdout(&out);
+    let line = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["path"].as_str().is_some_and(|p| p.ends_with("fox.txt")))
+        .expect("no per-file line for fox.txt");
+    assert_eq!(line["consistent"][0]["backend"], "ia-census");
+    assert_eq!(line["consistent"][0]["via"][0], "sha1");
+    assert_eq!(line["resolved"].as_array().map(Vec::len), Some(0));
+    let summary = scan_summary(&out);
+    assert_eq!(summary["consistent"], 1);
+    assert_eq!(summary["attributed"], 0);
+    assert_eq!(summary["known"], 1);
+
+    // Direct resolve by sha1 renders the census witness offline, and
+    // the md5 map crosswalks to the same row.
+    for hash in [format!("sha1:{FOX_SHA1}"), format!("md5:{FOX_MD5}")] {
+        let out = env.hdx(&["--offline", &hash]);
+        assert!(out.status.success(), "offline miss for {hash}");
+        let text = stdout(&out);
+        assert!(
+            text.contains("Internet Archive item fox-item.2016"),
+            "census witness missing for {hash}:\n{text}"
+        );
+    }
+}
+
 /// Naming a file directly must produce its per-file verdict even when
 /// the only evidence is filter membership (no claims yet): a two-file
 /// scan that prints nothing reads as "scan doesn't know these" when it

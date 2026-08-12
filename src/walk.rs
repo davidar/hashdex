@@ -49,16 +49,18 @@ pub struct WalkResult {
 
 /// Fixpoint lookup: query local sources (a closure over whatever
 /// datasets are pulled), follow co-observed coordinates, repeat until
-/// nothing new (or caps).
+/// nothing new (or caps). Multiple seeds let scan start from every
+/// digest it minted for a file (sha256 AND sha1) — weak-keyed sources
+/// are only reachable through the weak seed.
 pub fn walk(
-    queried: &Coord,
+    seeds: &[Coord],
     local: &dyn Fn(&Coord) -> Vec<Finding>,
     cache: Option<&Cache>,
 ) -> Vec<Evidence> {
     let mut evidence: Vec<Evidence> = Vec::new();
     let mut seen_findings: HashSet<String> = HashSet::new();
     let mut visited: HashSet<Coord> = HashSet::new();
-    let mut frontier = vec![queried.clone()];
+    let mut frontier = seeds.to_vec();
 
     for _ in 0..MAX_HOPS {
         if frontier.is_empty() || evidence.len() >= MAX_EVIDENCE {
