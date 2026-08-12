@@ -92,19 +92,19 @@ pub async fn peek(
         let mut probe_order: Vec<&NamedFilter> = filters.iter().collect();
         probe_order.sort_by_key(|f| f.bytes);
         let pool = Pool::new(probe_order, &ticker, threads);
-        let (trunc, discarded) = std::thread::scope(|scope| {
+        let (trunc, dead) = std::thread::scope(|scope| {
             for _ in 0..threads {
                 scope.spawn(|| pool.worker());
             }
-            let mut walk = Walk {
+            let walk = Walk {
                 pool: &pool,
-                slots: 0,
-                truncated: false,
-                conservative: false,
-                discarded: Vec::new(),
+                truncated: std::sync::atomic::AtomicBool::new(false),
+                dead: std::sync::Mutex::new(Vec::new()),
+                threads,
             };
             let r = View::of_file(root).and_then(|view| {
-                walk.process_ranged(view, root.display().to_string(), &name, 0, None)
+                let mut ctx = crate::peek_walk::Ctx::default();
+                walk.process_ranged(view, root.display().to_string(), &name, 0, None, &mut ctx)
             });
             if r.is_ok() {
                 // Only a complete descent closed every member; an
@@ -112,17 +112,14 @@ pub async fn peek(
                 pool.wait_idle();
             }
             pool.close();
-            r.map(|()| (walk.truncated, walk.discarded))
+            r.map(|()| (walk.truncated.into_inner(), walk.dead.into_inner().unwrap()))
         })?;
         truncated |= trunc;
         let mut sealed = pool.members.into_inner().unwrap();
-        // Subtrees abandoned by conservative retries: straggler seals
-        // may have landed in these slots after the discard — clear
-        // them now that the workers have joined.
-        for range in discarded {
-            for slot in range {
-                sealed[slot] = None;
-            }
+        // Members sealed into abandoned subtrees (conservative
+        // retries): drop them now that the workers have joined.
+        for slot in dead {
+            sealed[slot] = None;
         }
         // Parent pointers are pool-local slots; renumber them into the
         // combined table as the surviving members move over. A
@@ -280,22 +277,27 @@ pub async fn peek(
     }
 
     // Output order is the tree's: children lists rebuilt from the
-    // parent pointers (per-parent order is allocation order — any one
-    // container is walked by a single thread), depth-first from the
-    // roots. Nothing here depends on the member table's own order.
+    // parent pointers, ordered by ord (allocation order within any
+    // one container's walking thread; a retried member inherits its
+    // predecessor's ord), depth-first from the roots. Nothing here
+    // depends on the member table's own order.
     let order: Vec<usize> = {
         let mut kids: Vec<Vec<usize>> = vec![Vec::new(); rendered.len()];
-        let mut stack: Vec<usize> = Vec::new();
-        for (i, (m, ..)) in rendered.iter().enumerate().rev() {
+        let mut roots_idx: Vec<usize> = Vec::new();
+        for (i, (m, ..)) in rendered.iter().enumerate() {
             match m.parent {
                 Some(p) => kids[p].push(i),
-                None => stack.push(i),
+                None => roots_idx.push(i),
             }
         }
+        for k in &mut kids {
+            k.sort_by_key(|&i| rendered[i].0.ord);
+        }
         let mut order = Vec::with_capacity(rendered.len());
+        let mut stack: Vec<usize> = roots_idx.into_iter().rev().collect();
         while let Some(i) = stack.pop() {
             order.push(i);
-            stack.extend(std::mem::take(&mut kids[i]));
+            stack.extend(std::mem::take(&mut kids[i]).into_iter().rev());
         }
         order
     };

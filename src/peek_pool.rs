@@ -80,6 +80,12 @@ pub struct Member {
     /// nothing downstream depends on the slot order of the member
     /// table.
     pub parent: Option<usize>,
+    /// Position among siblings. Normally the member's own slot (any
+    /// one container is walked by a single thread, so slot order is
+    /// walk order); a member re-created by a conservative retry
+    /// inherits the ord of the member it replaces, keeping its place
+    /// among siblings that survived.
+    pub ord: usize,
     pub kind: &'static str,
     pub size: u64,
     pub digests: Digests,
@@ -163,6 +169,9 @@ struct Meta {
     path: String,
     depth: usize,
     parent: Option<usize>,
+    ord: usize,
+    /// Set at meta close — a member can be allocated (to fix its
+    /// place among siblings) before its head bytes are readable.
     kind: &'static str,
     children: usize,
     note: Option<String>,
@@ -224,6 +233,7 @@ impl Build {
             path: meta.path,
             depth: meta.depth,
             parent: meta.parent,
+            ord: meta.ord,
             kind: meta.kind,
             size,
             digests,
@@ -315,18 +325,22 @@ impl MetaClose {
         self.build.slot
     }
 
-    pub(crate) fn close(self, pool: &Pool, children: usize, note: Option<String>) {
+    pub(crate) fn close(
+        self,
+        pool: &Pool,
+        kind: &'static str,
+        children: usize,
+        note: Option<String>,
+    ) {
         {
             let mut meta = self.build.meta.lock().unwrap();
             let m = meta.as_mut().expect("meta closed twice");
+            m.kind = kind;
             m.children = children;
         }
         if let Some(n) = note {
             self.build.add_note(n);
         }
-        // The dead-member arithmetic (see `discard`) counts a member
-        // as sure-to-seal exactly when its meta was closed.
-        pool.metas_closed.fetch_add(1, Ordering::AcqRel);
         self.build.finish_part(pool);
     }
 }
@@ -354,16 +368,6 @@ pub(crate) struct Pool<'f> {
     pub(crate) members: Mutex<Vec<Option<Member>>>,
     created: AtomicUsize,
     sealed: AtomicUsize,
-    /// Metadata closes, incremented by `MetaClose::close`. A member
-    /// whose meta closed always seals eventually (its feed is closed
-    /// by the walker or a read task); one whose meta was dropped in
-    /// an unwind never will. The walker differences this against
-    /// `created` to count the dead exactly.
-    metas_closed: AtomicUsize,
-    /// Members abandoned by a conservative retry whose handles were
-    /// dropped un-closed — they will never seal, and wait_idle must
-    /// not hold out for them.
-    dead: AtomicUsize,
     idle_m: Mutex<()>,
     idle_cv: Condvar,
     probe_order: Vec<&'f NamedFilter>,
@@ -387,8 +391,6 @@ impl<'f> Pool<'f> {
             members: Mutex::new(Vec::new()),
             created: AtomicUsize::new(0),
             sealed: AtomicUsize::new(0),
-            metas_closed: AtomicUsize::new(0),
-            dead: AtomicUsize::new(0),
             idle_m: Mutex::new(()),
             idle_cv: Condvar::new(),
             probe_order,
@@ -396,14 +398,16 @@ impl<'f> Pool<'f> {
         }
     }
 
-    /// Reserve the next member slot and set up its hash jobs.
+    /// Reserve the next member slot and set up its hash jobs. `ord`
+    /// defaults to the slot itself; a conservative retry passes the
+    /// replaced member's ord instead.
     pub(crate) fn member(
         &self,
         path: String,
         depth: usize,
         parent: Option<usize>,
-        kind: &'static str,
         len: Option<u64>,
+        ord: Option<usize>,
     ) -> (MetaClose, Feed) {
         let slot = {
             let mut m = self.members.lock().unwrap();
@@ -430,7 +434,8 @@ impl<'f> Pool<'f> {
                 path,
                 depth,
                 parent,
-                kind,
+                ord: ord.unwrap_or(slot),
+                kind: "file",
                 children: 0,
                 note: None,
             })),
@@ -592,31 +597,20 @@ impl<'f> Pool<'f> {
         feed.close(self);
     }
 
-    /// Metadata closes so far — captured by the walker before a
-    /// subtree so a retry can compute the exact number of abandoned
-    /// members afterwards.
-    pub(crate) fn metas_closed(&self) -> usize {
-        self.metas_closed.load(Ordering::Acquire)
+    /// Members created so far — the walker's MAX_MEMBERS check.
+    pub(crate) fn created(&self) -> usize {
+        self.created.load(Ordering::Acquire)
     }
 
-    /// Members that will never seal (their handles were dropped
-    /// un-closed in a retry unwind). The count must be EXACT — an
-    /// overestimate would let `wait_idle` return while genuine
-    /// members' read tasks are still in flight, and closing the pool
-    /// cancels reads.
-    pub(crate) fn add_dead(&self, n: usize) {
-        self.dead.fetch_add(n, Ordering::AcqRel);
-        let _g = self.idle_m.lock().unwrap();
-        self.idle_cv.notify_all();
-    }
-
-    /// Block until every member that still can seal has sealed. Only
-    /// call after the descent returned (nothing is being created).
+    /// Block until every member has sealed. Every member always
+    /// seals: the walker closes both handles even on the error paths
+    /// (a member abandoned by a conservative retry seals with partial
+    /// digests and is dropped from the table afterwards). Only call
+    /// after the descent returned (nothing is being created).
     pub(crate) fn wait_idle(&self) {
         let mut g = self.idle_m.lock().unwrap();
         loop {
-            let expected = self.created.load(Ordering::Acquire) - self.dead.load(Ordering::Acquire);
-            if self.sealed.load(Ordering::Acquire) >= expected {
+            if self.sealed.load(Ordering::Acquire) >= self.created.load(Ordering::Acquire) {
                 return;
             }
             g = self.idle_cv.wait(g).unwrap();

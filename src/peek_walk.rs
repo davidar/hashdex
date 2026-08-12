@@ -13,6 +13,8 @@ use crate::peek_pool::{Feed, Pool};
 use crate::peek_source::{spool_stream, View};
 use anyhow::{Context, Result};
 use std::io::{BufReader, Read, Seek};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Containers nested deeper than this are hashed but not entered.
 pub(crate) const MAX_DEPTH: usize = 16;
@@ -178,50 +180,88 @@ fn swallow(r: Result<()>, what: &str) -> Result<Option<String>> {
 
 pub(crate) struct Walk<'a, 'f> {
     pub(crate) pool: &'a Pool<'f>,
-    /// Member slots allocated (the walker is the only allocator).
-    pub(crate) slots: usize,
-    pub(crate) truncated: bool,
-    /// Spool stream-fed zips instead of walking them speculatively —
-    /// set for the scope of a subtree being redone after a
-    /// `RetryConservative`.
-    pub(crate) conservative: bool,
-    /// Slot ranges abandoned by conservative retries; cleared from the
-    /// member table after the pool drains.
-    pub(crate) discarded: Vec<std::ops::Range<usize>>,
+    pub(crate) truncated: AtomicBool,
+    /// Slots whose members sealed but belong to abandoned subtrees
+    /// (conservative retries, batches cut short by an error); cleared
+    /// from the member table after the pool drains.
+    pub(crate) dead: Mutex<Vec<usize>>,
+    /// Worker count for parallel container descent (squashfs).
+    pub(crate) threads: usize,
+}
+
+/// Per-descent state, owned by whichever thread walks the subtree:
+/// the conservative flag (spool stream zips instead of walking them
+/// speculatively — set while redoing a subtree after a
+/// `RetryConservative`) and the slots allocated by the current retry
+/// boundary's attempt, so a retry knows exactly what to discard.
+#[derive(Default)]
+pub(crate) struct Ctx {
+    conservative: bool,
+    slots: Vec<usize>,
 }
 
 impl Walk<'_, '_> {
     /// Hash and descend a member whose bytes only flow forward.
     /// `len` is the member's size when the enclosing format states it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn process_stream(
-        &mut self,
+        &self,
         r: &mut dyn Read,
         len: Option<u64>,
         path: String,
         name: &str,
         depth: usize,
         parent: Option<usize>,
+        ctx: &mut Ctx,
     ) -> Result<()> {
-        if self.slots >= MAX_MEMBERS {
-            self.truncated = true;
+        if self.pool.created() >= MAX_MEMBERS {
+            self.truncated.store(true, Ordering::Relaxed);
             drain(r);
             return Ok(());
         }
+        let (meta, feed) = self.pool.member(path.clone(), depth, parent, len, None);
+        ctx.slots.push(meta.slot());
+        self.run_member(r, meta, feed, path, name, depth, ctx)
+    }
+
+    /// Hash and descend a member whose handles are already allocated
+    /// (the squashfs walker allocates a whole batch up front so slot
+    /// order stays sibling order, then workers run the members in
+    /// parallel). Both handles are closed before returning, error or
+    /// not — every member seals, and a subtree abandoned by a retry
+    /// is dropped from the member table by slot instead of being left
+    /// half-open.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_member(
+        &self,
+        r: &mut dyn Read,
+        meta: crate::peek_pool::MetaClose,
+        mut feed: Feed,
+        path: String,
+        name: &str,
+        depth: usize,
+        ctx: &mut Ctx,
+    ) -> Result<()> {
+        let pool = self.pool;
+        let own = meta.slot();
         let mut head = vec![0u8; HEAD];
         let mut got = 0;
-        while got < HEAD {
-            let n = r.read(&mut head[got..])?;
-            if n == 0 {
+        loop {
+            if got >= HEAD {
                 break;
             }
-            got += n;
+            match r.read(&mut head[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(e) => {
+                    feed.close(pool);
+                    meta.close(pool, Kind::Plain.label(), 0, None);
+                    return Err(e.into());
+                }
+            }
         }
         head.truncate(got);
         let kind = sniff(&head, name);
-        self.slots += 1;
-        let pool = self.pool;
-        let (meta, mut feed) = pool.member(path.clone(), depth, parent, kind.label(), len);
-        let own = meta.slot();
 
         let too_deep = depth >= MAX_DEPTH && !matches!(kind, Kind::Plain | Kind::SevenZ);
 
@@ -229,14 +269,28 @@ impl Walk<'_, '_> {
         // spool then descends exactly like a ranged member, so their
         // children can be views over the spool.
         let spools =
-            matches!(kind, Kind::SquashFs | Kind::Iso) || (kind == Kind::Zip && self.conservative);
+            matches!(kind, Kind::SquashFs | Kind::Iso) || (kind == Kind::Zip && ctx.conservative);
         if !too_deep && spools {
             let mut src = std::io::Cursor::new(head).chain(r);
-            let view = spool_stream(&mut src, |b| feed.push(pool, b))?;
+            let view = match spool_stream(&mut src, |b| feed.push(pool, b)) {
+                Ok(v) => v,
+                Err(e) => {
+                    feed.close(pool);
+                    meta.close(pool, kind.label(), 0, None);
+                    return Err(e);
+                }
+            };
             feed.close(pool);
-            let (children, note) = self.descend_retrying(kind, &view, &path, name, depth, own)?;
-            meta.close(pool, children, note);
-            return Ok(());
+            return match self.descend_retrying(kind, &view, &path, name, depth, own, ctx) {
+                Ok((children, note)) => {
+                    meta.close(pool, kind.label(), children, note);
+                    Ok(())
+                }
+                Err(e) => {
+                    meta.close(pool, kind.label(), 0, None);
+                    Err(e)
+                }
+            };
         }
 
         let mut tee = Tee {
@@ -244,27 +298,58 @@ impl Walk<'_, '_> {
             feed,
             pool,
         };
+        let res = if too_deep {
+            drain(&mut tee);
+            Ok((
+                0,
+                Some(format!(
+                    "nested deeper than {MAX_DEPTH} levels — not descended"
+                )),
+            ))
+        } else {
+            self.stream_arms(kind, &mut tee, &path, name, depth, own, ctx)
+        };
+        tee.feed.close(pool);
+        match res {
+            Ok((children, note)) => {
+                meta.close(pool, kind.label(), children, note);
+                Ok(())
+            }
+            Err(e) => {
+                meta.close(pool, kind.label(), 0, None);
+                Err(e)
+            }
+        }
+    }
+
+    /// The container arms of the stream path. Retry markers (and
+    /// genuine child errors) propagate out of here; `run_member`
+    /// closes the member's handles either way.
+    #[allow(clippy::too_many_arguments)]
+    fn stream_arms(
+        &self,
+        kind: Kind,
+        tee: &mut Tee<'_, '_, '_>,
+        path: &str,
+        name: &str,
+        depth: usize,
+        own: usize,
+        ctx: &mut Ctx,
+    ) -> Result<(usize, Option<String>)> {
         let mut note = None;
         let mut children = 0usize;
 
         match kind {
-            Kind::Plain => drain(&mut tee),
-            // The cap must outrank every container arm below.
-            _ if too_deep => {
-                note = Some(format!(
-                    "nested deeper than {MAX_DEPTH} levels — not descended"
-                ));
-                drain(&mut tee);
-            }
+            Kind::Plain => drain(&mut *tee),
             Kind::SevenZ => {
                 note = Some(format!(
                     "{} recognized — descending into it is not supported yet",
                     kind.label()
                 ));
-                drain(&mut tee);
+                drain(&mut *tee);
             }
             Kind::Gzip => {
-                let mut dec = flate2::read::MultiGzDecoder::new(tee);
+                let mut dec = flate2::read::MultiGzDecoder::new(&mut *tee);
                 let child = unwrapped_name(name, kind);
                 let r = self.process_stream(
                     &mut dec,
@@ -273,14 +358,15 @@ impl Walk<'_, '_> {
                     &child,
                     depth + 1,
                     Some(own),
+                    ctx,
                 );
                 children = 1;
-                tee = dec.into_inner();
+                drop(dec);
                 note = swallow(r, "decompression stopped")?;
-                drain(&mut tee);
+                drain(&mut *tee);
             }
             Kind::Xz => {
-                let mut dec = liblzma::read::XzDecoder::new_multi_decoder(tee);
+                let mut dec = liblzma::read::XzDecoder::new_multi_decoder(&mut *tee);
                 let child = unwrapped_name(name, kind);
                 let r = self.process_stream(
                     &mut dec,
@@ -289,14 +375,15 @@ impl Walk<'_, '_> {
                     &child,
                     depth + 1,
                     Some(own),
+                    ctx,
                 );
                 children = 1;
-                tee = dec.into_inner();
+                drop(dec);
                 note = swallow(r, "decompression stopped")?;
-                drain(&mut tee);
+                drain(&mut *tee);
             }
             Kind::Zstd => {
-                let mut dec = zstd::stream::read::Decoder::new(tee)?;
+                let mut dec = zstd::stream::read::Decoder::new(&mut *tee)?;
                 let child = unwrapped_name(name, kind);
                 let r = self.process_stream(
                     &mut dec,
@@ -305,14 +392,15 @@ impl Walk<'_, '_> {
                     &child,
                     depth + 1,
                     Some(own),
+                    ctx,
                 );
                 children = 1;
-                tee = dec.finish().into_inner();
+                drop(dec);
                 note = swallow(r, "decompression stopped")?;
-                drain(&mut tee);
+                drain(&mut *tee);
             }
             Kind::Bzip2 => {
-                let mut dec = bzip2::read::MultiBzDecoder::new(tee);
+                let mut dec = bzip2::read::MultiBzDecoder::new(&mut *tee);
                 let child = unwrapped_name(name, kind);
                 let r = self.process_stream(
                     &mut dec,
@@ -321,14 +409,15 @@ impl Walk<'_, '_> {
                     &child,
                     depth + 1,
                     Some(own),
+                    ctx,
                 );
                 children = 1;
-                tee = dec.into_inner();
+                drop(dec);
                 note = swallow(r, "decompression stopped")?;
-                drain(&mut tee);
+                drain(&mut *tee);
             }
             Kind::Tar => {
-                let mut archive = tar::Archive::new(tee);
+                let mut archive = tar::Archive::new(&mut *tee);
                 match archive.entries() {
                     Ok(entries) => {
                         for entry in entries {
@@ -358,16 +447,16 @@ impl Walk<'_, '_> {
                                 &leaf,
                                 depth + 1,
                                 Some(own),
+                                ctx,
                             )?;
                         }
                     }
                     Err(e) => note = Some(format!("tar parse failed: {e}")),
                 }
-                tee = archive.into_inner();
-                drain(&mut tee);
+                drain(&mut *tee);
             }
             Kind::Ar => {
-                let mut archive = ar::Archive::new(tee);
+                let mut archive = ar::Archive::new(&mut *tee);
                 while let Some(entry) = archive.next_entry() {
                     let mut entry = match entry {
                         Ok(e) => e,
@@ -388,67 +477,68 @@ impl Walk<'_, '_> {
                         &ename,
                         depth + 1,
                         Some(own),
+                        ctx,
                     )?;
                 }
-                tee = archive.into_inner()?;
-                drain(&mut tee);
+                drop(archive);
+                drain(&mut *tee);
             }
             Kind::Cpio => {
-                match self.cpio_stream(&mut tee, &path, depth, own, &mut children) {
+                match self.cpio_stream(tee, path, depth, own, &mut children, ctx) {
                     Ok(n) => note = n,
                     Err(e) if e.downcast_ref::<RetryConservative>().is_some() => return Err(e),
                     Err(e) => note = Some(format!("cpio walk stopped: {e}")),
                 }
-                drain(&mut tee);
+                drain(&mut *tee);
             }
             Kind::Rpm => {
                 // Lead (96 bytes, magic already sniffed) + signature
                 // header (8-aligned) + main header, then the payload —
                 // a compressed cpio the arms above know how to walk.
-                match skip_rpm_headers(&mut tee) {
+                match skip_rpm_headers(&mut *tee) {
                     Ok(()) => {
                         children = 1;
                         self.process_stream(
-                            &mut tee,
+                            &mut *tee,
                             None,
                             format!("{path}!payload"),
                             "payload",
                             depth + 1,
                             Some(own),
+                            ctx,
                         )?;
                     }
                     Err(e) => note = Some(format!("rpm header parse failed: {e}")),
                 }
-                drain(&mut tee);
+                drain(&mut *tee);
             }
             Kind::Zip => {
                 // Optimistic streaming walk over the local headers,
                 // reconciled against the central directory at the end.
-                let (n, walk_note) = self.zip_speculative(&mut tee, &path, depth, own)?;
+                let (n, walk_note) = self.zip_speculative(tee, path, depth, own, ctx)?;
                 children = n;
                 note = walk_note;
-                drain(&mut tee);
+                drain(&mut *tee);
             }
             Kind::SquashFs | Kind::Iso => unreachable!("handled by the spool path above"),
         }
 
-        tee.feed.close(pool);
-        meta.close(pool, children, note);
-        Ok(())
+        Ok((children, note))
     }
 
     /// Hash and descend a member backed by seekable bytes: the pool
     /// reads and hashes the extents while the walker descends.
     pub(crate) fn process_ranged(
-        &mut self,
+        &self,
         view: View,
         path: String,
         name: &str,
         depth: usize,
         parent: Option<usize>,
+        ctx: &mut Ctx,
     ) -> Result<()> {
-        if self.slots >= MAX_MEMBERS {
-            self.truncated = true;
+        if self.pool.created() >= MAX_MEMBERS {
+            self.truncated.store(true, Ordering::Relaxed);
             return Ok(());
         }
         let mut head = vec![0u8; HEAD];
@@ -463,25 +553,33 @@ impl Walk<'_, '_> {
                 kind = Kind::Iso;
             }
         }
-        self.slots += 1;
         let pool = self.pool;
-        let (meta, feed) = pool.member(path.clone(), depth, parent, kind.label(), Some(view.len()));
+        let (meta, feed) = pool.member(path.clone(), depth, parent, Some(view.len()), None);
+        ctx.slots.push(meta.slot());
         let own = meta.slot();
         pool.read_task(view.clone(), feed);
 
         let too_deep = depth >= MAX_DEPTH && !matches!(kind, Kind::Plain | Kind::SevenZ);
-        let (children, note) = if too_deep {
-            (
+        let res = if too_deep {
+            Ok((
                 0,
                 Some(format!(
                     "nested deeper than {MAX_DEPTH} levels — not descended"
                 )),
-            )
+            ))
         } else {
-            self.descend_retrying(kind, &view, &path, name, depth, own)?
+            self.descend_retrying(kind, &view, &path, name, depth, own, ctx)
         };
-        meta.close(pool, children, note);
-        Ok(())
+        match res {
+            Ok((children, note)) => {
+                meta.close(pool, kind.label(), children, note);
+                Ok(())
+            }
+            Err(e) => {
+                meta.close(pool, kind.label(), 0, None);
+                Err(e)
+            }
+        }
     }
 
     /// Descend a seekable member, and — because its view can be
@@ -489,58 +587,53 @@ impl Walk<'_, '_> {
     /// somewhere below turned out misbehaved, discard just this
     /// subtree and redo it conservatively instead of letting the
     /// error unwind any further.
+    #[allow(clippy::too_many_arguments)]
     fn descend_retrying(
-        &mut self,
+        &self,
         kind: Kind,
         view: &View,
         path: &str,
         name: &str,
         depth: usize,
         own: usize,
+        ctx: &mut Ctx,
     ) -> Result<(usize, Option<String>)> {
-        let start = self.slots;
-        let metas = self.pool.metas_closed();
-        match self.descend_seekable(kind, view, path, name, depth, own) {
-            Err(e) if is_retry(&e) && !self.conservative => {
+        let start = ctx.slots.len();
+        match self.descend_seekable(kind, view, path, name, depth, own, ctx) {
+            Err(e) if is_retry(&e) && !ctx.conservative => {
                 eprintln!("note: {e}; re-reading {path} with spooling");
-                self.discard(start, metas);
-                self.conservative = true;
-                let redo = self.descend_seekable(kind, view, path, name, depth, own);
-                self.conservative = false;
+                self.discard(ctx, start);
+                ctx.conservative = true;
+                let redo = self.descend_seekable(kind, view, path, name, depth, own, ctx);
+                ctx.conservative = false;
                 redo
             }
             r => r,
         }
     }
 
-    /// The slots allocated since `start` belong to an abandoned
-    /// subtree: remember them for clearing, and tell the pool exactly
-    /// how many will never seal — the members whose metadata was never
-    /// closed (every meta close between the captured count and now was
-    /// a member of this subtree, because the walker is single-threaded
-    /// and was only ever inside it). The count must be exact: too high
-    /// and wait_idle abandons live read tasks, too low and it hangs.
-    fn discard(&mut self, start: usize, metas_at_start: usize) {
-        if start < self.slots {
-            let created = self.slots - start;
-            let closed = self.pool.metas_closed() - metas_at_start;
-            self.pool.add_dead(created - closed);
-            self.discarded.push(start..self.slots);
-        }
+    /// The slots recorded since `start` belong to an abandoned
+    /// subtree. Their members still seal — handles are closed on
+    /// every path — so nothing here needs counting; marking the slots
+    /// dead just drops them from the member table afterwards.
+    fn discard(&self, ctx: &mut Ctx, start: usize) {
+        self.dead.lock().unwrap().extend(ctx.slots.drain(start..));
     }
 
     /// Walk the inside of a seekable container (a ranged member or a
     /// fresh spool). Children of uncompressed formats become views —
     /// ranges of the same underlying source; only decompressed data
     /// flows as streams.
+    #[allow(clippy::too_many_arguments)]
     fn descend_seekable(
-        &mut self,
+        &self,
         kind: Kind,
         view: &View,
         path: &str,
         name: &str,
         depth: usize,
         own: usize,
+        ctx: &mut Ctx,
     ) -> Result<(usize, Option<String>)> {
         let mut children = 0usize;
         let note = match kind {
@@ -560,6 +653,7 @@ impl Walk<'_, '_> {
                     &child,
                     depth + 1,
                     Some(own),
+                    ctx,
                 );
                 swallow(r, "decompression stopped")?
             }
@@ -575,6 +669,7 @@ impl Walk<'_, '_> {
                     &child,
                     depth + 1,
                     Some(own),
+                    ctx,
                 );
                 swallow(r, "decompression stopped")?
             }
@@ -589,6 +684,7 @@ impl Walk<'_, '_> {
                     &child,
                     depth + 1,
                     Some(own),
+                    ctx,
                 );
                 swallow(r, "decompression stopped")?
             }
@@ -603,10 +699,11 @@ impl Walk<'_, '_> {
                     &child,
                     depth + 1,
                     Some(own),
+                    ctx,
                 );
                 swallow(r, "decompression stopped")?
             }
-            Kind::Tar => self.tar_ranged(view, path, depth, own, &mut children)?,
+            Kind::Tar => self.tar_ranged(view, path, depth, own, &mut children, ctx)?,
             Kind::Ar => {
                 let mut note = None;
                 let mut archive = ar::Archive::new(BufReader::new(view.rewound()));
@@ -630,11 +727,12 @@ impl Walk<'_, '_> {
                         &ename,
                         depth + 1,
                         Some(own),
+                        ctx,
                     )?;
                 }
                 note
             }
-            Kind::Cpio => match self.cpio_ranged(view, path, depth, own, &mut children) {
+            Kind::Cpio => match self.cpio_ranged(view, path, depth, own, &mut children, ctx) {
                 Ok(n) => n,
                 Err(e) if e.downcast_ref::<RetryConservative>().is_some() => return Err(e),
                 Err(e) => Some(format!("cpio walk stopped: {e}")),
@@ -652,6 +750,7 @@ impl Walk<'_, '_> {
                             "payload",
                             depth + 1,
                             Some(own),
+                            ctx,
                         )?;
                         None
                     }
@@ -659,15 +758,15 @@ impl Walk<'_, '_> {
                 }
             }
             Kind::Zip => swallow(
-                self.zip_ranged(view, path, depth, own, &mut children),
+                self.zip_ranged(view, path, depth, own, &mut children, ctx),
                 "zip parse failed",
             )?,
             Kind::SquashFs => swallow(
-                self.squashfs_ranged(view, path, depth, own, &mut children),
+                self.squashfs_ranged(view, path, depth, own, &mut children, ctx),
                 "squashfs parse failed",
             )?,
             Kind::Iso => swallow(
-                self.iso_ranged(view, path, depth, own, &mut children),
+                self.iso_ranged(view, path, depth, own, &mut children, ctx),
                 "iso9660 parse failed",
             )?,
         };
@@ -676,13 +775,15 @@ impl Walk<'_, '_> {
 
     // ------------------------------------------------------------ tar
 
+    #[allow(clippy::too_many_arguments)]
     fn tar_ranged(
-        &mut self,
+        &self,
         view: &View,
         path: &str,
         depth: usize,
         own: usize,
         children: &mut usize,
+        ctx: &mut Ctx,
     ) -> Result<Option<String>> {
         let mut note = None;
         let mut archive = tar::Archive::new(BufReader::with_capacity(64 << 10, view.rewound()));
@@ -726,6 +827,7 @@ impl Walk<'_, '_> {
                             &leaf,
                             depth + 1,
                             Some(own),
+                            ctx,
                         )?;
                     } else {
                         let pos = entry.raw_file_position();
@@ -736,6 +838,7 @@ impl Walk<'_, '_> {
                             &leaf,
                             depth + 1,
                             Some(own),
+                            ctx,
                         )?;
                     }
                 }
@@ -749,13 +852,15 @@ impl Walk<'_, '_> {
 
     /// Seekable zip: the central directory is the truth, walk it
     /// directly. Stored entries become views; compressed ones stream.
+    #[allow(clippy::too_many_arguments)]
     fn zip_ranged(
-        &mut self,
+        &self,
         view: &View,
         path: &str,
         depth: usize,
         own: usize,
         children: &mut usize,
+        ctx: &mut Ctx,
     ) -> Result<()> {
         let pool = self.pool;
         let mut za = zip::ZipArchive::new(view.rewound())?;
@@ -769,19 +874,24 @@ impl Walk<'_, '_> {
                 // Encrypted or unsupported-method entries: name them,
                 // keep going.
                 Err(e) => {
-                    if self.slots < MAX_MEMBERS {
-                        self.slots += 1;
+                    if pool.created() < MAX_MEMBERS {
                         let (meta, feed) = pool.member(
                             format!("{path}!{index_name}"),
                             depth + 1,
                             Some(own),
-                            Kind::Plain.label(),
                             Some(0),
+                            None,
                         );
+                        ctx.slots.push(meta.slot());
                         feed.close(pool);
-                        meta.close(pool, 0, Some(format!("unreadable zip member: {e}")));
+                        meta.close(
+                            pool,
+                            Kind::Plain.label(),
+                            0,
+                            Some(format!("unreadable zip member: {e}")),
+                        );
                     } else {
-                        self.truncated = true;
+                        self.truncated.store(true, Ordering::Relaxed);
                     }
                     continue;
                 }
@@ -807,6 +917,7 @@ impl Walk<'_, '_> {
                         &leaf,
                         depth + 1,
                         Some(own),
+                        ctx,
                     )?;
                 }
                 None => {
@@ -817,6 +928,7 @@ impl Walk<'_, '_> {
                         &leaf,
                         depth + 1,
                         Some(own),
+                        ctx,
                     )?;
                 }
             }
@@ -830,11 +942,12 @@ impl Walk<'_, '_> {
     /// any disagreement or stream-walk failure aborts the whole
     /// descent with `RetryConservative`.
     fn zip_speculative(
-        &mut self,
+        &self,
         tee: &mut Tee<'_, '_, '_>,
         path: &str,
         depth: usize,
         own: usize,
+        ctx: &mut Ctx,
     ) -> Result<(usize, Option<String>)> {
         let mut children = 0usize;
         let mut streamed: Vec<(String, u32)> = Vec::new();
@@ -858,6 +971,7 @@ impl Walk<'_, '_> {
                             &leaf,
                             depth + 1,
                             Some(own),
+                            ctx,
                         )?;
                     }
                     // zf's Drop advances the stream past the entry.
@@ -883,13 +997,15 @@ impl Walk<'_, '_> {
 
     // ----------------------------------------------------------- cpio
 
+    #[allow(clippy::too_many_arguments)]
     fn cpio_stream(
-        &mut self,
+        &self,
         r: &mut Tee<'_, '_, '_>,
         path: &str,
         depth: usize,
         own: usize,
         children: &mut usize,
+        ctx: &mut Ctx,
     ) -> Result<Option<String>> {
         loop {
             let mut hdr = [0u8; 110];
@@ -915,6 +1031,7 @@ impl Walk<'_, '_> {
                     &leaf,
                     depth + 1,
                     Some(own),
+                    ctx,
                 )?;
                 drain(&mut data);
             } else {
@@ -924,13 +1041,15 @@ impl Walk<'_, '_> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn cpio_ranged(
-        &mut self,
+        &self,
         view: &View,
         path: &str,
         depth: usize,
         own: usize,
         children: &mut usize,
+        ctx: &mut Ctx,
     ) -> Result<Option<String>> {
         let mut pos = 0u64;
         loop {
@@ -962,7 +1081,14 @@ impl Walk<'_, '_> {
                 *children += 1;
                 let leaf = name.rsplit('/').next().unwrap_or(&name).to_string();
                 let sub = view.slice(&[(data_off, filesize)]);
-                self.process_ranged(sub, format!("{path}!{name}"), &leaf, depth + 1, Some(own))?;
+                self.process_ranged(
+                    sub,
+                    format!("{path}!{name}"),
+                    &leaf,
+                    depth + 1,
+                    Some(own),
+                    ctx,
+                )?;
             }
             pos = data_off + filesize + data_pad;
         }
@@ -970,19 +1096,39 @@ impl Walk<'_, '_> {
 
     // ------------------------------------------------------- squashfs
 
+    /// Squashfs members are walked by a worker team: the walker
+    /// enumerates the files and allocates their member slots in
+    /// order (slot order stays sibling order), then workers
+    /// decompress, hash, sniff and descend whole files in parallel —
+    /// the reader's internals are lock-protected (a Mutex around the
+    /// raw byte source, held only per block read; decompression runs
+    /// outside it).
+    #[allow(clippy::too_many_arguments)]
     fn squashfs_ranged(
-        &mut self,
+        &self,
         view: &View,
         path: &str,
         depth: usize,
         own: usize,
         children: &mut usize,
+        ctx: &mut Ctx,
     ) -> Result<()> {
+        struct Item<'i> {
+            meta: crate::peek_pool::MetaClose,
+            feed: Feed,
+            file: &'i backhand::SquashfsFileReader,
+            path: String,
+            leaf: String,
+            size: u64,
+        }
         let mut done = 0usize;
         loop {
             // Rebuilding the reader is how the fragment cache gets
             // dropped: backhand keeps every decompressed fragment
-            // block for the reader's lifetime.
+            // block for the reader's lifetime. One reader serves one
+            // batch, capped by fragment-backed bytes; the batch
+            // barrier below is also what lets the reader be rebuilt
+            // safely.
             let fs = backhand::FilesystemReader::from_reader(BufReader::with_capacity(
                 1 << 20,
                 view.rewound(),
@@ -992,61 +1138,137 @@ impl Walk<'_, '_> {
                 .filter(|n| matches!(&n.inner, backhand::InnerNode::File(_)))
                 .collect();
             let total = files.len();
+            let mut end = done;
             let mut frag_bytes = 0u64;
-            let mut rebuild = false;
-            for node in files.into_iter().skip(done) {
+            while end < total && frag_bytes < SQUASHFS_FRAG_CAP {
+                if let backhand::InnerNode::File(f) = &files[end].inner {
+                    if f.frag_index() != 0xffff_ffff {
+                        frag_bytes += f.file_len() as u64;
+                    }
+                }
+                end += 1;
+            }
+            let mut batch: Vec<Mutex<Option<Item>>> = Vec::with_capacity(end - done);
+            for node in &files[done..end] {
                 let backhand::InnerNode::File(f) = &node.inner else {
                     continue;
                 };
-                done += 1;
+                if self.pool.created() >= MAX_MEMBERS {
+                    self.truncated.store(true, Ordering::Relaxed);
+                    break;
+                }
                 let size = f.file_len() as u64;
                 let full = node.fullpath.to_string_lossy();
                 let name = full.trim_start_matches('/');
                 *children += 1;
                 let leaf = name.rsplit('/').next().unwrap_or(name).to_string();
                 let child_path = format!("{path}!{name}");
-                let start = self.slots;
-                let metas = self.pool.metas_closed();
-                let mut reader = backhand::FilesystemReaderFile::new(&fs, f).reader();
-                let r = self.process_stream(
-                    &mut reader,
-                    Some(size),
-                    child_path.clone(),
-                    &leaf,
-                    depth + 1,
-                    Some(own),
-                );
-                match r {
-                    // A squashfs file is re-derivable on its own — a
-                    // misbehaved zip inside it costs one file redone,
-                    // not the whole image.
-                    Err(e) if is_retry(&e) && !self.conservative => {
-                        eprintln!("note: {e}; re-reading {child_path} with spooling");
-                        self.discard(start, metas);
-                        self.conservative = true;
-                        let mut again = backhand::FilesystemReaderFile::new(&fs, f).reader();
-                        let redo = self.process_stream(
-                            &mut again,
-                            Some(size),
-                            child_path,
-                            &leaf,
-                            depth + 1,
-                            Some(own),
-                        );
-                        self.conservative = false;
-                        redo?;
+                let (meta, feed) =
+                    self.pool
+                        .member(child_path.clone(), depth + 1, Some(own), Some(size), None);
+                batch.push(Mutex::new(Some(Item {
+                    meta,
+                    feed,
+                    file: f,
+                    path: child_path,
+                    leaf,
+                    size,
+                })));
+            }
+            let next = AtomicUsize::new(0);
+            let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+            let batch_slots: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+            let conservative = ctx.conservative;
+            if !batch.is_empty() {
+                std::thread::scope(|scope| {
+                    for _ in 0..self.threads.min(batch.len()) {
+                        scope.spawn(|| loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            if i >= batch.len() || failed.lock().unwrap().is_some() {
+                                break;
+                            }
+                            let item = batch[i].lock().unwrap().take().expect("item taken once");
+                            let slot = item.meta.slot();
+                            let mut wctx = Ctx {
+                                conservative,
+                                slots: vec![slot],
+                            };
+                            let mut reader =
+                                backhand::FilesystemReaderFile::new(&fs, item.file).reader();
+                            let r = self.run_member(
+                                &mut reader,
+                                item.meta,
+                                item.feed,
+                                item.path.clone(),
+                                &item.leaf,
+                                depth + 1,
+                                &mut wctx,
+                            );
+                            let r = match r {
+                                // A squashfs file is re-derivable on its
+                                // own — a misbehaved zip inside it costs
+                                // one file redone, not the whole image.
+                                // The redo member inherits the ord of the
+                                // one it replaces, keeping its place
+                                // among siblings.
+                                Err(e) if is_retry(&e) && !conservative => {
+                                    eprintln!("note: {e}; re-reading {} with spooling", item.path);
+                                    self.dead.lock().unwrap().append(&mut wctx.slots);
+                                    wctx.conservative = true;
+                                    let (meta, feed) = self.pool.member(
+                                        item.path.clone(),
+                                        depth + 1,
+                                        Some(own),
+                                        Some(item.size),
+                                        Some(slot),
+                                    );
+                                    wctx.slots.push(meta.slot());
+                                    let mut again =
+                                        backhand::FilesystemReaderFile::new(&fs, item.file)
+                                            .reader();
+                                    self.run_member(
+                                        &mut again,
+                                        meta,
+                                        feed,
+                                        item.path,
+                                        &item.leaf,
+                                        depth + 1,
+                                        &mut wctx,
+                                    )
+                                }
+                                r => r,
+                            };
+                            batch_slots.lock().unwrap().append(&mut wctx.slots);
+                            if let Err(e) = r {
+                                let mut f = failed.lock().unwrap();
+                                if f.is_none() {
+                                    *f = Some(e);
+                                }
+                                break;
+                            }
+                        });
                     }
-                    r => r?,
-                }
-                if f.frag_index() != 0xffff_ffff {
-                    frag_bytes += size;
-                }
-                if frag_bytes >= SQUASHFS_FRAG_CAP && done < total {
-                    rebuild = true;
-                    break;
+                });
+            }
+            // Slots this batch allocated belong to the enclosing
+            // retry boundary's attempt like any other descendant's.
+            ctx.slots.append(&mut batch_slots.into_inner().unwrap());
+            // Items never taken (a worker error abandoned the batch):
+            // close their handles so they seal, and drop them from
+            // the member table — they were never examined.
+            for cell in &batch {
+                if let Some(item) = cell.lock().unwrap().take() {
+                    *children -= 1;
+                    self.dead.lock().unwrap().push(item.meta.slot());
+                    item.feed.close(self.pool);
+                    item.meta.close(self.pool, Kind::Plain.label(), 0, None);
                 }
             }
-            if !rebuild {
+            if let Some(e) = failed.into_inner().unwrap() {
+                return Err(e);
+            }
+            done = end;
+            if done >= total || self.truncated.load(Ordering::Relaxed) {
                 return Ok(());
             }
         }
@@ -1060,13 +1282,15 @@ impl Walk<'_, '_> {
     /// extents — which become views, not copies. Names prefer Rock
     /// Ridge NM entries; plain 9660 names get their ";1" version
     /// suffix stripped. Joliet is not read.
+    #[allow(clippy::too_many_arguments)]
     fn iso_ranged(
-        &mut self,
+        &self,
         view: &View,
         path: &str,
         depth: usize,
         own: usize,
         children: &mut usize,
+        ctx: &mut Ctx,
     ) -> Result<()> {
         const SECTOR: u64 = 2048;
         let mut root: Option<(u64, u64)> = None;
@@ -1093,12 +1317,12 @@ impl Walk<'_, '_> {
             }
         }
         let (lba, size) = root.context("no primary volume descriptor")?;
-        self.iso_dir(view, lba, size, path, "", depth, own, children)
+        self.iso_dir(view, lba, size, path, "", depth, own, children, ctx)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn iso_dir(
-        &mut self,
+        &self,
         view: &View,
         lba: u64,
         size: u64,
@@ -1107,6 +1331,7 @@ impl Walk<'_, '_> {
         depth: usize,
         own: usize,
         children: &mut usize,
+        ctx: &mut Ctx,
     ) -> Result<()> {
         anyhow::ensure!(size < 64 << 20, "directory extent implausibly large");
         let mut dir = vec![0u8; size as usize];
@@ -1158,6 +1383,7 @@ impl Walk<'_, '_> {
                 &name,
                 depth + 1,
                 Some(own),
+                ctx,
             )?;
         }
         for (name, sub_lba, sub_size) in dirs {
@@ -1170,6 +1396,7 @@ impl Walk<'_, '_> {
                 depth,
                 own,
                 children,
+                ctx,
             )?;
         }
         Ok(())
