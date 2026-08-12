@@ -194,13 +194,37 @@ pub(crate) struct Walk<'a, 'f> {
 /// speculatively — set while redoing a subtree after a
 /// `RetryConservative`) and the slots allocated by the current retry
 /// boundary's attempt, so a retry knows exactly what to discard.
+/// `count` bounds the members of ONE root descent (shared by every
+/// worker walking the same container tree) — the cap is per descended
+/// container, not per pool, so a multi-million-file disk scan never
+/// trips it.
 #[derive(Default)]
 pub(crate) struct Ctx {
     conservative: bool,
     slots: Vec<usize>,
+    count: std::sync::Arc<AtomicUsize>,
 }
 
 impl Walk<'_, '_> {
+    /// Full descent of an explicitly named container file — the
+    /// hashoscope entry point. On error the partial subtree is
+    /// discarded (its members still seal and are dropped by slot);
+    /// the caller reports the error without aborting anything else.
+    pub(crate) fn walk_root(&self, path: &std::path::Path) -> Result<()> {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let mut ctx = Ctx::default();
+        let r = View::of_file(path).and_then(|view| {
+            self.process_ranged(view, path.display().to_string(), &name, 0, None, &mut ctx)
+        });
+        if r.is_err() {
+            self.discard(&mut ctx, 0);
+        }
+        r
+    }
+
     /// Hash and descend a member whose bytes only flow forward.
     /// `len` is the member's size when the enclosing format states it.
     #[allow(clippy::too_many_arguments)]
@@ -214,8 +238,7 @@ impl Walk<'_, '_> {
         parent: Option<usize>,
         ctx: &mut Ctx,
     ) -> Result<()> {
-        if self.pool.created() >= MAX_MEMBERS {
-            self.truncated.store(true, Ordering::Relaxed);
+        if self.capped(ctx) {
             drain(r);
             return Ok(());
         }
@@ -537,8 +560,7 @@ impl Walk<'_, '_> {
         parent: Option<usize>,
         ctx: &mut Ctx,
     ) -> Result<()> {
-        if self.pool.created() >= MAX_MEMBERS {
-            self.truncated.store(true, Ordering::Relaxed);
+        if self.capped(ctx) {
             return Ok(());
         }
         let mut head = vec![0u8; HEAD];
@@ -618,6 +640,15 @@ impl Walk<'_, '_> {
     /// dead just drops them from the member table afterwards.
     fn discard(&self, ctx: &mut Ctx, start: usize) {
         self.dead.lock().unwrap().extend(ctx.slots.drain(start..));
+    }
+
+    /// Bump this descent's member count against the per-root cap.
+    fn capped(&self, ctx: &Ctx) -> bool {
+        if ctx.count.fetch_add(1, Ordering::Relaxed) >= MAX_MEMBERS {
+            self.truncated.store(true, Ordering::Relaxed);
+            return true;
+        }
+        false
     }
 
     /// Walk the inside of a seekable container (a ranged member or a
@@ -874,7 +905,7 @@ impl Walk<'_, '_> {
                 // Encrypted or unsupported-method entries: name them,
                 // keep going.
                 Err(e) => {
-                    if pool.created() < MAX_MEMBERS {
+                    if !self.capped(ctx) {
                         let (meta, feed) = pool.member(
                             format!("{path}!{index_name}"),
                             depth + 1,
@@ -890,8 +921,6 @@ impl Walk<'_, '_> {
                             0,
                             Some(format!("unreadable zip member: {e}")),
                         );
-                    } else {
-                        self.truncated.store(true, Ordering::Relaxed);
                     }
                     continue;
                 }
@@ -1153,8 +1182,7 @@ impl Walk<'_, '_> {
                 let backhand::InnerNode::File(f) = &node.inner else {
                     continue;
                 };
-                if self.pool.created() >= MAX_MEMBERS {
-                    self.truncated.store(true, Ordering::Relaxed);
+                if self.capped(ctx) {
                     break;
                 }
                 let size = f.file_len() as u64;
@@ -1179,6 +1207,7 @@ impl Walk<'_, '_> {
             let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
             let batch_slots: Mutex<Vec<usize>> = Mutex::new(Vec::new());
             let conservative = ctx.conservative;
+            let count = &ctx.count;
             if !batch.is_empty() {
                 std::thread::scope(|scope| {
                     for _ in 0..self.threads.min(batch.len()) {
@@ -1192,6 +1221,7 @@ impl Walk<'_, '_> {
                             let mut wctx = Ctx {
                                 conservative,
                                 slots: vec![slot],
+                                count: count.clone(),
                             };
                             let mut reader =
                                 backhand::FilesystemReaderFile::new(&fs, item.file).reader();

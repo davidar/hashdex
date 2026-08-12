@@ -849,6 +849,91 @@ fn explicit_file_roots_always_listed() {
     assert!(text.contains("--online"), "hint missing --online:\n{text}");
 }
 
+/// Mixed roots in one invocation: a directory (flat listing) and a
+/// container file (tree section) share one member tree, one summary —
+/// disk files and nested members counted separately.
+#[test]
+fn scan_mixes_directory_and_container_roots() {
+    let env = TestEnv::new("mixedroots");
+    let payload = b"mixed-roots payload: bytes the filter knows about\n";
+    let payload_sha256 = {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(payload);
+        format!("{:x}", h.finalize())
+    };
+    // A directory root holding one loose copy of the payload…
+    let dir = env.work().join("tree");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub/loose.bin"), payload).unwrap();
+    // …and a container-file root holding another.
+    let tgz = {
+        let mut tarball = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut tarball, flate2::Compression::default());
+            let mut b = tar::Builder::new(enc);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "inside.bin", &payload[..]).unwrap();
+            let enc = b.into_inner().unwrap();
+            enc.finish().unwrap();
+        }
+        env.write("box.tar.gz", &tarball)
+    };
+    let list = env.digest_list("digests.txt", &payload_sha256);
+    let out = env.hdx(&[
+        "filters",
+        "build",
+        "mixsrc",
+        "sha256",
+        list.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    let out = env.hdx(&[
+        "--offline",
+        "scan",
+        "--list",
+        "known",
+        dir.to_str().unwrap(),
+        tgz.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    // Tree section: the container root, its wrapper, the tagged member.
+    assert!(text.contains("box.tar.gz"), "{text}");
+    assert!(text.contains("inside.bin"), "tree member missing:\n{text}");
+    // Flat section: the loose disk file with its tag prefix.
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("mixsrc") && l.contains("loose.bin")),
+        "flat listing missing the disk file:\n{text}"
+    );
+    // Summary separates disk files from nested members.
+    assert!(
+        text.contains("2 files") && text.contains("nested member"),
+        "summary should count disk files and nested members separately:\n{text}"
+    );
+
+    // JSON: summary object carries both tallies.
+    let out = env.hdx(&[
+        "--offline",
+        "--json",
+        "scan",
+        dir.to_str().unwrap(),
+        tgz.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let summary = scan_summary(&out);
+    assert_eq!(summary["files"], 2, "disk files: loose.bin + box.tar.gz");
+    assert!(
+        summary["members"].as_u64().unwrap() >= 2,
+        "nested members missing from summary: {summary}"
+    );
+}
+
 #[test]
 fn fetch_registry_works_offline() {
     let env = TestEnv::new("fetch");
@@ -962,13 +1047,13 @@ fn scan_online_conflicts_with_no_resolve() {
     );
 }
 
-/// The hashoscope: peek descends gzip→tar and ar→gzip→tar chains,
-/// tags members against filters, honors the identity floor, and
-/// reports containers it cannot enter. Fixtures are built with the
-/// same crates the binary uses — the test proves the walk, not the
-/// format libraries.
+/// The hashoscope: scanning an explicitly named container file
+/// descends gzip→tar and ar→gzip→tar chains, tags members against
+/// filters, honors the identity floor, and reports containers it
+/// cannot enter. Fixtures are built with the same crates the binary
+/// uses — the test proves the walk, not the format libraries.
 #[test]
-fn peek_descends_containers() {
+fn scan_descends_container_roots() {
     use std::io::Write as _;
     let env = TestEnv::new("peek");
 
@@ -1048,7 +1133,7 @@ fn peek_descends_containers() {
 
     // Tarball: container line, decompressed pseudo-member, tagged member,
     // floor member.
-    let out = env.hdx(&["--offline", "peek", tgz.to_str().unwrap()]);
+    let out = env.hdx(&["--offline", "scan", tgz.to_str().unwrap()]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("t.tar.gz"), "{text}");
@@ -1067,10 +1152,14 @@ fn peek_descends_containers() {
     );
 
     // Deb-shaped ar: the nested chain ar→gz→tar reaches the same bytes.
-    let out = env.hdx(&["--offline", "--json", "peek", deb.to_str().unwrap()]);
+    // JSON mode emits one object per member (NDJSON) plus a summary.
+    let out = env.hdx(&["--offline", "--json", "scan", deb.to_str().unwrap()]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
-    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
-    let members = v["members"].as_array().unwrap();
+    let members: Vec<serde_json::Value> = stdout(&out)
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter(|v: &serde_json::Value| v.get("depth").is_some())
+        .collect();
     let deep = members
         .iter()
         .find(|m| {
@@ -1151,7 +1240,7 @@ fn peek_descends_containers() {
         cpio.push(0);
     }
     let cpio_file = env.write("t.cpio", &cpio);
-    let out = env.hdx(&["--offline", "peek", cpio_file.to_str().unwrap()]);
+    let out = env.hdx(&["--offline", "scan", cpio_file.to_str().unwrap()]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("member.txt"), "{text}");
@@ -1188,21 +1277,14 @@ fn peek_descends_containers() {
         img[21 * 2048..21 * 2048 + payload.len()].copy_from_slice(payload);
         env.write("t.iso", &img)
     };
-    let out = env.hdx(&["--offline", "peek", iso.to_str().unwrap()]);
+    let out = env.hdx(&["--offline", "scan", iso.to_str().unwrap()]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("PAYLOAD.TXT"), "iso member missing:\n{text}");
     assert!(text.contains("[peeksrc]"), "iso member not tagged:\n{text}");
-
-    // Errors: no files; a directory.
-    let out = env.hdx(&["peek"]);
-    assert!(!out.status.success());
-    let out = env.hdx(&["--offline", "peek", env.work().to_str().unwrap()]);
-    assert!(!out.status.success());
-    assert!(stderr(&out).contains("not a file"), "{}", stderr(&out));
 }
 
-/// Zips take three routes through peek: a seekable root walks the
+/// Zips take three routes through the container walk: a seekable root walks the
 /// central directory directly (stored entries as range views), a
 /// stream-fed zip is walked speculatively from its local headers and
 /// reconciled against the central directory, and a MISBEHAVED stream
@@ -1210,7 +1292,7 @@ fn peek_descends_containers() {
 /// triggers one conservative re-descent that spools and trusts only
 /// the central directory.
 #[test]
-fn peek_zip_speculative_and_conservative() {
+fn scan_zip_speculative_and_conservative() {
     use std::io::Write as _;
     let env = TestEnv::new("peekzip");
 
@@ -1248,7 +1330,7 @@ fn peek_zip_speculative_and_conservative() {
 
     // Root zip = seekable: both entries attributed, no retry.
     let zip_file = env.write("t.zip", &zip_bytes);
-    let out = env.hdx(&["--offline", "peek", zip_file.to_str().unwrap()]);
+    let out = env.hdx(&["--offline", "scan", zip_file.to_str().unwrap()]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("stored.txt"), "{text}");
@@ -1268,7 +1350,7 @@ fn peek_zip_speculative_and_conservative() {
         enc.finish().unwrap();
         env.write("t.zip.gz", &gz)
     };
-    let out = env.hdx(&["--offline", "peek", zgz.to_str().unwrap()]);
+    let out = env.hdx(&["--offline", "scan", zgz.to_str().unwrap()]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("stored.txt"), "{text}");
@@ -1310,7 +1392,7 @@ fn peek_zip_speculative_and_conservative() {
         enc.finish().unwrap();
         env.write("bad.zip.gz", &gz)
     };
-    let out = env.hdx(&["--offline", "peek", tgz.to_str().unwrap()]);
+    let out = env.hdx(&["--offline", "scan", tgz.to_str().unwrap()]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let err = stderr(&out);
     assert!(
@@ -1332,7 +1414,7 @@ fn peek_zip_speculative_and_conservative() {
 /// still works — it spools, and its members resolve as views over the
 /// spool.
 #[test]
-fn peek_spools_streamed_iso() {
+fn scan_spools_streamed_iso() {
     use std::io::Write as _;
     let env = TestEnv::new("peekspool");
 
@@ -1372,7 +1454,7 @@ fn peek_spools_streamed_iso() {
         // sniffing reach for streams) and spooled to walk.
         env.write("image.iso.gz", &gz)
     };
-    let out = env.hdx(&["--offline", "peek", gz.to_str().unwrap()]);
+    let out = env.hdx(&["--offline", "scan", gz.to_str().unwrap()]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let text = stdout(&out);
     assert!(
@@ -1386,7 +1468,7 @@ fn peek_spools_streamed_iso() {
 /// so only that one member is redone — the note names the member, not
 /// the image — and its siblings keep their verdicts.
 #[test]
-fn peek_retry_is_localized_to_the_squashfs_file() {
+fn scan_retry_is_localized_to_the_squashfs_file() {
     use std::io::Write as _;
     let env = TestEnv::new("peeksquash");
 
@@ -1449,7 +1531,7 @@ fn peek_retry_is_localized_to_the_squashfs_file() {
         env.write("t.squashfs", &img.into_inner())
     };
 
-    let out = env.hdx(&["--offline", "peek", squash.to_str().unwrap()]);
+    let out = env.hdx(&["--offline", "scan", squash.to_str().unwrap()]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let err = stderr(&out);
     // The retry note names the squashfs member, not the image root.

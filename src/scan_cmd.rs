@@ -1,13 +1,16 @@
 use crate::coord::Scheme;
 use crate::filter::NamedFilter;
 use crate::local_index::{CachedEntry, LocalIndex};
+use crate::peek_pool::{Digests, Member, Pool};
+use crate::peek_walk::Walk;
+use crate::report::{self, Class};
 use anyhow::{Context, Result};
 use serde_json::json;
 use sha2::Digest;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 pub struct ScanOptions {
@@ -143,8 +146,12 @@ fn to_fresh(r: &FileResult) -> crate::local_index::FreshEntry {
 }
 
 /// Walk paths, hash every regular file (sha1 + sha256 in one pass), check
-/// membership filters locally. Zero network. This is the personal-NSRL
-/// scan: "which of my files are publicly known bytes."
+/// membership filters locally, and — for explicitly named container
+/// files — descend recursively, minting all six coordinates per nested
+/// member (the hashoscope). Everything lands in ONE member tree:
+/// directories are digestless container nodes, disk files are members,
+/// nested members hang under the file that holds them. Zero network
+/// unless resolving.
 ///
 /// Hashes persist in the local index (updatedb-style): unchanged files
 /// (same size + mtime) are not re-read on later scans, and `hdx locate`
@@ -169,15 +176,6 @@ pub async fn scan(
         })
         .collect::<Result<_>>()?;
     let paths = &paths;
-
-    // Roots the user named as literal files always get a per-file
-    // verdict: an explicit two-file scan that prints nothing reads as
-    // "scan doesn't know these" even when the summary counted them.
-    let file_roots: HashSet<&Path> = paths
-        .iter()
-        .filter(|p| p.is_file())
-        .map(|p| p.as_path())
-        .collect();
 
     let own_cache = crate::cache::cache_dir();
     let ticker = &Ticker::new();
@@ -208,48 +206,115 @@ pub async fn scan(
     // bigger-than-RAM filter would need a disk seek.
     let mut probe_order: Vec<&NamedFilter> = filters.iter().collect();
     probe_order.sort_by_key(|f| f.bytes);
-    let probe_order = &probe_order;
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(2);
+    let pool = Pool::new(probe_order, ticker, threads, opts.probe_all);
 
     let done = AtomicUsize::new(0);
     let found = AtomicUsize::new(0);
-    let walk_done = std::sync::atomic::AtomicBool::new(false);
+    let walk_done = AtomicBool::new(false);
     let hashed_fresh = AtomicUsize::new(0);
+    let reused = AtomicUsize::new(0);
     let big_skipped_files = AtomicUsize::new(0);
-    let results: Mutex<Vec<FileResult>> = Mutex::new(Vec::new());
+    // Freshly hashed disk files bound for the incremental index flush.
+    let fresh: Mutex<Vec<crate::local_index::FreshEntry>> = Mutex::new(Vec::new());
+    // Disk-file paths actually walked over (index hits included) — the
+    // complement drives stale-entry deletion.
+    let seen: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let skipped: Mutex<Vec<String>> = Mutex::new(Vec::new());
     // Unreadable paths (permission denied, vanished mid-scan, …) are
     // routine on real machines; collect them and report once at the end
     // instead of spamming the terminal as they're hit.
     let unreadable: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    // Bounded: backpressure keeps the walker a few thousand paths
+
+    /// A unit of worker work: a file found under a directory root, or
+    /// an explicitly named root file (which gets the full recursive
+    /// descent — pointing hdx at a container IS the demand).
+    enum Job {
+        File {
+            path: PathBuf,
+            parent: Option<usize>,
+            ord: usize,
+            depth: usize,
+        },
+        Root(PathBuf),
+    }
+    // Bounded: backpressure keeps the walker a few thousand entries
     // ahead of the workers instead of materializing the whole tree.
-    let (walk_tx, walk_rx) = std::sync::mpsc::sync_channel::<PathBuf>(8192);
+    let (walk_tx, walk_rx) = std::sync::mpsc::sync_channel::<Job>(8192);
     let walk_rx = Mutex::new(walk_rx);
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
     let cached_ref = &cached;
     let index_cell = Mutex::new(index);
 
+    let walk = Walk {
+        pool: &pool,
+        truncated: AtomicBool::new(false),
+        dead: Mutex::new(Vec::new()),
+        threads,
+    };
     std::thread::scope(|scope| {
-        // ONE fused pass over the filesystem. The walker reads
-        // directory blocks and streams paths (hdx's own cache pruned —
-        // it would pollute the known/unknown metrics with our own
-        // artifacts — unless a scan root points inside it explicitly);
-        // workers stat, index-check, filter, and hash in parallel from
-        // the first path on. Recognized files cost one stat; only
+        // The hash/read pool: container descent (root files) feeds
+        // per-member hash jobs here; plain disk files are hashed
+        // inline by the scan workers below and never touch it.
+        for _ in 0..threads {
+            scope.spawn(|| pool.worker());
+        }
+        let walk = &walk;
+        // The walker only enumerates: directory nodes are allocated
+        // (and closed with their child counts) as it goes, files
+        // stream to the workers (hdx's own cache pruned — it would
+        // pollute the known/unknown metrics with our own artifacts —
+        // unless a scan root points inside it explicitly). Workers
+        // stat, index-check, filter, and hash in parallel from the
+        // first entry on. Recognized files cost one stat; only
         // unrecognized content is read at all.
-        let (found, walk_done) = (&found, &walk_done);
+        let (found_ref, walk_done_ref) = (&found, &walk_done);
         let unreadable_ref = &unreadable;
-        scope.spawn(move || {
+        let pool_ref = &pool;
+        let walker = scope.spawn(move || {
             for root in paths {
                 if root.is_file() {
-                    found.fetch_add(1, Ordering::Relaxed);
-                    let _ = walk_tx.send(root.clone());
+                    found_ref.fetch_add(1, Ordering::Relaxed);
+                    if walk_tx.send(Job::Root(root.clone())).is_err() {
+                        return; // workers are gone
+                    }
                     continue;
                 }
                 let prune_cache = !root.starts_with(&own_cache);
                 let mut excluded = false;
+                // Open directory nodes, deepest last; a node closes
+                // (child count final) when the walk moves past its
+                // subtree.
+                struct OpenDir {
+                    slot: crate::peek_pool::Slot,
+                    path: String,
+                    depth: usize,
+                    parent: Option<usize>,
+                    ord: usize,
+                    children: usize,
+                }
+                let close = |d: OpenDir| {
+                    pool_ref.fill_slot(
+                        d.slot,
+                        Member {
+                            path: d.path,
+                            depth: d.depth,
+                            parent: d.parent,
+                            ord: d.ord,
+                            kind: "dir",
+                            size: 0,
+                            fs: true,
+                            digests: None,
+                            matched: Vec::new(),
+                            children: d.children,
+                            note: None,
+                        },
+                    );
+                };
+                let mut stack: Vec<OpenDir> = Vec::new();
                 let walker = walkdir::WalkDir::new(root)
                     .follow_links(false)
                     .into_iter()
@@ -262,15 +327,57 @@ pub async fn scan(
                     });
                 for entry in walker {
                     match entry {
-                        Ok(e) if e.file_type().is_file() => {
-                            found.fetch_add(1, Ordering::Relaxed);
-                            if walk_tx.send(e.into_path()).is_err() {
-                                return; // workers are gone
+                        Ok(e) => {
+                            let ft = e.file_type();
+                            let depth = e.depth();
+                            while stack.len() > depth {
+                                close(stack.pop().unwrap());
+                            }
+                            if !ft.is_dir() && !ft.is_file() {
+                                continue; // symlinks, sockets, …
+                            }
+                            let (parent, ord) = match stack.last_mut() {
+                                Some(p) => {
+                                    let ord = p.children;
+                                    p.children += 1;
+                                    (Some(p.slot.idx()), ord)
+                                }
+                                None => (None, 0),
+                            };
+                            if ft.is_dir() {
+                                stack.push(OpenDir {
+                                    slot: pool_ref.reserve(),
+                                    path: e.path().display().to_string(),
+                                    depth,
+                                    parent,
+                                    ord,
+                                    children: 0,
+                                });
+                            } else {
+                                found_ref.fetch_add(1, Ordering::Relaxed);
+                                if walk_tx
+                                    .send(Job::File {
+                                        path: e.into_path(),
+                                        parent,
+                                        ord,
+                                        depth,
+                                    })
+                                    .is_err()
+                                {
+                                    // Workers are gone; close what's
+                                    // open so every slot still fills.
+                                    while let Some(d) = stack.pop() {
+                                        close(d);
+                                    }
+                                    return;
+                                }
                             }
                         }
-                        Ok(_) => {}
                         Err(e) => unreadable_ref.lock().unwrap().push(e.to_string()),
                     }
+                }
+                while let Some(d) = stack.pop() {
+                    close(d);
                 }
                 if excluded {
                     eprintln!(
@@ -280,39 +387,28 @@ pub async fn scan(
                 }
             }
             drop(walk_tx);
-            walk_done.store(true, Ordering::Release);
+            walk_done_ref.store(true, Ordering::Release);
         });
         // Incremental persistence: a killed scan keeps the hashing it
         // already paid for. Fresh hashes flush in batches as workers
         // produce them; stale-path deletion stays at the very end —
         // only a COMPLETE walk is allowed to delete.
-        scope.spawn(|| {
-            let mut flushed_upto = 0usize;
+        let flusher = scope.spawn(|| {
             let mut last_flush = std::time::Instant::now();
             loop {
                 std::thread::park_timeout(std::time::Duration::from_millis(500));
                 let finished = walk_done.load(Ordering::Acquire)
                     && done.load(Ordering::Relaxed) >= found.load(Ordering::Relaxed);
-                let pending = results.lock().unwrap().len() - flushed_upto;
+                let pending = fresh.lock().unwrap().len();
                 if pending > 0
                     && (finished || pending >= 2000 || last_flush.elapsed().as_secs() >= 5)
                 {
-                    let fresh: Vec<crate::local_index::FreshEntry> = {
-                        let res = results.lock().unwrap();
-                        let batch = res[flushed_upto..]
-                            .iter()
-                            .filter(|r| !r.from_index)
-                            .map(to_fresh)
-                            .collect();
-                        flushed_upto = res.len();
-                        batch
-                    };
+                    let batch: Vec<crate::local_index::FreshEntry> =
+                        fresh.lock().unwrap().drain(..).collect();
                     last_flush = std::time::Instant::now();
-                    if !fresh.is_empty() {
-                        if let Some(ix) = index_cell.lock().unwrap().as_mut() {
-                            if let Err(e) = ix.commit_scan(&fresh, &[]) {
-                                eprintln!("warning: incremental index flush failed: {e}");
-                            }
+                    if let Some(ix) = index_cell.lock().unwrap().as_mut() {
+                        if let Err(e) = ix.commit_scan(&batch, &[]) {
+                            eprintln!("warning: incremental index flush failed: {e}");
                         }
                     }
                 }
@@ -321,61 +417,88 @@ pub async fn scan(
                 }
             }
         });
+        let mut workers = Vec::new();
         for _ in 0..threads {
-            scope.spawn(|| {
+            workers.push(scope.spawn(|| {
                 let mut buf = vec![0u8; 1 << 20];
                 loop {
                     // Bind before matching: a `match recv()` scrutinee
                     // would hold the receiver lock through the whole
                     // file examination, serializing every worker.
-                    let path = walk_rx.lock().unwrap().recv();
-                    let Ok(path) = path else { break };
-                    match examine(&path, cached_ref, opts.rehash, &mut buf) {
-                        Ok(Some(mut r)) => {
-                            if !r.from_index {
-                                hashed_fresh.fetch_add(1, Ordering::Relaxed);
+                    let job = walk_rx.lock().unwrap().recv();
+                    let Ok(job) = job else { break };
+                    match job {
+                        Job::Root(path) => {
+                            // The hashoscope path: full recursive
+                            // descent, all six schemes per member.
+                            match walk.walk_root(&path) {
+                                Ok(()) => seen
+                                    .lock()
+                                    .unwrap()
+                                    .push(path.to_string_lossy().into_owned()),
+                                Err(e) => unreadable
+                                    .lock()
+                                    .unwrap()
+                                    .push(format!("{}: {e}", path.display())),
                             }
-                            let sha1_hex = hex_upper(&r.sha1);
-                            let sha256_hex = hex_lower(&r.sha256);
-                            let mut skipped_big = false;
-                            for f in probe_order {
-                                if !opts.probe_all
-                                    && f.bytes >= EXPENSIVE_FILTER_BYTES
-                                    && !r.matched.is_empty()
-                                {
-                                    skipped_big = true;
-                                    continue;
-                                }
-                                let key: &[u8] = match f.scheme {
-                                    Scheme::Sha1 => sha1_hex.as_bytes(),
-                                    Scheme::Sha256 => sha256_hex.as_bytes(),
-                                    _ => continue,
-                                };
-                                if f.bloom.check(key) {
-                                    r.matched.push(f.name.clone());
-                                }
-                            }
-                            // One name per source: a source with sha1 AND
-                            // sha256 blooms firing on the same file must
-                            // not render as "fatcat,fatcat" or count twice
-                            // in the per-source summary.
-                            r.matched.sort();
-                            r.matched.dedup();
-                            if skipped_big {
-                                big_skipped_files.fetch_add(1, Ordering::Relaxed);
-                            }
-                            results.lock().unwrap().push(r);
                         }
-                        Ok(None) => {
-                            skipped
+                        Job::File {
+                            path,
+                            parent,
+                            ord,
+                            depth,
+                        } => match examine(&path, cached_ref, opts.rehash, &mut buf) {
+                            Ok(Some(r)) => {
+                                if r.from_index {
+                                    reused.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    hashed_fresh.fetch_add(1, Ordering::Relaxed);
+                                    fresh.lock().unwrap().push(to_fresh(&r));
+                                }
+                                let (matched, skipped_big) =
+                                    pool.probe(&r.sha1, &r.sha256, opts.probe_all);
+                                if skipped_big {
+                                    big_skipped_files.fetch_add(1, Ordering::Relaxed);
+                                }
+                                seen.lock()
+                                    .unwrap()
+                                    .push(r.path.to_string_lossy().into_owned());
+                                let slot = pool.reserve();
+                                pool.fill_slot(
+                                    slot,
+                                    Member {
+                                        path: path.display().to_string(),
+                                        depth,
+                                        parent,
+                                        ord,
+                                        kind: "file",
+                                        size: r.size,
+                                        fs: true,
+                                        digests: Some(Digests {
+                                            md5: None,
+                                            sha1: r.sha1,
+                                            sha256: r.sha256,
+                                            sha512: None,
+                                            blake2s: None,
+                                            sha1_git: None,
+                                        }),
+                                        matched,
+                                        children: 0,
+                                        note: None,
+                                    },
+                                );
+                            }
+                            Ok(None) => {
+                                skipped
+                                    .lock()
+                                    .unwrap()
+                                    .push(path.to_string_lossy().into_owned());
+                            }
+                            Err(e) => unreadable
                                 .lock()
                                 .unwrap()
-                                .push(path.to_string_lossy().into_owned());
-                        }
-                        Err(e) => unreadable
-                            .lock()
-                            .unwrap()
-                            .push(format!("{}: {e}", path.display())),
+                                .push(format!("{}: {e}", path.display())),
+                        },
                     }
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     // Most files are index hits (stat + compare), not
@@ -390,37 +513,77 @@ pub async fn scan(
                         }
                     });
                 }
-            });
+            }));
         }
+        walker.join().unwrap();
+        for w in workers {
+            w.join().unwrap();
+        }
+        flusher.join().unwrap();
+        // Container descents may still be hashing on the pool.
+        pool.wait_idle();
+        pool.close();
     });
+    // Partial-moving Walk's state ends its borrow of the pool, so the
+    // member table can be consumed below.
+    let truncated = walk.truncated.into_inner();
+    let dead = walk.dead.into_inner().unwrap();
     ticker.clear();
 
-    let mut results = results.into_inner().unwrap();
-    results.sort_by(|a, b| a.path.cmp(&b.path));
+    // Assemble the member tree: drop members sealed into abandoned
+    // subtrees (conservative retries), renumber parent pointers into
+    // the surviving table. A survivor's parent always survives —
+    // discards drop whole subtrees, never a member without its
+    // descendants.
+    let mut sealed = pool.members.into_inner().unwrap();
+    for slot in dead {
+        sealed[slot] = None;
+    }
+    let mut members: Vec<Member> = Vec::new();
+    let mut remap: Vec<Option<usize>> = vec![None; sealed.len()];
+    for (slot, m) in sealed.into_iter().enumerate() {
+        if let Some(mut m) = m {
+            remap[slot] = Some(members.len());
+            m.parent = m.parent.map(|p| remap[p].expect("parent survived discard"));
+            // Roots are filesystem objects whichever arm created them.
+            if m.parent.is_none() {
+                m.fs = true;
+            }
+            members.push(m);
+        }
+    }
+
+    let seen = seen.into_inner().unwrap();
     let skipped = skipped.into_inner().unwrap();
     let unreadable = unreadable.into_inner().unwrap();
 
-    // Persist: fresh hashes in (idempotent over the incremental
-    // flushes), vanished paths out.
+    // Persist: root files in (they were descended, so always freshly
+    // hashed — the incremental flusher covered everything else),
+    // vanished paths out.
     let mut index = index_cell.into_inner().unwrap();
-    let reused = results.iter().filter(|r| r.from_index).count();
     if let Some(ix) = &mut index {
-        let fresh: Vec<crate::local_index::FreshEntry> = results
-            .iter()
-            .filter(|r| !r.from_index)
-            .map(to_fresh)
-            .collect();
-        let seen: HashSet<String> = results
-            .iter()
-            .map(|r| r.path.to_string_lossy().into_owned())
-            .collect();
+        let mut fresh_roots: Vec<crate::local_index::FreshEntry> = Vec::new();
+        for m in &members {
+            if m.parent.is_none() && m.kind != "dir" {
+                if let Some(d) = &m.digests {
+                    let mtime_ns = std::fs::metadata(Path::new(&m.path))
+                        .ok()
+                        .and_then(|meta| meta.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|dur| dur.as_nanos() as i64)
+                        .unwrap_or(0);
+                    fresh_roots.push((m.path.clone(), m.size, mtime_ns, d.sha1, d.sha256));
+                }
+            }
+        }
+        let seen_set: HashSet<&str> = seen.iter().map(String::as_str).collect();
         let mut stale: Vec<String> = cached
             .keys()
-            .filter(|p| !seen.contains(p.as_str()))
+            .filter(|p| !seen_set.contains(p.as_str()))
             .cloned()
             .collect();
         stale.extend(skipped);
-        if let Err(e) = ix.commit_scan(&fresh, &stale) {
+        if let Err(e) = ix.commit_scan(&fresh_roots, &stale) {
             eprintln!("warning: index update failed: {e}");
         }
     }
@@ -428,8 +591,24 @@ pub async fn scan(
     // Demand-driven network probes for matched digests, each visiting
     // only the backends whose filter fired: dataset-transport backends
     // by default, third-party APIs with --online consent. Runs before
-    // the walk so fresh findings are in the observation store when the
-    // per-file resolution below sweeps it.
+    // the local walk so fresh findings are in the observation store
+    // when the per-member resolution below sweeps it. Nested members
+    // probe exactly like disk files — a bloom hit is the demand.
+    let results: Vec<FileResult> = members
+        .iter()
+        .filter(|m| !m.matched.is_empty())
+        .filter_map(|m| {
+            m.digests.as_ref().map(|d| FileResult {
+                path: PathBuf::from(&m.path),
+                size: m.size,
+                mtime_ns: 0,
+                sha1: d.sha1,
+                sha256: d.sha256,
+                from_index: false,
+                matched: m.matched.clone(),
+            })
+        })
+        .collect();
     if opts.resolve && !ropts.offline {
         online_probe(
             &results,
@@ -442,181 +621,227 @@ pub async fn scan(
         .await;
     }
 
-    // Local resolution context for --resolve: pulled datasets + the
+    // Local resolution for --resolve: every member walks from its
+    // sha256 AND sha1 seeds through the pulled datasets and the
     // observation store (which --online may have just enriched).
-    let resolver = if opts.resolve {
+    // Verdicts per witness row (the approved weak-digest policy):
+    //   identified — the row's cluster contains the member's sha256;
+    //   consistent — the row matches only on weak digests, and NO
+    //     scheme it co-states contradicts a locally-minted digest
+    //     (a contradicted row describes other bytes → related,
+    //     silently);
+    // both tiers count as known, reported separately.
+    let evidence: Vec<report::Evidence> = if opts.resolve {
         let datasets = crate::datasets::open_all();
-        let cache = if opts.no_index {
-            None
-        } else {
-            crate::cache::Cache::open().ok()
-        };
-        Some((datasets, cache))
+        report::resolve_members(&members, datasets, threads, !opts.no_index, ticker)
     } else {
-        None
+        members.iter().map(|_| Default::default()).collect()
     };
+    ticker.clear();
 
+    let classes: Vec<Class> = members
+        .iter()
+        .zip(&evidence)
+        .map(|(m, ev)| report::classify(m, ev))
+        .collect();
+
+    // Which members live inside an explicitly named container root
+    // (rendered as a tree) as opposed to the flat filesystem listing.
+    // Parents always precede children in the member table, so one
+    // forward pass settles it.
+    let mut in_tree: Vec<bool> = vec![false; members.len()];
+    for i in 0..members.len() {
+        in_tree[i] = match members[i].parent {
+            Some(p) => in_tree[p],
+            None => members[i].kind != "dir",
+        };
+    }
+
+    // Summary counters. Disk files (scan's headline) and nested
+    // members (the hashoscope's) are counted separately — "12 known
+    // files" must keep meaning files on disk even when one of them
+    // held half a million members.
+    let mut scanned = 0usize;
     let mut known = 0usize;
     let mut attributed = 0usize;
     let mut consistent_files = 0usize;
     let mut membership_only = 0usize;
     let mut known_bytes = 0u64;
     let mut total_bytes = 0u64;
+    let mut nested = 0usize;
+    let (mut n_identified, mut n_consistent, mut n_membership, mut n_unknown) = (0, 0, 0, 0usize);
     let mut per_filter: std::collections::BTreeMap<&str, usize> = Default::default();
-    for (i, r) in results.iter().enumerate() {
-        ticker.update(100_000, i, || {
-            format!("resolving locally… {i}/{} files", results.len())
-        });
-        total_bytes += r.size;
-        for m in &r.matched {
-            *per_filter.entry(m.as_str()).or_default() += 1;
+    for ((m, ev), class) in members.iter().zip(&evidence).zip(&classes) {
+        for name in &m.matched {
+            *per_filter.entry(name.as_str()).or_default() += 1;
         }
-        // Attributed listing needs the evidence to decide visibility,
-        // so the walk runs for every file whenever we resolve — except
-        // sub-digest-size files, which are never attributed. The walk
-        // is seeded with every digest scan minted (sha256 AND sha1 —
-        // weak-keyed sources are only reachable via the weak seed).
-        // Verdicts per witness row (the approved weak-digest policy):
-        //   identified — the row's cluster contains the file's sha256;
-        //   consistent — the row matches only on weak digests, and NO
-        //     scheme it co-states contradicts a locally-minted digest
-        //     (a contradicted row describes other bytes → related,
-        //     silently);
-        // both tiers count as known, reported separately.
-        let evidence = resolver
-            .as_ref()
-            .filter(|_| r.size >= IDENTITY_MIN_BYTES)
-            .map(|(datasets, cache)| local_verdicts(&r.sha256, &r.sha1, datasets, cache.as_ref()));
-        let has_claims = evidence
-            .as_ref()
-            .is_some_and(|(id, _)| id.iter().any(|f| !f.claims.is_empty()));
-        let has_consistent = evidence
-            .as_ref()
-            .is_some_and(|(_, co)| co.iter().any(|f| !f.claims.is_empty()));
-        if has_claims {
-            attributed += 1;
-        } else if has_consistent {
-            consistent_files += 1;
+        let (identified, consistent) = ev;
+        let has_claims = identified.iter().any(|f| !f.claims.is_empty());
+        let has_consistent = consistent.iter().any(|f| !f.claims.is_empty());
+        if m.fs && m.digests.is_some() {
+            scanned += 1;
+            total_bytes += m.size;
+            if has_claims {
+                attributed += 1;
+            } else if has_consistent {
+                consistent_files += 1;
+            }
+            // Known = a filter matched OR the walk produced a claim:
+            // index rows (tarballs, cached observations) are
+            // witness-grade evidence, stronger than a probabilistic
+            // bloom hit — a file can't be both attributed and
+            // "unknown".
+            if !m.matched.is_empty() || has_claims || has_consistent {
+                known += 1;
+                known_bytes += m.size;
+            }
+            if opts.resolve && !m.matched.is_empty() && !has_claims && !has_consistent {
+                membership_only += 1;
+            }
+        } else if !m.fs {
+            nested += 1;
+            match class {
+                Class::Identified => n_identified += 1,
+                Class::Consistent => n_consistent += 1,
+                Class::Membership => n_membership += 1,
+                Class::Unknown => n_unknown += 1,
+                Class::Floor | Class::Node => {}
+            }
         }
-        // Known = a filter matched OR the walk produced a claim: index
-        // rows (tarballs, cached observations) are witness-grade
-        // evidence, stronger than a probabilistic bloom hit — a file
-        // can't be both attributed and "unknown".
-        if !r.matched.is_empty() || has_claims || has_consistent {
-            known += 1;
-            known_bytes += r.size;
+    }
+
+    // Tree sections first: every explicitly named container file
+    // renders its full descent, hashoscope style.
+    if in_tree.iter().any(|t| *t) {
+        let rollups = report::rollups(&members, &classes);
+        for &i in report::tree_order(&members).iter().filter(|&&i| in_tree[i]) {
+            if opts.json {
+                println!(
+                    "{}",
+                    report::member_json(&members[i], &evidence[i], &rollups[i])
+                );
+            } else {
+                report::render_tree_line(&members[i], &evidence[i], &rollups[i], opts.verbose);
+            }
         }
-        if resolver.is_some() && !r.matched.is_empty() && !has_claims && !has_consistent {
-            membership_only += 1;
-        }
+    }
+
+    // Flat listing over the filesystem files, sorted by path.
+    let mut flat: Vec<usize> = (0..members.len())
+        .filter(|&i| members[i].fs && members[i].digests.is_some() && !in_tree[i])
+        .collect();
+    flat.sort_by(|&a, &b| members[a].path.cmp(&members[b].path));
+    for &i in &flat {
+        let m = &members[i];
+        let (identified, consistent) = &evidence[i];
+        let has_claims = identified.iter().any(|f| !f.claims.is_empty());
+        let has_consistent = consistent.iter().any(|f| !f.claims.is_empty());
         let show = match opts.list {
             ListMode::None => false,
             ListMode::All => true,
-            ListMode::Known => !r.matched.is_empty(),
-            ListMode::Unknown => r.matched.is_empty(),
-            ListMode::Attributed => {
-                has_claims || has_consistent || file_roots.contains(r.path.as_path())
-            }
+            ListMode::Known => !m.matched.is_empty(),
+            ListMode::Unknown => m.matched.is_empty(),
+            ListMode::Attributed => has_claims || has_consistent,
         };
-        if show {
-            ticker.clear();
-            // Every consistent match is via sha1 — the only weak digest
-            // scan mints (md5 joins when an md5-only source needs it).
-            const WEAK_VIA: &str = "sha1";
-            if opts.json {
-                let mut obj = json!({
-                    "path": r.path.display().to_string(),
-                    "size": r.size,
-                    "sha1": hex_lower(&r.sha1),
-                    "sha256": hex_lower(&r.sha256),
-                    "known": !r.matched.is_empty(),
-                    "filters": r.matched,
-                });
-                if let Some((identified, consistent)) = &evidence {
-                    obj["resolved"] = identified
-                        .iter()
-                        .map(|f| json!({"backend": f.backend, "claims": f.claims}))
-                        .collect();
-                    obj["consistent"] = consistent
-                        .iter()
-                        .map(|f| {
-                            json!({"backend": f.backend, "claims": f.claims, "via": [WEAK_VIA]})
-                        })
-                        .collect();
-                }
-                println!("{obj}");
+        if !show {
+            continue;
+        }
+        ticker.clear();
+        // Every consistent match is via sha1 — the only weak digest
+        // scan mints (md5 joins when an md5-only source needs it).
+        const WEAK_VIA: &str = "sha1";
+        let d = m.digests.as_ref().expect("flat members carry digests");
+        if opts.json {
+            let mut obj = json!({
+                "path": m.path,
+                "size": m.size,
+                "sha1": hex_lower(&d.sha1),
+                "sha256": hex_lower(&d.sha256),
+                "known": !m.matched.is_empty(),
+                "filters": m.matched,
+            });
+            if opts.resolve {
+                obj["resolved"] = identified
+                    .iter()
+                    .map(|f| json!({"backend": f.backend, "claims": f.claims}))
+                    .collect();
+                obj["consistent"] = consistent
+                    .iter()
+                    .map(|f| json!({"backend": f.backend, "claims": f.claims, "via": [WEAK_VIA]}))
+                    .collect();
+            }
+            println!("{obj}");
+        } else {
+            let backends_of = |fs: &[crate::finding::Finding]| {
+                let mut backends: Vec<&str> = fs
+                    .iter()
+                    .filter(|f| !f.claims.is_empty())
+                    .map(|f| f.backend.as_str())
+                    .collect();
+                backends.sort_unstable();
+                backends.dedup();
+                backends.join(",")
+            };
+            let tag = if !m.matched.is_empty() {
+                m.matched.join(",")
+            } else if has_claims {
+                // No filter fired but the local walk attributed it
+                // (index-only sources like tarballs have no bloom):
+                // name the attestors, don't call it unknown.
+                backends_of(identified)
+            } else if has_consistent {
+                backends_of(consistent)
             } else {
-                let backends_of = |fs: &[crate::finding::Finding]| {
-                    let mut backends: Vec<&str> = fs
-                        .iter()
-                        .filter(|f| !f.claims.is_empty())
-                        .map(|f| f.backend.as_str())
-                        .collect();
-                    backends.sort_unstable();
-                    backends.dedup();
-                    backends.join(",")
-                };
-                let tag = if !r.matched.is_empty() {
-                    r.matched.join(",")
-                } else if has_claims {
-                    // No filter fired but the local walk attributed it
-                    // (index-only sources like tarballs have no bloom):
-                    // name the attestors, don't call it unknown.
-                    evidence.as_ref().map(|(id, _)| backends_of(id)).unwrap()
-                } else if has_consistent {
-                    evidence.as_ref().map(|(_, co)| backends_of(co)).unwrap()
-                } else {
-                    "unknown".to_string()
-                };
-                println!("{:<12} {}", tag, r.path.display());
-                if let Some((identified, consistent)) = &evidence {
-                    // Weak-only matches never present as identity: their
-                    // lines carry the tier and the scheme that matched.
-                    let prefix = format!("consistent ({WEAK_VIA}): ");
-                    // (identity-tier?, backend, statement, url) —
-                    // identified claims always outrank consistent ones.
-                    let lines: Vec<(bool, &str, String, &Option<String>)> = identified
-                        .iter()
-                        .flat_map(|f| {
-                            f.claims.iter().map(move |c| {
-                                (true, f.backend.as_str(), c.statement.clone(), &c.url)
-                            })
+                "unknown".to_string()
+            };
+            println!("{:<12} {}", tag, m.path);
+            if opts.resolve {
+                // Weak-only matches never present as identity: their
+                // lines carry the tier and the scheme that matched.
+                let prefix = format!("consistent ({WEAK_VIA}): ");
+                // (identity-tier?, backend, statement, url) —
+                // identified claims always outrank consistent ones.
+                let lines: Vec<(bool, &str, String, &Option<String>)> = identified
+                    .iter()
+                    .flat_map(|f| {
+                        f.claims
+                            .iter()
+                            .map(move |c| (true, f.backend.as_str(), c.statement.clone(), &c.url))
+                    })
+                    .chain(consistent.iter().flat_map(|f| {
+                        f.claims.iter().map(|c| {
+                            (
+                                false,
+                                f.backend.as_str(),
+                                format!("{prefix}{}", c.statement),
+                                &c.url,
+                            )
                         })
-                        .chain(consistent.iter().flat_map(|f| {
-                            f.claims.iter().map(|c| {
-                                (
-                                    false,
-                                    f.backend.as_str(),
-                                    format!("{prefix}{}", c.statement),
-                                    &c.url,
-                                )
-                            })
-                        }))
-                        .collect();
-                    if opts.verbose {
-                        const SHOWN: usize = 3;
-                        for (_, backend, statement, url) in lines.iter().take(SHOWN) {
-                            println!("             {backend:<12} {statement}");
-                            if let Some(url) = url {
-                                println!("             {:<12} → {url}", "");
-                            }
-                        }
-                        if lines.len() > SHOWN {
-                            println!("             … and {} more claims", lines.len() - SHOWN);
-                        }
-                    } else if let Some((_, backend, statement, url)) = lines
-                        .iter()
-                        .max_by_key(|(id, _, s, url)| (*id, url.is_some(), s.len()))
-                    {
-                        // Compact default: the most informative single
-                        // claim (URL-bearing beats bare join keys) WITH
-                        // its URL — the URL is usually the payload the
-                        // user is after (wayback copy, SWH archive).
-                        // -v for the full multi-claim blocks.
+                    }))
+                    .collect();
+                if opts.verbose {
+                    const SHOWN: usize = 3;
+                    for (_, backend, statement, url) in lines.iter().take(SHOWN) {
                         println!("             {backend:<12} {statement}");
                         if let Some(url) = url {
                             println!("             {:<12} → {url}", "");
                         }
+                    }
+                    if lines.len() > SHOWN {
+                        println!("             … and {} more claims", lines.len() - SHOWN);
+                    }
+                } else if let Some((_, backend, statement, url)) = lines
+                    .iter()
+                    .max_by_key(|(id, _, s, url)| (*id, url.is_some(), s.len()))
+                {
+                    // Compact default: the most informative single
+                    // claim (URL-bearing beats bare join keys) WITH
+                    // its URL — the URL is usually the payload the
+                    // user is after (wayback copy, SWH archive).
+                    // -v for the full multi-claim blocks.
+                    println!("             {backend:<12} {statement}");
+                    if let Some(url) = url {
+                        println!("             {:<12} → {url}", "");
                     }
                 }
             }
@@ -624,7 +849,7 @@ pub async fn scan(
     }
 
     ticker.clear();
-    let scanned = results.len();
+    let reused = reused.load(Ordering::Relaxed);
     let mut summary = json!({
         "files": scanned,
         "bytes": total_bytes,
@@ -638,16 +863,26 @@ pub async fn scan(
         "per_filter": per_filter.iter().map(|(k, v)| (k.to_string(), v)).collect::<std::collections::BTreeMap<_,_>>(),
         "filters_loaded": filters.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
     });
-    if resolver.is_some() {
+    if opts.resolve {
         summary["attributed"] = json!(attributed);
         summary["consistent"] = json!(consistent_files);
         summary["membership_only"] = json!(membership_only);
+    }
+    if nested > 0 {
+        summary["members"] = json!(nested);
+        summary["members_identified"] = json!(n_identified);
+        summary["members_consistent"] = json!(n_consistent);
+        summary["members_membership"] = json!(n_membership);
+        summary["members_unknown"] = json!(n_unknown);
+    }
+    if truncated {
+        summary["truncated"] = json!(true);
     }
     if opts.json {
         println!("{summary}");
     } else {
         eprintln!();
-        let mut attribution = if resolver.is_some() {
+        let mut attribution = if opts.resolve {
             format!(", {attributed} attributed")
         } else {
             String::new()
@@ -666,6 +901,19 @@ pub async fn scan(
             human(known_bytes),
             scanned - known
         );
+        if nested > 0 {
+            println!(
+                "{nested} nested member{} — {n_identified} identified, {n_consistent} consistent \
+                 (weak digests only), {n_membership} known to filters, {n_unknown} unknown",
+                s(nested)
+            );
+        }
+        if truncated {
+            println!(
+                "  (a descent stopped at {} members — the rest were not examined)",
+                crate::peek_walk::MAX_MEMBERS
+            );
+        }
         for (f, n) in &per_filter {
             println!("  {f}: {n} file{}", s(*n));
         }

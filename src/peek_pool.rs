@@ -26,42 +26,50 @@ const CHUNK: usize = 256 << 10;
 /// real buffered bytes stay well under this.
 const BUDGET: i64 = 512 << 20;
 
-/// All six coordinates of one member, inline — a Vec<Coord> per
-/// member costs seven allocations and half a million members is real
-/// memory.
+/// The coordinates of one member, inline — a Vec<Coord> per member
+/// costs allocations and half a million members is real memory.
+/// sha1 + sha256 are always minted (they're what filters, the local
+/// index, and the walk seeds key on); the rest are minted for
+/// container members (the full six-scheme observation) but not for
+/// plain disk files, which keep scan's two-scheme cost profile.
 pub struct Digests {
-    pub md5: [u8; 16],
+    pub md5: Option<[u8; 16]>,
     pub sha1: [u8; 20],
     pub sha256: [u8; 32],
-    pub sha512: [u8; 64],
-    pub blake2s: [u8; 32],
+    pub sha512: Option<[u8; 64]>,
+    pub blake2s: Option<[u8; 32]>,
     pub sha1_git: Option<[u8; 20]>,
 }
 
 impl Digests {
     pub fn coords(&self) -> Vec<Coord> {
-        let mut coords = vec![
-            Coord {
+        let mut coords = Vec::with_capacity(6);
+        if let Some(d) = self.md5 {
+            coords.push(Coord {
                 scheme: Scheme::Md5,
-                digest: self.md5.to_vec(),
-            },
-            Coord {
-                scheme: Scheme::Sha1,
-                digest: self.sha1.to_vec(),
-            },
-            Coord {
-                scheme: Scheme::Sha256,
-                digest: self.sha256.to_vec(),
-            },
-            Coord {
+                digest: d.to_vec(),
+            });
+        }
+        coords.push(Coord {
+            scheme: Scheme::Sha1,
+            digest: self.sha1.to_vec(),
+        });
+        coords.push(Coord {
+            scheme: Scheme::Sha256,
+            digest: self.sha256.to_vec(),
+        });
+        if let Some(d) = self.sha512 {
+            coords.push(Coord {
                 scheme: Scheme::Sha512,
-                digest: self.sha512.to_vec(),
-            },
-            Coord {
+                digest: d.to_vec(),
+            });
+        }
+        if let Some(d) = self.blake2s {
+            coords.push(Coord {
                 scheme: Scheme::Blake2s256,
-                digest: self.blake2s.to_vec(),
-            },
-        ];
+                digest: d.to_vec(),
+            });
+        }
         if let Some(g) = self.sha1_git {
             coords.push(Coord {
                 scheme: Scheme::Sha1Git,
@@ -88,7 +96,14 @@ pub struct Member {
     pub ord: usize,
     pub kind: &'static str,
     pub size: u64,
-    pub digests: Digests,
+    /// A real filesystem object (a directory node or a disk file) as
+    /// opposed to a nested member inside a container. Filesystem
+    /// files feed the local index and scan's file summary; nested
+    /// members are counted separately.
+    pub fs: bool,
+    /// None for tree nodes without a bytestream of their own —
+    /// directories are containers that no hash names.
+    pub digests: Option<Digests>,
     pub matched: Vec<String>,
     pub children: usize,
     pub note: Option<String>,
@@ -198,11 +213,11 @@ impl Build {
         let meta = self.meta.lock().unwrap().take().expect("sealed twice");
         let p = std::mem::take(&mut *self.parts.lock().unwrap());
         let digests = Digests {
-            md5: p.md5.expect("md5 part"),
+            md5: p.md5,
             sha1: p.sha1.expect("sha1 part"),
             sha256: p.sha256.expect("sha256 part"),
-            sha512: p.sha512.expect("sha512 part"),
-            blake2s: p.blake2s.expect("blake2s part"),
+            sha512: p.sha512,
+            blake2s: p.blake2s,
             sha1_git: p.sha1_git,
         };
         let size = self.size.load(Ordering::Acquire);
@@ -211,23 +226,7 @@ impl Build {
         // members never probe.
         let mut matched: Vec<String> = Vec::new();
         if size >= IDENTITY_MIN_BYTES {
-            let sha1_hex = hex_upper(&digests.sha1);
-            let sha256_hex = hex_lower(&digests.sha256);
-            for f in &pool.probe_order {
-                if f.bytes >= EXPENSIVE_FILTER_BYTES && !matched.is_empty() {
-                    continue;
-                }
-                let key: &[u8] = match f.scheme {
-                    Scheme::Sha1 => sha1_hex.as_bytes(),
-                    Scheme::Sha256 => sha256_hex.as_bytes(),
-                    _ => continue,
-                };
-                if f.bloom.check(key) {
-                    matched.push(f.name.clone());
-                }
-            }
-            matched.sort();
-            matched.dedup();
+            matched = pool.probe(&digests.sha1, &digests.sha256, pool.probe_all).0;
         }
         let member = Member {
             path: meta.path,
@@ -236,17 +235,14 @@ impl Build {
             ord: meta.ord,
             kind: meta.kind,
             size,
-            digests,
+            fs: false,
+            digests: Some(digests),
             matched,
             children: meta.children,
             note: meta.note,
         };
-        pool.members.lock().unwrap()[self.slot] = Some(member);
-        let sealed = pool.sealed.fetch_add(1, Ordering::AcqRel) + 1;
-        {
-            let _g = pool.idle_m.lock().unwrap();
-            pool.idle_cv.notify_all();
-        }
+        pool.fill(self.slot, member);
+        let sealed = pool.sealed.load(Ordering::Acquire);
         pool.ticker
             .update(64, sealed, || format!("descending… {sealed} members"));
     }
@@ -345,6 +341,19 @@ impl MetaClose {
     }
 }
 
+/// A reserved-but-unfilled slot for a member assembled synchronously
+/// by whoever holds it (the scan workers hash disk files inline and
+/// construct the whole Member themselves — no jobs, no Build). The
+/// slot must be filled before the pool is waited on; parents reserve
+/// before their children so parent slots exist to point at.
+pub(crate) struct Slot(usize);
+
+impl Slot {
+    pub(crate) fn idx(&self) -> usize {
+        self.0
+    }
+}
+
 // ---------------------------------------------------------------- pool
 
 enum Task {
@@ -371,6 +380,9 @@ pub(crate) struct Pool<'f> {
     idle_m: Mutex<()>,
     idle_cv: Condvar,
     probe_order: Vec<&'f NamedFilter>,
+    /// Probe every filter even when a smaller one matched (scan's
+    /// --probe-all, honored for container members too).
+    probe_all: bool,
     ticker: &'f Ticker,
 }
 
@@ -379,6 +391,7 @@ impl<'f> Pool<'f> {
         probe_order: Vec<&'f NamedFilter>,
         ticker: &'f Ticker,
         threads: usize,
+        probe_all: bool,
     ) -> Pool<'f> {
         Pool {
             queue: Mutex::new(VecDeque::new()),
@@ -394,8 +407,67 @@ impl<'f> Pool<'f> {
             idle_m: Mutex::new(()),
             idle_cv: Condvar::new(),
             probe_order,
+            probe_all,
             ticker,
         }
+    }
+
+    /// Reserve a member slot to be filled synchronously by the caller
+    /// (no hash jobs — the scan workers hash inline). Counted like any
+    /// member: every reserved slot MUST be filled or the pool never
+    /// goes idle.
+    pub(crate) fn reserve(&self) -> Slot {
+        let mut m = self.members.lock().unwrap();
+        m.push(None);
+        self.created.fetch_add(1, Ordering::AcqRel);
+        Slot(m.len() - 1)
+    }
+
+    /// Seal a reserved slot with a fully assembled member.
+    pub(crate) fn fill_slot(&self, slot: Slot, member: Member) {
+        self.fill(slot.0, member);
+    }
+
+    fn fill(&self, slot: usize, member: Member) {
+        self.members.lock().unwrap()[slot] = Some(member);
+        self.sealed.fetch_add(1, Ordering::AcqRel);
+        let _g = self.idle_m.lock().unwrap();
+        self.idle_cv.notify_all();
+    }
+
+    /// Check the membership filters for a digest pair, cheapest filter
+    /// first; filters at EXPENSIVE_FILTER_BYTES and above are skipped
+    /// once a smaller one already matched (unless `probe_all`).
+    /// Returns the matched filter names (sorted, deduped — one name
+    /// per source even when its sha1 and sha256 blooms both fire) and
+    /// whether any big filter was skipped.
+    pub(crate) fn probe(
+        &self,
+        sha1: &[u8; 20],
+        sha256: &[u8; 32],
+        probe_all: bool,
+    ) -> (Vec<String>, bool) {
+        let sha1_hex = hex_upper(sha1);
+        let sha256_hex = hex_lower(sha256);
+        let mut matched: Vec<String> = Vec::new();
+        let mut skipped_big = false;
+        for f in &self.probe_order {
+            if !probe_all && f.bytes >= EXPENSIVE_FILTER_BYTES && !matched.is_empty() {
+                skipped_big = true;
+                continue;
+            }
+            let key: &[u8] = match f.scheme {
+                Scheme::Sha1 => sha1_hex.as_bytes(),
+                Scheme::Sha256 => sha256_hex.as_bytes(),
+                _ => continue,
+            };
+            if f.bloom.check(key) {
+                matched.push(f.name.clone());
+            }
+        }
+        matched.sort();
+        matched.dedup();
+        (matched, skipped_big)
     }
 
     /// Reserve the next member slot and set up its hash jobs. `ord`
@@ -409,12 +481,7 @@ impl<'f> Pool<'f> {
         len: Option<u64>,
         ord: Option<usize>,
     ) -> (MetaClose, Feed) {
-        let slot = {
-            let mut m = self.members.lock().unwrap();
-            m.push(None);
-            m.len() - 1
-        };
-        self.created.fetch_add(1, Ordering::AcqRel);
+        let slot = self.reserve().0;
         let mut hashers = vec![
             HState::Md5(md5::Md5::new()),
             HState::Sha1(sha1::Sha1::new()),
@@ -595,11 +662,6 @@ impl<'f> Pool<'f> {
             }
         }
         feed.close(self);
-    }
-
-    /// Members created so far — the walker's MAX_MEMBERS check.
-    pub(crate) fn created(&self) -> usize {
-        self.created.load(Ordering::Acquire)
     }
 
     /// Block until every member has sealed. Every member always
