@@ -74,9 +74,10 @@ Privacy is a consent line, not a mode:
 - **Offline by default where it matters**: membership checks and
   `scan`'s attribution walk run against local filters and indexes.
 - **Dataset transports** (the fatcat scholarly index, release
-  tarballs) are range reads over static published parquet — the
-  server sees byte offsets, never your digests — so `scan` uses them
-  without asking. `hdx index pull` makes them local and fully offline.
+  tarballs, the IA census) are range reads over static published
+  parquet — the server sees byte offsets, never your digests — so
+  `scan` uses them without asking. `hdx index pull` makes them local
+  and fully offline.
 - **Third-party APIs** (CIRCL, deps.dev, Software Heritage, Rekor,
   snapshot.debian.org) are only told your digests when you
   ask: single-hash `hdx <hash>` lookups query them, and batch scans
@@ -107,6 +108,13 @@ build our own from public digest extracts:
   Internet Archive's bibliographic catalog bulk export; the companion
   [fatcat-files dataset](https://huggingface.co/datasets/david-ar/fatcat-files)
   turns matches into full citations with archived-copy URLs.
+- **IA census** — 150M per-file md5+sha1 rows covering every public
+  Internet Archive item as of April 2016 (the only bulk hash
+  inventory of IA ever published), as the
+  [ia-census dataset](https://huggingface.co/datasets/david-ar/ia-census).
+  Both digests are weak, so scan reports census matches as
+  "consistent (sha1)" — a separate verdict tier that never claims
+  verified identity — with the item's download URL as the claim.
 - **deps.dev** — 172M package-artifact digests (sha1+sha256) from the
   BigQuery public dataset, free tier.
 - **Rekor** — attestation subject digests from the BigQuery public

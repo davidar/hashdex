@@ -848,7 +848,14 @@ fn fetch_registry_works_offline() {
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let text = stdout(&out);
     for name in [
-        "circl", "fedora", "fatcat", "depsdev", "rekor", "swh", "tarballs",
+        "circl",
+        "fedora",
+        "fatcat",
+        "depsdev",
+        "rekor",
+        "swh",
+        "tarballs",
+        "ia-census",
     ] {
         assert!(text.contains(name), "registry listing missing {name}");
     }

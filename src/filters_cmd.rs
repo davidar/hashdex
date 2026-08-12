@@ -112,6 +112,14 @@ const REGISTRY: &[RegistryEntry] = &[
         huge: false,
     },
     RegistryEntry {
+        name: "ia-census",
+        scheme: "sha1",
+        urls: &["https://huggingface.co/datasets/david-ar/ia-census/resolve/main/ia-census.sha1.bloom"],
+        size: "311 MiB",
+        source: "Internet Archive 2016 census: every public item's files",
+        huge: false,
+    },
+    RegistryEntry {
         name: "swh",
         scheme: "sha256",
         urls: &["https://huggingface.co/datasets/david-ar/swh-content-bloom/resolve/main/2026-06-04/swh.sha256.bloom"],

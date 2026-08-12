@@ -70,8 +70,8 @@ pub static TARBALLS: Spec = Spec {
 
 pub static CENSUS: Spec = Spec {
     name: "ia-census",
-    repo: "david-ar/ia-census-2016",
-    approx_size: "~11 GB",
+    repo: "david-ar/ia-census",
+    approx_size: "~14 GB",
     suffix: 8 << 20,
     supports: crate::census::supports,
     start_paths: crate::census::start_paths,
