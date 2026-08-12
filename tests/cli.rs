@@ -1059,6 +1059,12 @@ fn peek_descends_containers() {
     assert!(text.contains("payload.txt"), "{text}");
     assert!(text.contains("[peeksrc]"), "member not tagged:\n{text}");
     assert!(text.contains("below identity floor"), "{text}");
+    // Container verdicts are recursive: the gz line rolls up leaves
+    // from two levels down (the known payload + the sub-floor member).
+    assert!(
+        text.contains("(2 members: 1 known, 1 below floor)"),
+        "no recursive rollup:\n{text}"
+    );
 
     // Deb-shaped ar: the nested chain ar→gz→tar reaches the same bytes.
     let out = env.hdx(&["--offline", "--json", "peek", deb.to_str().unwrap()]);
@@ -1153,6 +1159,40 @@ fn peek_descends_containers() {
         text.contains("[peeksrc]"),
         "cpio member not tagged:\n{text}"
     );
+
+    // iso9660 (hand-rolled walker): minimal image — PVD at sector 16
+    // pointing at a root directory holding one file.
+    let iso = {
+        let mut img = vec![0u8; 22 * 2048];
+        let pvd = 16 * 2048;
+        img[pvd] = 1;
+        img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        img[pvd + 6] = 1;
+        let r = pvd + 156; // root record: lba 20, one sector, dir flag
+        img[r] = 34;
+        img[r + 2..r + 6].copy_from_slice(&20u32.to_le_bytes());
+        img[r + 10..r + 14].copy_from_slice(&2048u32.to_le_bytes());
+        img[r + 25] = 0x02;
+        img[r + 32] = 1;
+        let term = 17 * 2048;
+        img[term] = 255;
+        img[term + 1..term + 6].copy_from_slice(b"CD001");
+        img[term + 6] = 1;
+        let d = 20 * 2048; // root directory: one file record
+        let name = b"PAYLOAD.TXT;1";
+        img[d] = (33 + name.len()) as u8;
+        img[d + 2..d + 6].copy_from_slice(&21u32.to_le_bytes());
+        img[d + 10..d + 14].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        img[d + 32] = name.len() as u8;
+        img[d + 33..d + 33 + name.len()].copy_from_slice(name);
+        img[21 * 2048..21 * 2048 + payload.len()].copy_from_slice(payload);
+        env.write("t.iso", &img)
+    };
+    let out = env.hdx(&["--offline", "peek", iso.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("PAYLOAD.TXT"), "iso member missing:\n{text}");
+    assert!(text.contains("[peeksrc]"), "iso member not tagged:\n{text}");
 
     // Errors: no files; a directory.
     let out = env.hdx(&["peek"]);

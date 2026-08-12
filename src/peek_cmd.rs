@@ -220,6 +220,27 @@ fn unwrapped_name(name: &str, kind: Kind) -> String {
 
 // ------------------------------------------------------------- member
 
+/// One member's resolution tier, computed once and reused by the
+/// listing, the summary, and the container rollups.
+#[derive(Clone, Copy, PartialEq)]
+enum Class {
+    Identified,
+    Consistent,
+    Membership,
+    Unknown,
+    Floor,
+}
+
+/// Recursive verdict for a container: counts over every LEAF
+/// descendant, at any depth.
+#[derive(Default, Clone, Copy)]
+struct Rollup {
+    total: usize,
+    known: usize,
+    unknown: usize,
+    floor: usize,
+}
+
 pub struct Member {
     pub path: String,
     pub depth: usize,
@@ -235,6 +256,9 @@ pub struct Member {
 
 struct Ctx<'a> {
     members: Vec<Option<Member>>,
+    /// The root file's path: already seekable, so seek-needing
+    /// containers at depth 0 re-open it instead of spooling a copy.
+    root: Option<PathBuf>,
     /// Probe order mirrors scan: cheapest filter first, RAM-dwarfing
     /// ones skipped once a smaller filter already matched.
     probe_order: Vec<&'a NamedFilter>,
@@ -338,31 +362,48 @@ fn process(
 
     // Depth-capped or unsupported containers still get fully hashed —
     // identity never depends on whether we can see inside.
-    let too_deep = depth >= MAX_DEPTH && !matches!(kind, Kind::Plain | Kind::SevenZ | Kind::Iso);
+    let too_deep = depth >= MAX_DEPTH && !matches!(kind, Kind::Plain | Kind::SevenZ);
     let mut note = None;
     let mut children = 0usize;
 
     match kind {
         Kind::Plain => drain(&mut tee),
-        Kind::SquashFs => {
-            // backhand needs BufRead + Seek, so squashfs spools like zip.
-            let (minted, spool) = spool_all(tee.mint, tee.inner)?;
-            if let Err(e) = walk_squashfs(ctx, spool, &path, depth, &mut children) {
-                note = Some(format!("squashfs parse failed: {e}"));
-            }
-            ctx.seal(slot, Member::build(path, depth, kind, minted, children, note));
-            return Ok(());
-        }
-        Kind::SevenZ | Kind::Iso => {
-            note = Some(format!(
-                "{} recognized — descending into it is not supported yet",
-                kind.label()
-            ));
-            drain(&mut tee);
-        }
+        // The cap must outrank every container arm below.
         _ if too_deep => {
             note = Some(format!(
                 "nested deeper than {MAX_DEPTH} levels — not descended"
+            ));
+            drain(&mut tee);
+        }
+        Kind::SquashFs => {
+            // backhand needs BufRead + Seek, so squashfs spools like zip.
+            let (minted, spool) = spool_or_root(ctx, tee, depth)?;
+            if let Err(e) = walk_squashfs(ctx, spool, &path, depth, &mut children) {
+                note = Some(format!("squashfs parse failed: {e}"));
+            }
+            ctx.seal(
+                slot,
+                Member::build(path, depth, kind, minted, children, note),
+            );
+            return Ok(());
+        }
+        Kind::Iso => {
+            // iso9660 files are contiguous extents — pure (offset, len)
+            // reads over the spooled image, no decompression at all.
+            let (minted, mut spool) = spool_or_root(ctx, tee, depth)?;
+            if let Err(e) = walk_iso(ctx, &mut spool, &path, depth, &mut children) {
+                note = Some(format!("iso9660 parse failed: {e}"));
+            }
+            ctx.seal(
+                slot,
+                Member::build(path, depth, kind, minted, children, note),
+            );
+            return Ok(());
+        }
+        Kind::SevenZ => {
+            note = Some(format!(
+                "{} recognized — descending into it is not supported yet",
+                kind.label()
             ));
             drain(&mut tee);
         }
@@ -535,12 +576,15 @@ fn process(
         Kind::Zip => {
             // Zip needs random access (the truth lives in the central
             // directory), so the member spools — hashed on the way in.
-            let (minted, spool) = spool_all(tee.mint, tee.inner)?;
+            let (minted, spool) = spool_or_root(ctx, tee, depth)?;
             match walk_zip(ctx, spool, &path, depth, &mut children) {
                 Ok(()) => {}
                 Err(e) => note = Some(format!("zip parse failed: {e}")),
             }
-            ctx.seal(slot, Member::build(path, depth, kind, minted, children, note));
+            ctx.seal(
+                slot,
+                Member::build(path, depth, kind, minted, children, note),
+            );
             return Ok(());
         }
     }
@@ -638,6 +682,20 @@ fn walk_cpio(
     }
 }
 
+/// Seek-needing containers: the root file is already seekable, so
+/// hash it in place and re-open it rather than copying gigabytes into
+/// a spool; nested members genuinely need the copy.
+fn spool_or_root(ctx: &Ctx, mut tee: Tee<'_>, depth: usize) -> Result<(Minted, Spool)> {
+    if depth == 0 {
+        if let Some(p) = &ctx.root {
+            drain(&mut tee);
+            let f = std::fs::File::open(p).with_context(|| format!("reopen {}", p.display()))?;
+            return Ok((tee.mint.finish(), Spool::File(std::io::BufReader::new(f))));
+        }
+    }
+    spool_all(tee.mint, tee.inner)
+}
+
 enum Spool {
     Mem(std::io::Cursor<Vec<u8>>),
     File(std::io::BufReader<std::fs::File>),
@@ -678,7 +736,15 @@ fn spool_all(mut mint: Mint, mut src: Box<dyn Read + '_>) -> Result<(Minted, Spo
         } else {
             mem.extend_from_slice(&buf[..n]);
             if mem.len() as u64 > RAM_SPOOL_MAX {
-                let mut f = tempfile::tempfile().context("create spool temp file")?;
+                // NOT tempfile::tempfile(): std's temp dir is tmpfs on
+                // many distros, and a multi-GB spool in tmpfs is a
+                // memory bomb. The cache dir is real disk.
+                let dir = crate::filter::filters_dir()
+                    .parent()
+                    .map(|p| p.join("tmp"))
+                    .context("no cache dir")?;
+                std::fs::create_dir_all(&dir)?;
+                let mut f = tempfile::tempfile_in(&dir).context("create spool temp file")?;
                 f.write_all(&mem)?;
                 mem = Vec::new();
                 file = Some(f);
@@ -693,6 +759,206 @@ fn spool_all(mut mint: Mint, mut src: Box<dyn Read + '_>) -> Result<(Minted, Spo
         None => Spool::Mem(std::io::Cursor::new(mem)),
     };
     Ok((mint.finish(), spool))
+}
+
+/// iso9660, hand-rolled read-only. Volume descriptors start at sector
+/// 16; the primary descriptor's root record leads to a directory tree
+/// where every file is one or more contiguous extents. Names prefer
+/// Rock Ridge NM entries (Linux media carry them); plain 9660 names
+/// get their ";1" version suffix stripped. Joliet is not read.
+fn walk_iso(
+    ctx: &mut Ctx,
+    spool: &mut Spool,
+    path: &str,
+    depth: usize,
+    children: &mut usize,
+) -> Result<()> {
+    const SECTOR: u64 = 2048;
+    let mut root: Option<(u64, u64)> = None;
+    for sector in 16..48u64 {
+        let mut vd = [0u8; 2048];
+        spool.seek(std::io::SeekFrom::Start(sector * SECTOR))?;
+        spool.read_exact(&mut vd)?;
+        anyhow::ensure!(&vd[1..6] == b"CD001", "no CD001 volume descriptor");
+        match vd[0] {
+            1 if root.is_none() => {
+                // The root record's "name" is the pseudo-entry byte
+                // 0x00, so read the fields raw instead of via
+                // parse_iso_record (which rightly skips pseudo-entries).
+                let rec = &vd[156..190];
+                anyhow::ensure!(rec[0] >= 34, "bad root record");
+                let lba = u32::from_le_bytes(rec[2..6].try_into().unwrap()) as u64;
+                let size = u32::from_le_bytes(rec[10..14].try_into().unwrap()) as u64;
+                root = Some((lba, size));
+            }
+            255 => break,
+            _ => {}
+        }
+    }
+    let (lba, size) = root.context("no primary volume descriptor")?;
+    walk_iso_dir(ctx, spool, lba, size, path, "", depth, children)
+}
+
+struct IsoRecord {
+    lba: u64,
+    size: u64,
+    is_dir: bool,
+    more_extents: bool,
+    name: String,
+}
+
+fn parse_iso_record(rec: &[u8]) -> Option<IsoRecord> {
+    let len = rec[0] as usize;
+    if len < 34 || rec.len() < len {
+        return None;
+    }
+    let lba = u32::from_le_bytes(rec[2..6].try_into().ok()?) as u64;
+    let size = u32::from_le_bytes(rec[10..14].try_into().ok()?) as u64;
+    let flags = rec[25];
+    let name_len = rec[32] as usize;
+    if 33 + name_len > len {
+        return None;
+    }
+    let raw = &rec[33..33 + name_len];
+    // 0x00/0x01 are the self/parent pseudo-entries.
+    if raw == [0x00] || raw == [0x01] {
+        return None;
+    }
+    let mut name = String::from_utf8_lossy(raw)
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('.')
+        .to_string();
+    // Rock Ridge: the system use area (after the name, padded to even)
+    // may carry NM entries with the real name.
+    let mut su = 33 + name_len + (1 - name_len % 2);
+    let mut rr_name = String::new();
+    while su + 4 <= len {
+        let (sig, entry_len) = (&rec[su..su + 2], rec[su + 2] as usize);
+        if entry_len < 4 || su + entry_len > len {
+            break;
+        }
+        if sig == b"NM" && entry_len > 5 {
+            rr_name.push_str(&String::from_utf8_lossy(&rec[su + 5..su + entry_len]));
+        }
+        su += entry_len;
+    }
+    if !rr_name.is_empty() && rr_name != "." && rr_name != ".." {
+        name = rr_name;
+    }
+    Some(IsoRecord {
+        lba,
+        size,
+        is_dir: flags & 0x02 != 0,
+        more_extents: flags & 0x80 != 0,
+        name,
+    })
+}
+
+/// Reads a file that spans one or more extents of the spooled image.
+struct ExtentReader<'a> {
+    spool: &'a mut Spool,
+    extents: std::collections::VecDeque<(u64, u64)>, // (byte offset, len)
+    current: u64,                                    // bytes left in the seeked extent
+}
+
+impl Read for ExtentReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.current == 0 {
+            let Some((off, len)) = self.extents.pop_front() else {
+                return Ok(0);
+            };
+            self.spool.seek(std::io::SeekFrom::Start(off))?;
+            self.current = len;
+        }
+        let want = buf.len().min(self.current as usize);
+        let n = self.spool.read(&mut buf[..want])?;
+        self.current -= n as u64;
+        Ok(n)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_iso_dir(
+    ctx: &mut Ctx,
+    spool: &mut Spool,
+    lba: u64,
+    size: u64,
+    path: &str,
+    prefix: &str,
+    depth: usize,
+    children: &mut usize,
+) -> Result<()> {
+    anyhow::ensure!(size < 64 << 20, "directory extent implausibly large");
+    spool.seek(std::io::SeekFrom::Start(lba * 2048))?;
+    let mut dir = vec![0u8; size as usize];
+    spool.read_exact(&mut dir)?;
+
+    // Parse the whole directory before touching the spool again.
+    let mut files: Vec<(String, Vec<(u64, u64)>)> = Vec::new();
+    let mut dirs: Vec<(String, u64, u64)> = Vec::new();
+    let mut pending: Option<(String, Vec<(u64, u64)>)> = None;
+    let mut off = 0usize;
+    while off < dir.len() {
+        if dir[off] == 0 {
+            // Records never span sectors; a zero length pads to the
+            // next sector boundary.
+            off = (off / 2048 + 1) * 2048;
+            continue;
+        }
+        let len = dir[off] as usize;
+        if off + len > dir.len() {
+            break;
+        }
+        if let Some(rec) = parse_iso_record(&dir[off..off + len]) {
+            if rec.is_dir {
+                dirs.push((rec.name, rec.lba, rec.size));
+            } else {
+                let extent = (rec.lba * 2048, rec.size);
+                match &mut pending {
+                    // Multi-extent continuation of the same file.
+                    Some((_, extents)) => extents.push(extent),
+                    None => pending = Some((rec.name, vec![extent])),
+                }
+                if !rec.more_extents {
+                    files.push(pending.take().unwrap());
+                }
+            }
+        }
+        off += len;
+    }
+
+    for (name, extents) in files {
+        *children += 1;
+        let total: u64 = extents.iter().map(|(_, l)| l).sum();
+        let mut rdr = ExtentReader {
+            spool,
+            extents: extents.into(),
+            current: 0,
+        };
+        process(
+            ctx,
+            &mut rdr,
+            Some(total),
+            format!("{path}!{prefix}{name}"),
+            &name.clone(),
+            depth + 1,
+        )?;
+    }
+    for (name, sub_lba, sub_size) in dirs {
+        walk_iso_dir(
+            ctx,
+            spool,
+            sub_lba,
+            sub_size,
+            path,
+            &format!("{prefix}{name}/"),
+            depth,
+            children,
+        )?;
+    }
+    Ok(())
 }
 
 fn walk_squashfs(
@@ -811,6 +1077,7 @@ pub async fn peek(
         probe_order.sort_by_key(|f| f.bytes);
         let mut ctx = Ctx {
             members: Vec::new(),
+            root: Some(root.clone()),
             probe_order,
             truncated: false,
             ticker: &ticker,
@@ -882,23 +1149,61 @@ pub async fn peek(
         }
         let has_claims = identified.iter().any(|f| !f.claims.is_empty());
         let has_consistent = consistent.iter().any(|f| !f.claims.is_empty());
-        if has_claims {
+        let class = if m.size < IDENTITY_MIN_BYTES {
+            Class::Floor
+        } else if has_claims {
             n_identified += 1;
+            Class::Identified
         } else if has_consistent {
             n_consistent += 1;
+            Class::Consistent
         } else if !m.matched.is_empty() {
             n_membership += 1;
-        } else if m.size >= IDENTITY_MIN_BYTES {
+            Class::Membership
+        } else {
             n_unknown += 1;
-        }
-        rendered.push((m, identified, consistent));
+            Class::Unknown
+        };
+        rendered.push((m, identified, consistent, class));
     }
+
+    // A container's verdict is recursive: roll up every LEAF
+    // descendant (members are in DFS order, so a member's subtree is
+    // the run of deeper entries that follows it). Wrapper
+    // pseudo-members and nested containers don't count against the
+    // rollup — their own bytes being unindexed says nothing about
+    // what they hold.
+    let rollups: Vec<Option<Rollup>> = (0..rendered.len())
+        .map(|i| {
+            let (m, ..) = &rendered[i];
+            if m.children == 0 {
+                return None;
+            }
+            let mut r = Rollup::default();
+            for (d, .., class) in rendered.iter().skip(i + 1) {
+                if d.depth <= m.depth {
+                    break;
+                }
+                if d.children > 0 {
+                    continue;
+                }
+                r.total += 1;
+                match class {
+                    Class::Identified | Class::Consistent | Class::Membership => r.known += 1,
+                    Class::Unknown => r.unknown += 1,
+                    Class::Floor => r.floor += 1,
+                }
+            }
+            Some(r)
+        })
+        .collect();
 
     if opts.json {
         let out: Vec<serde_json::Value> = rendered
             .iter()
-            .map(|(m, identified, consistent)| {
-                json!({
+            .zip(&rollups)
+            .map(|((m, identified, consistent, _), rollup)| {
+                let mut v = json!({
                     "path": m.path,
                     "depth": m.depth,
                     "kind": m.kind,
@@ -909,7 +1214,16 @@ pub async fn peek(
                     "identified": identified,
                     "consistent": consistent,
                     "note": m.note,
-                })
+                });
+                if let Some(r) = rollup {
+                    v["rollup"] = json!({
+                        "files": r.total,
+                        "known": r.known,
+                        "unknown": r.unknown,
+                        "below_floor": r.floor,
+                    });
+                }
+                v
             })
             .collect();
         println!(
@@ -923,26 +1237,41 @@ pub async fn peek(
         return Ok(());
     }
 
-    for (m, identified, consistent) in &rendered {
+    for ((m, identified, consistent, _), rollup) in rendered.iter().zip(&rollups) {
         let indent = "  ".repeat(m.depth);
         let leaf = m.path.rsplit('!').next().unwrap_or(&m.path);
         let mut line = format!("{indent}{leaf} — {}", human(m.size));
         if m.kind != "file" {
             line.push_str(&format!(", {}", m.kind));
         }
-        if m.children > 0 {
-            line.push_str(&format!(" ({} member{})", m.children, s(m.children)));
+        if let Some(r) = rollup {
+            // The container's verdict is its contents', recursively.
+            if r.total == 0 {
+                line.push_str(" (no file members)");
+            } else if r.unknown == 0 && r.floor == 0 {
+                line.push_str(&format!(" ({} member{}, all known)", r.total, s(r.total)));
+            } else {
+                let mut parts = format!(" ({} member{}: {} known", r.total, s(r.total), r.known);
+                if r.unknown > 0 {
+                    parts.push_str(&format!(", {} unknown", r.unknown));
+                }
+                if r.floor > 0 {
+                    parts.push_str(&format!(", {} below floor", r.floor));
+                }
+                parts.push(')');
+                line.push_str(&parts);
+            }
         }
+        let no_claims = identified.iter().all(|f| f.claims.is_empty())
+            && consistent.iter().all(|f| f.claims.is_empty());
         if m.size < IDENTITY_MIN_BYTES {
             line.push_str("  (below identity floor)");
-        } else if identified.iter().all(|f| f.claims.is_empty())
-            && consistent.iter().all(|f| f.claims.is_empty())
-        {
-            if m.matched.is_empty() {
-                line.push_str("  — unknown");
-            } else {
-                line.push_str(&format!("  [{}]", m.matched.join(",")));
-            }
+        } else if no_claims && !m.matched.is_empty() {
+            line.push_str(&format!("  [{}]", m.matched.join(",")));
+        } else if no_claims && m.children == 0 {
+            // Only leaves wear "unknown" — a container's own unindexed
+            // bytes say nothing about what it holds.
+            line.push_str("  — unknown");
         }
         println!("{line}");
         if let Some(note) = &m.note {

@@ -21,7 +21,8 @@ hdx <hash>            # resolve (hex, base32, SRI, SWHID, scheme:hex);
 hdx coords <file>     # mint all six coordinates of local files
 hdx peek <file>       # hashoscope: recursively hash + identify every
                       #   nested member of a container (tar/zip/deb/
-                      #   rpm/cpio/squashfs; iso/7z recognized only)
+                      #   rpm/cpio/squashfs — iso and 7z are detected
+                      #   but not yet descended into)
 hdx scan <dir>        # scan against filters + attribute what it can
                       #   (dataset probes by default; --no-resolve =
                       #   census; --online consents to third-party APIs)
