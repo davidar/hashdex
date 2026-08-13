@@ -40,6 +40,8 @@ mod peek_source;
 #[cfg(feature = "cli")]
 mod peek_walk;
 #[cfg(feature = "cli")]
+pub mod recipe_cmd;
+#[cfg(feature = "cli")]
 mod report;
 #[cfg(feature = "cli")]
 pub mod resolve;

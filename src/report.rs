@@ -36,6 +36,31 @@ pub(crate) struct Rollup {
 
 pub(crate) type Evidence = (Vec<Finding>, Vec<Finding>);
 
+/// Assemble the member tree from the pool's slot table: drop members
+/// sealed into abandoned subtrees (conservative retries), renumber
+/// parent pointers into the surviving table. A survivor's parent
+/// always survives — discards drop whole subtrees, never a member
+/// without its descendants. Roots are filesystem objects whichever
+/// arm created them.
+pub(crate) fn compact_members(mut sealed: Vec<Option<Member>>, dead: &[usize]) -> Vec<Member> {
+    for &slot in dead {
+        sealed[slot] = None;
+    }
+    let mut members: Vec<Member> = Vec::new();
+    let mut remap: Vec<Option<usize>> = vec![None; sealed.len()];
+    for (slot, m) in sealed.into_iter().enumerate() {
+        if let Some(mut m) = m {
+            remap[slot] = Some(members.len());
+            m.parent = m.parent.map(|p| remap[p].expect("parent survived discard"));
+            if m.parent.is_none() {
+                m.fs = true;
+            }
+            members.push(m);
+        }
+    }
+    members
+}
+
 /// Resolve every member against the pulled datasets + observation
 /// store, in parallel: dataset reads are lock-free mmap lookups, each
 /// worker opens its own read connection to the observation store, and

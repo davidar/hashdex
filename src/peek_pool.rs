@@ -80,6 +80,17 @@ impl Digests {
     }
 }
 
+/// Where a member's bytes live inside a shared seekable source: the
+/// source's identity (`View::src_id`) plus (logical, source offset,
+/// len) runs. Only view-backed members carry this, and the runs are
+/// only meaningful against the source they name — a spool starts a
+/// fresh coordinate space, so consumers (recipes) must check `src`
+/// against the root's before treating runs as root-file ranges.
+pub struct Extents {
+    pub src: usize,
+    pub runs: Box<[(u64, u64, u64)]>,
+}
+
 pub struct Member {
     pub path: String,
     pub depth: usize,
@@ -104,6 +115,9 @@ pub struct Member {
     /// None for tree nodes without a bytestream of their own —
     /// directories are containers that no hash names.
     pub digests: Option<Digests>,
+    /// Byte ranges of this member within a shared source (ranged
+    /// members only; stream-fed members have no home in any source).
+    pub extents: Option<Extents>,
     pub matched: Vec<String>,
     pub children: usize,
     pub note: Option<String>,
@@ -190,6 +204,7 @@ struct Meta {
     kind: &'static str,
     children: usize,
     note: Option<String>,
+    extents: Option<Extents>,
 }
 
 impl Build {
@@ -237,6 +252,7 @@ impl Build {
             size,
             fs: false,
             digests: Some(digests),
+            extents: meta.extents,
             matched,
             children: meta.children,
             note: meta.note,
@@ -472,7 +488,8 @@ impl<'f> Pool<'f> {
 
     /// Reserve the next member slot and set up its hash jobs. `ord`
     /// defaults to the slot itself; a conservative retry passes the
-    /// replaced member's ord instead.
+    /// replaced member's ord instead. `extents` records where a
+    /// view-backed member's bytes live in its source.
     pub(crate) fn member(
         &self,
         path: String,
@@ -480,6 +497,7 @@ impl<'f> Pool<'f> {
         parent: Option<usize>,
         len: Option<u64>,
         ord: Option<usize>,
+        extents: Option<Extents>,
     ) -> (MetaClose, Feed) {
         let slot = self.reserve().0;
         let mut hashers = vec![
@@ -505,6 +523,7 @@ impl<'f> Pool<'f> {
                 kind: "file",
                 children: 0,
                 note: None,
+                extents,
             })),
             parts: Mutex::new(Partial::default()),
             // One part per hash job, plus the walker's metadata close.

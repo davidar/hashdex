@@ -169,6 +169,7 @@ fn descent_key(d: Descent) -> i64 {
 /// descent spreads it over every pool worker — the replay must not
 /// pay it serially, so it probes on a worker team first and fills
 /// slots (order-sensitive: parents before children) afterwards.
+#[allow(clippy::too_many_arguments)]
 fn materialize_cached(
     pool: &Pool,
     container_slot: usize,
@@ -177,10 +178,12 @@ fn materialize_cached(
     rows: &[crate::local_index::CachedMember],
     probe_all: bool,
     threads: usize,
+    ticker: &Ticker,
 ) {
     let matched: Vec<Vec<String>> = {
         let out: Mutex<Vec<Option<Vec<String>>>> = Mutex::new(vec![None; rows.len()]);
         let next = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for _ in 0..threads.min(rows.len()).max(1) {
                 scope.spawn(|| loop {
@@ -200,6 +203,10 @@ fn materialize_cached(
                         }));
                     }
                     out.lock().unwrap()[start..end].swap_with_slice(&mut chunk);
+                    let d = done.fetch_add(end - start, Ordering::Relaxed) + (end - start);
+                    ticker.update(100_000, d, || {
+                        format!("replaying cached descent… {d}/{} members", rows.len())
+                    });
                 });
             }
         });
@@ -235,6 +242,7 @@ fn materialize_cached(
                     blake2s: m.blake2s,
                     sha1_git: m.sha1_git,
                 }),
+                extents: None,
                 matched,
                 children: m.children,
                 note: m.note.clone(),
@@ -406,6 +414,7 @@ pub async fn scan(
                             size: 0,
                             fs: true,
                             digests: None,
+                            extents: None,
                             matched: Vec::new(),
                             children: d.children,
                             note: None,
@@ -575,6 +584,7 @@ pub async fn scan(
                                         &rows,
                                         opts.probe_all,
                                         threads,
+                                        ticker,
                                     );
                                     let matched = if e.size >= IDENTITY_MIN_BYTES {
                                         pool.probe(&e.sha1, &e.sha256, opts.probe_all).0
@@ -600,6 +610,7 @@ pub async fn scan(
                                                 blake2s: None,
                                                 sha1_git: None,
                                             }),
+                                            extents: None,
                                             matched,
                                             children: c.children,
                                             note: c.note.clone(),
@@ -667,6 +678,7 @@ pub async fn scan(
                                         &rows,
                                         opts.probe_all,
                                         threads,
+                                        ticker,
                                     );
                                     (
                                         c.children,
@@ -707,6 +719,7 @@ pub async fn scan(
                                             blake2s: None,
                                             sha1_git: None,
                                         }),
+                                        extents: None,
                                         matched,
                                         children,
                                         note,
@@ -755,28 +768,7 @@ pub async fn scan(
     let dead = walk.dead.into_inner().unwrap();
     ticker.clear();
 
-    // Assemble the member tree: drop members sealed into abandoned
-    // subtrees (conservative retries), renumber parent pointers into
-    // the surviving table. A survivor's parent always survives —
-    // discards drop whole subtrees, never a member without its
-    // descendants.
-    let mut sealed = pool.members.into_inner().unwrap();
-    for slot in dead {
-        sealed[slot] = None;
-    }
-    let mut members: Vec<Member> = Vec::new();
-    let mut remap: Vec<Option<usize>> = vec![None; sealed.len()];
-    for (slot, m) in sealed.into_iter().enumerate() {
-        if let Some(mut m) = m {
-            remap[slot] = Some(members.len());
-            m.parent = m.parent.map(|p| remap[p].expect("parent survived discard"));
-            // Roots are filesystem objects whichever arm created them.
-            if m.parent.is_none() {
-                m.fs = true;
-            }
-            members.push(m);
-        }
-    }
+    let members = report::compact_members(pool.members.into_inner().unwrap(), &dead);
 
     let seen = seen.into_inner().unwrap();
     let skipped = skipped.into_inner().unwrap();

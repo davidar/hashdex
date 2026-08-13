@@ -486,11 +486,6 @@ versioned static files by construction and skip the stability filter.)*
   twitter/the-algorithm) is largely inside SWH already —
   second-witness value only. Source: `gitea.arpa.li/
   JustAnotherArchivist/codearchiver` (GitHub mirrors 404).
-- **e621 db_export** — `static1.e621.net/data/db_export/posts.csv.gz`
-  (1.9 GB, daily, 4-day retention): ~5.5–6.6M rows md5 + tags + size
-  + ext; claim URL by construction `static1.e621.net/data/{m[0:2]}/
-  {m[2:4]}/{md5}.{ext}` (verified live). md5-only + adult art booru —
-  **attestor-taste call pending, not queued**.
 - **Fatcat / IA Scholar** 🔀 — the scholarly-PDF jackpot: `archive.org/details/fatcat_snapshots_and_exports`,
   item `fatcat_bulk_exports_2024-02-18` contains
   `file_hashes.tsv.gz` (14.23 GiB) — schema
@@ -498,11 +493,21 @@ versioned static files by construction and skip the stability filter.)*
   single-witness → edge-minting legal), **122.3M unique sha1 /
   122.2M sha256** measured on ingest; plus
   `file_export.json.gz` (23 GiB, adds URLs + mimetype + DOI-linked
-  release ids) and `release_extid.tsv.gz` (10.7 GiB, DOI/PMID/arXiv
-  crosswalk). Free HTTPS download, no auth. ⚠️ Fatcat is frozen —
-  2024-02-18 is the **last** export (editing paused after IA
-  cutbacks); treat as one-shot corpus. Metadata license CC0 per
-  fatcat guide (UNVERIFIED — guide.fatcat.wiki unreachable).
+  release ids) and `release_extid.tsv.gz` (10.7 GiB, DOI/PMID
+  crosswalk — **no arXiv column**; arXiv ids live only in
+  `release_export_expanded`'s ext_ids, 216 GiB). Free HTTPS download,
+  no auth. ⚠️ Fatcat is frozen AND the site is gone —
+  2024-02-18 is the **last** export, and `fatcat.wiki` +
+  `api.fatcat.wiki` refuse connections (verified 2026-08-02; wayback
+  holds no entity-page captures either). Fatcat idents are therefore
+  **join keys into the dumps only, never claim URLs** — the claim URL
+  is the wayback capture of the PDF itself (per-file `urls` in
+  file_export), with DOI/doi.org secondary. Corpus hygiene verified
+  on ingest: zero weak-digest collisions (75 duplicate md5/sha1 keys,
+  all same-sha256 re-registrations). Ingested → published as
+  `hf.co/datasets/david-ar/fatcat-files` (123.2M file×release rows,
+  sha256-sorted page-indexed parquet + sha1/md5 maps). Metadata
+  license CC0 per fatcat guide (UNVERIFIED — guide unreachable).
   Ops note: IA item torrents are web-seeded by the same datanodes as
   HTTP (no external seeders for datasets like this) — for the
   multi-hundred-GB items (release_export_expanded: 216 GiB), parallel

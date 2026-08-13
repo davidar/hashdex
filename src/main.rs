@@ -2,7 +2,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use hashdex::coord::{Coord, Scheme};
 use hashdex::resolve::{self, Options, Resolution};
-use hashdex::{cache, coords_cmd, filter, filters_cmd, index_cmd, local_index, scan_cmd};
+use hashdex::{
+    cache, coords_cmd, filter, filters_cmd, index_cmd, local_index, recipe_cmd, scan_cmd,
+};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -108,6 +110,18 @@ enum Command {
               conflicts_with = "no_resolve")]
         online: Option<String>,
     },
+    /// Mint a reconstruction manifest from a container file: its bytes
+    /// as a verified splice of member byte ranges — referenced by
+    /// digest, with claim URLs where the indexes name the bytes — plus
+    /// literal residue. Writes FILE.recipe.json (+ .residue); anyone
+    /// holding the members can rebuild the container byte-exact
+    #[command(args_conflicts_with_subcommands = true)]
+    Recipe {
+        #[command(subcommand)]
+        action: Option<RecipeAction>,
+        /// Container file to mint a recipe for
+        file: Option<PathBuf>,
+    },
     /// Find local files by digest (from the index hdx scan maintains)
     Locate {
         /// sha1 or sha256 hash (any common spelling)
@@ -124,6 +138,23 @@ enum Command {
     Filters {
         #[command(subcommand)]
         action: FilterAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecipeAction {
+    /// Rebuild a recipe from blobs already on disk and verify the
+    /// result byte-exact. Never fetches: missing members are listed
+    /// with their claim URLs and the check fails
+    Check {
+        /// The recipe document (FILE.recipe.json)
+        recipe: PathBuf,
+        /// Directory holding candidate member files (matched by
+        /// sha256, names irrelevant; searched recursively)
+        dir: PathBuf,
+        /// Also write the rebuilt container here
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
     },
 }
 
@@ -262,6 +293,22 @@ async fn main() -> Result<()> {
             };
             scan_cmd::scan(paths, &filters, &sopts, &client, &opts).await?;
         }
+        (Some(Command::Recipe { action, file }), _) => match (action, file) {
+            (
+                Some(RecipeAction::Check {
+                    recipe,
+                    dir,
+                    output,
+                }),
+                _,
+            ) => {
+                recipe_cmd::check(recipe, dir, output.as_deref())?;
+            }
+            (None, Some(f)) => recipe_cmd::mint(f, !cli.no_cache, cli.json)?,
+            (None, None) => {
+                anyhow::bail!("hdx recipe: name a container file, or `hdx recipe check RECIPE DIR`")
+            }
+        },
         (Some(Command::Locate { hash }), _) => {
             let coord = Coord::parse(hash)?;
             if !matches!(coord.scheme, Scheme::Sha1 | Scheme::Sha256) {

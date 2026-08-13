@@ -74,6 +74,17 @@ impl View {
         self.len
     }
 
+    /// (logical start, source offset, len) triples, logical ascending.
+    pub(crate) fn extents(&self) -> &[(u64, u64, u64)] {
+        &self.extents
+    }
+
+    /// Identity of the underlying source. Extents are only comparable
+    /// between views that share a source — a spool starts a new one.
+    pub(crate) fn src_id(&self) -> usize {
+        Arc::as_ptr(&self.src) as *const u8 as usize
+    }
+
     /// The same window with the cursor back at the start.
     pub(crate) fn rewound(&self) -> View {
         let mut v = self.clone();

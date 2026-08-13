@@ -361,7 +361,9 @@ impl Walk<'_, '_> {
             drain(r);
             return Ok(());
         }
-        let (meta, feed) = self.pool.member(path.clone(), depth, parent, len, None);
+        let (meta, feed) = self
+            .pool
+            .member(path.clone(), depth, parent, len, None, None);
         ctx.slots.push(meta.slot());
         self.run_member(r, meta, feed, path, name, depth, ctx)
     }
@@ -702,7 +704,18 @@ impl Walk<'_, '_> {
             }
         }
         let pool = self.pool;
-        let (meta, feed) = pool.member(path.clone(), depth, parent, Some(view.len()), None);
+        let extents = crate::peek_pool::Extents {
+            src: view.src_id(),
+            runs: view.extents().into(),
+        };
+        let (meta, feed) = pool.member(
+            path.clone(),
+            depth,
+            parent,
+            Some(view.len()),
+            None,
+            Some(extents),
+        );
         ctx.slots.push(meta.slot());
         let own = meta.slot();
         pool.read_task(view.clone(), feed);
@@ -1041,6 +1054,7 @@ impl Walk<'_, '_> {
                             Some(own),
                             Some(0),
                             None,
+                            None,
                         );
                         ctx.slots.push(meta.slot());
                         feed.close(pool);
@@ -1320,9 +1334,14 @@ impl Walk<'_, '_> {
                 *children += 1;
                 let leaf = name.rsplit('/').next().unwrap_or(name).to_string();
                 let child_path = format!("{path}!{name}");
-                let (meta, feed) =
-                    self.pool
-                        .member(child_path.clone(), depth + 1, Some(own), Some(size), None);
+                let (meta, feed) = self.pool.member(
+                    child_path.clone(),
+                    depth + 1,
+                    Some(own),
+                    Some(size),
+                    None,
+                    None,
+                );
                 batch.push(Mutex::new(Some(Item {
                     meta,
                     feed,
@@ -1384,6 +1403,7 @@ impl Walk<'_, '_> {
                                         Some(own),
                                         Some(item.size),
                                         Some(slot),
+                                        None,
                                     );
                                     wctx.slots.push(meta.slot());
                                     let mut again =

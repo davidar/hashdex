@@ -1784,3 +1784,230 @@ fn scan_retry_is_localized_to_the_squashfs_file() {
         "discarded slots leaked into the listing:\n{text}"
     );
 }
+
+// ---------------------------------------------------------------- recipe
+
+/// An uncompressed GNU tar — every member is a byte range of the root,
+/// which is what splice recipes reference.
+fn plain_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut b = tar::Builder::new(Vec::new());
+    for (name, bytes) in entries {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(bytes.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, name, *bytes).unwrap();
+    }
+    b.into_inner().unwrap()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+#[test]
+fn recipe_splices_a_plain_tar() {
+    let env = TestEnv::new("recipe-tar");
+    let big = vec![0xA5u8; 5000];
+    let mid: Vec<u8> = (0u8..=255).cycle().take(600).collect();
+    let tarball = plain_tar(&[("a.bin", &big), ("tiny", b"tiny"), ("b.bin", &mid)]);
+    let tar_path = env.write("demo.tar", &tarball);
+
+    let out = env.hdx(&["--offline", "recipe", tar_path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("verified byte-exact"),
+        "summary: {}",
+        stdout(&out)
+    );
+
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("demo.tar.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(doc["hdx_recipe"], "0");
+    assert_eq!(doc["source"]["sha256"], sha256_hex(&tarball).as_str());
+    let build = &doc["root"]["build"];
+    assert_eq!(build["builder"], "splice@0");
+    let inputs = build["inputs"].as_array().unwrap();
+    let refs: Vec<&str> = inputs
+        .iter()
+        .filter_map(|i| i["ref"]["name"].as_str())
+        .collect();
+    // The sub-floor member folds into the literals; the real payloads
+    // are referenced in tar order.
+    assert_eq!(refs, vec!["a.bin", "b.bin"]);
+    assert!(inputs.iter().any(|i| i["literal"].is_object()));
+    let cov = &doc["coverage"];
+    assert_eq!(cov["referenced_bytes"].as_u64().unwrap(), 5600);
+    assert_eq!(
+        cov["referenced_bytes"].as_u64().unwrap() + cov["residue_bytes"].as_u64().unwrap(),
+        cov["total_bytes"].as_u64().unwrap()
+    );
+
+    // Rebuild from blobs matched by content — names are irrelevant.
+    let blobs = env.work().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join("first"), &big).unwrap();
+    std::fs::write(blobs.join("second"), &mid).unwrap();
+    let rebuilt = env.work().join("rebuilt.tar");
+    let recipe = env.work().join("demo.tar.recipe.json");
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        recipe.to_str().unwrap(),
+        blobs.to_str().unwrap(),
+        "--output",
+        rebuilt.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    assert!(stdout(&out).contains("rebuilt byte-exact"));
+    assert_eq!(std::fs::read(&rebuilt).unwrap(), tarball);
+
+    // A member absent from the blob dir fails the check by name and
+    // digest; a tampered blob is the same case (matched by content).
+    std::fs::remove_file(blobs.join("second")).unwrap();
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        recipe.to_str().unwrap(),
+        blobs.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    let se = stderr(&out);
+    assert!(se.contains("missing: b.bin"), "stderr: {se}");
+    assert!(se.contains(&sha256_hex(&mid)), "stderr: {se}");
+}
+
+#[test]
+fn recipe_nests_and_rebuilds_from_leaves() {
+    let env = TestEnv::new("recipe-nest");
+    let pay1 = vec![1u8; 700];
+    let pay2 = vec![2u8; 800];
+    let pay3 = vec![3u8; 900];
+    let inner = plain_tar(&[("inner-a.bin", &pay1), ("inner-b.bin", &pay2)]);
+    let outer = plain_tar(&[("inner.tar", &inner), ("outer-c.bin", &pay3)]);
+    let outer_path = env.write("outer.tar", &outer);
+
+    let out = env.hdx(&["--offline", "recipe", outer_path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("outer.tar.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    // The inner tar is a build nested inside the root's splice, with
+    // its own refs.
+    let inputs = doc["root"]["build"]["inputs"].as_array().unwrap();
+    let nested = inputs
+        .iter()
+        .find(|i| i["build"]["name"] == "inner.tar")
+        .expect("inner tar must nest as a build");
+    let nested_refs: Vec<&str> = nested["build"]["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["ref"]["name"].as_str())
+        .collect();
+    assert_eq!(nested_refs, vec!["inner-a.bin", "inner-b.bin"]);
+
+    // The whole outer container rebuilds from leaf payloads alone —
+    // no copy of inner.tar needed.
+    let blobs = env.work().join("leaves");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join("one"), &pay1).unwrap();
+    std::fs::write(blobs.join("two"), &pay2).unwrap();
+    std::fs::write(blobs.join("three"), &pay3).unwrap();
+    let rebuilt = env.work().join("outer-rebuilt.tar");
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        env.work().join("outer.tar.recipe.json").to_str().unwrap(),
+        blobs.to_str().unwrap(),
+        "--output",
+        rebuilt.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    assert_eq!(std::fs::read(&rebuilt).unwrap(), outer);
+}
+
+#[test]
+fn recipe_wrapped_root_is_all_residue() {
+    use std::io::Write as _;
+    let env = TestEnv::new("recipe-tgz");
+    let tarball = plain_tar(&[("inside.bin", &vec![7u8; 400])]);
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(&tarball).unwrap();
+    let tgz = gz.finish().unwrap();
+    let path = env.write("demo.tar.gz", &tgz);
+
+    // Nothing behind the compressed wrapper is a byte range of the
+    // root — the honest recipe is a full copy, and it says so.
+    let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("full copy"),
+        "summary: {}",
+        stdout(&out)
+    );
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("demo.tar.gz.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(doc["coverage"]["referenced_bytes"], 0);
+
+    // Totality: even the trivial recipe rebuilds — from the residue
+    // alone, with an empty blob dir.
+    let blobs = env.work().join("empty");
+    std::fs::create_dir_all(&blobs).unwrap();
+    let rebuilt = env.work().join("rebuilt.tar.gz");
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        env.work().join("demo.tar.gz.recipe.json").to_str().unwrap(),
+        blobs.to_str().unwrap(),
+        "--output",
+        rebuilt.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    assert_eq!(std::fs::read(&rebuilt).unwrap(), tgz);
+}
+
+#[test]
+fn recipe_of_claimed_file_is_one_ref() {
+    use sha2::Digest as _;
+    let env = TestEnv::new("recipe-claimed");
+    let content = b"claimed-content: these exact bytes are indexed by the fixture dataset\n";
+    let sha256 = sha256_hex(content);
+    let sha1 = {
+        let mut h = sha1::Sha1::new();
+        h.update(content);
+        format!("{:x}", h.finalize())
+    };
+    let md5 = {
+        use md5::Digest as _;
+        format!("{:x}", md5::Md5::digest(content))
+    };
+    install_fatcat_dataset(&env, &[(&sha1, &sha256, &md5)]);
+    let path = env.write("paper.pdf", content);
+
+    // The indexes name the whole file: one ref, no splice, no residue.
+    let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("100% by claimed reference"),
+        "summary: {}",
+        stdout(&out)
+    );
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("paper.pdf.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    let r = &doc["root"]["ref"];
+    assert_eq!(r["digests"]["sha256"], sha256.as_str());
+    let url = r["claims"][0]["url"].as_str().unwrap();
+    assert!(url.contains("web.archive.org"), "claim url: {url}");
+    assert!(doc["residue"].is_null());
+    assert!(!env.work().join("paper.pdf.recipe.residue").exists());
+}
