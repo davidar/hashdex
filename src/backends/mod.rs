@@ -58,6 +58,11 @@ pub fn all() -> Vec<Backend> {
             lookup: |_, k| Box::pin(dataset::lookup(&datasets::CENSUS, k)),
         },
         Backend {
+            name: datasets::DEBS.name,
+            supports: datasets::DEBS.supports,
+            lookup: |_, k| Box::pin(dataset::lookup(&datasets::DEBS, k)),
+        },
+        Backend {
             name: swh::NAME,
             supports: swh::supports,
             lookup: single!(swh),

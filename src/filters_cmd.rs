@@ -112,6 +112,14 @@ const REGISTRY: &[RegistryEntry] = &[
         huge: false,
     },
     RegistryEntry {
+        name: "debs",
+        scheme: "sha256",
+        urls: &["https://huggingface.co/datasets/david-ar/deb-packages/resolve/main/debs.sha256.bloom"],
+        size: "~2 MiB",
+        source: "Debian/Ubuntu/Kali binary-package (.deb) checksums",
+        huge: false,
+    },
+    RegistryEntry {
         name: "ia-census",
         scheme: "sha1",
         urls: &["https://huggingface.co/datasets/david-ar/ia-census/resolve/main/ia-census.sha1.bloom"],

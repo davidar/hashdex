@@ -80,7 +80,16 @@ pub static CENSUS: Spec = Spec {
     start_paths: crate::census::start_paths,
 };
 
-pub static SPECS: &[&Spec] = &[&FATCAT, &TARBALLS, &CENSUS];
+pub static DEBS: Spec = Spec {
+    name: "debs",
+    repo: "david-ar/deb-packages",
+    approx_size: "~200 MB",
+    suffix: 4 << 20,
+    supports: crate::debs::supports,
+    start_paths: crate::debs::start_paths,
+};
+
+pub static SPECS: &[&Spec] = &[&FATCAT, &TARBALLS, &CENSUS, &DEBS];
 
 pub fn spec(name: &str) -> Option<&'static Spec> {
     SPECS.iter().find(|s| s.name == name).copied()
@@ -104,6 +113,7 @@ where
         "fatcat" => crate::fatcat::lookup_with(open, coord),
         "tarballs" => crate::tarballs::lookup_with(open, coord),
         "ia-census" => crate::census::lookup_with(open, coord),
+        "debs" => crate::debs::lookup_with(open, coord),
         _ => Ok(Vec::new()),
     }
 }

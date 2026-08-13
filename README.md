@@ -162,6 +162,18 @@ One source is an exact witness index rather than filter-only:
   A companion bloom (`hdx filters fetch tarballs`, 359 KiB) routes
   scans to it; `hdx index pull tarballs` (~25 MB) makes the whole
   index local and offline.
+- **Binary packages (.deb)** — the same idea for the packages install
+  media and mirrors actually ship: `tools/deb_packages.py` harvests
+  the apt `Packages` indexes of Debian (trixie + sid + security,
+  udeb sub-indexes included), Ubuntu (noble, jammy), and Kali into
+  ~524k witness rows with pool-path claim URLs, published as
+  page-indexed parquet
+  ([deb-packages](https://huggingface.co/datasets/david-ar/deb-packages)).
+  Ubuntu rows carry md5+sha1+sha256+sha512 — 4-hash single-witness
+  crosswalk edges. `hdx filters fetch debs` routes scans to it;
+  `hdx index pull debs` (~100 MB) goes offline. This is what lets
+  `hdx recipe` of a Debian install DVD attach fetchable claim URLs to
+  93% of the image's bytes, offline — a verified, generalized jigdo.
 
 ## Build
 

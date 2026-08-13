@@ -10,6 +10,7 @@
 pub mod census;
 pub mod coord;
 pub mod dcso;
+pub mod debs;
 pub mod fatcat;
 pub mod finding;
 pub mod media;
