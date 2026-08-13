@@ -1211,6 +1211,389 @@ fn index_blobs(files: &[PathBuf], ticker: &Ticker) -> Result<HashMap<String, Pat
     Ok(out.into_inner().unwrap())
 }
 
+// ------------------------------------------------------- jigdo emission
+
+/// Project a splice recipe into a `.jigdo` + `.template` pair that
+/// stock jigdo tooling consumes. Claimed refs become fetchable parts;
+/// everything else — literals, claim-less refs, slices — becomes
+/// template data, exactly as `jigdo-file make-template` would have
+/// classified bytes it couldn't match. Conventions byte-verified
+/// against Debian's own libjte-2.0 output: template 2.0 framing,
+/// sha256 DESC entries, RsyncSum64 over the first 1024 bytes
+/// (table-based; the table's author explicitly permits
+/// reimplementation under any license), base64url-no-pad checksums.
+const JIGDO_BLOCKLEN: u32 = 1024;
+/// Literal bytes per zlib DATA part (libjte's chunking).
+const JIGDO_CHUNK: usize = 1 << 20;
+
+/// jigdo's 64-bit rolling checksum: independent per-byte table sums.
+/// Table values from jigdo's rsyncsum.cc, where Richard Atterer
+/// disclaims copyright over the numbers.
+fn rsync64(data: &[u8]) -> [u8; 8] {
+    let (mut a, mut b) = (0u32, 0u32);
+    for &byte in data {
+        a = a.wrapping_add(RSYNC_TABLE[byte as usize]);
+        b = b.wrapping_add(a);
+    }
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&a.to_le_bytes());
+    out[4..].copy_from_slice(&b.to_le_bytes());
+    out
+}
+
+fn b64url(bytes: &[u8]) -> String {
+    data_encoding::BASE64URL_NOPAD.encode(bytes)
+}
+
+fn u48(n: u64) -> [u8; 6] {
+    let b = n.to_le_bytes();
+    [b[0], b[1], b[2], b[3], b[4], b[5]]
+}
+
+/// One flattened region of the image, in image order.
+enum JRegion {
+    Part {
+        len: u64,
+        sha256: [u8; 32],
+        urls: Vec<String>,
+    },
+    Literal {
+        len: u64,
+    },
+}
+
+/// Flatten a recipe tree: claimed refs (whole, unsliced) become
+/// parts; all other bytes are literal. Adjacent literals merge.
+fn jigdo_flatten(node: &Value, out: &mut Vec<JRegion>) -> Result<()> {
+    let push_literal = |out: &mut Vec<JRegion>, len: u64| {
+        if len == 0 {
+            return;
+        }
+        if let Some(JRegion::Literal { len: l }) = out.last_mut() {
+            *l += len;
+        } else {
+            out.push(JRegion::Literal { len });
+        }
+    };
+    if node["literal"].is_object() {
+        push_literal(out, node["literal"]["len"].as_u64().context("literal len")?);
+        return Ok(());
+    }
+    if node["slice"].is_object() {
+        // A slice is a window of a member — jigdo can't fetch part of
+        // a file, so its bytes ride in the template.
+        push_literal(out, node["slice"]["len"].as_u64().context("slice len")?);
+        return Ok(());
+    }
+    if node["ref"].is_object() {
+        let r = &node["ref"];
+        let len = r["size"].as_u64().context("ref size")?;
+        let urls: Vec<String> = r["claims"]
+            .as_array()
+            .map(|cs| {
+                cs.iter()
+                    .filter_map(|c| c["url"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if urls.is_empty() {
+            push_literal(out, len);
+        } else {
+            let mut sha256 = [0u8; 32];
+            let hex = r["digests"]["sha256"].as_str().context("ref sha256")?;
+            data_encoding::HEXLOWER
+                .decode_mut(hex.as_bytes(), &mut sha256)
+                .map_err(|_| anyhow::anyhow!("bad sha256 hex in ref"))?;
+            out.push(JRegion::Part { len, sha256, urls });
+        }
+        return Ok(());
+    }
+    if node["build"].is_object() {
+        for input in node["build"]["inputs"].as_array().context("build inputs")? {
+            jigdo_flatten(input, out)?;
+        }
+        return Ok(());
+    }
+    bail!("unknown recipe node in jigdo projection")
+}
+
+/// Split a claim URL into (server prefix, path) at the archive root:
+/// before a `pool/` or `dists/` component when present, else after
+/// the host.
+fn jigdo_split_url(url: &str) -> (String, String) {
+    for marker in ["/pool/", "/dists/"] {
+        if let Some(i) = url.find(marker) {
+            return (url[..i + 1].to_string(), url[i + 1..].to_string());
+        }
+    }
+    let after_scheme = url.find("//").map(|i| i + 2).unwrap_or(0);
+    match url[after_scheme..].find('/') {
+        Some(i) => {
+            let cut = after_scheme + i + 1;
+            (url[..cut].to_string(), url[cut..].to_string())
+        }
+        None => (url.to_string(), String::new()),
+    }
+}
+
+pub fn emit_jigdo(recipe: &Path) -> Result<()> {
+    let doc: Value = serde_json::from_reader(std::io::BufReader::new(
+        std::fs::File::open(recipe).with_context(|| format!("open {}", recipe.display()))?,
+    ))?;
+    ensure!(doc["hdx_recipe"] == json!("0"), "not an hdx recipe");
+    let image_path = PathBuf::from(
+        recipe
+            .to_string_lossy()
+            .strip_suffix(".recipe.json")
+            .context("recipe path must end in .recipe.json (the image sits beside it)")?
+            .to_string(),
+    );
+    let image_name = doc["source"]["name"].as_str().context("source name")?;
+    let image_size = doc["source"]["size"].as_u64().context("source size")?;
+    let image_sha = doc["source"]["sha256"].as_str().context("source sha256")?;
+
+    let mut regions = Vec::new();
+    jigdo_flatten(&doc["root"], &mut regions)?;
+    ensure!(
+        regions.iter().any(|r| matches!(r, JRegion::Part { .. })),
+        "recipe has no claimed refs — a jigdo projection would be one big template"
+    );
+
+    // Stream the image once: literals into zlib DATA parts, parts
+    // hashed for their DESC entries (rsync64 needs the head bytes;
+    // sha256 re-verified while we're reading anyway).
+    let img = std::fs::File::open(&image_path).with_context(|| {
+        format!(
+            "image {} (must sit beside the recipe)",
+            image_path.display()
+        )
+    })?;
+    ensure!(
+        img.metadata()?.len() == image_size,
+        "{}: size differs from the recipe — re-mint first",
+        image_path.display()
+    );
+    let view = View::of_file(&image_path)?;
+    let template_path = image_path.with_extension(
+        image_path
+            .extension()
+            .map(|e| format!("{}.template", e.to_string_lossy()))
+            .unwrap_or_else(|| "template".into()),
+    );
+    let mut tf = std::io::BufWriter::new(std::fs::File::create(&template_path)?);
+    let header = format!(
+        "JigsawDownload template 2.0 hashdex-hdx/{} \r\n\
+         Projected from {}.recipe.json ; hdx at https://github.com/davidar/hashdex \r\n\r\n",
+        env!("CARGO_PKG_VERSION"),
+        image_name,
+    );
+    tf.write_all(header.as_bytes())?;
+
+    let mut desc: Vec<u8> = Vec::new();
+    let mut image_hash = sha2::Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut pos = 0u64;
+    let mut lit_chunk: Vec<u8> = Vec::with_capacity(JIGDO_CHUNK);
+    let flush_chunk = |tf: &mut dyn Write, chunk: &mut Vec<u8>| -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(6));
+        z.write_all(chunk)?;
+        let zbytes = z.finish()?;
+        tf.write_all(b"DATA")?;
+        tf.write_all(&u48(16 + zbytes.len() as u64))?;
+        tf.write_all(&u48(chunk.len() as u64))?;
+        tf.write_all(&zbytes)?;
+        chunk.clear();
+        Ok(())
+    };
+    for region in &regions {
+        match region {
+            JRegion::Literal { len } => {
+                desc.push(2);
+                desc.extend_from_slice(&u48(*len));
+                let mut left = *len;
+                while left > 0 {
+                    let want = (left as usize)
+                        .min(buf.len())
+                        .min(JIGDO_CHUNK - lit_chunk.len());
+                    let n = view.read_full_at(&mut buf[..want], pos)?;
+                    ensure!(n == want, "short read at {pos}");
+                    image_hash.update(&buf[..n]);
+                    lit_chunk.extend_from_slice(&buf[..n]);
+                    if lit_chunk.len() >= JIGDO_CHUNK {
+                        flush_chunk(&mut tf, &mut lit_chunk)?;
+                    }
+                    pos += n as u64;
+                    left -= n as u64;
+                }
+            }
+            JRegion::Part { len, sha256, .. } => {
+                // Parts flush the pending literal chunk so DATA parts
+                // and files interleave in image order.
+                flush_chunk(&mut tf, &mut lit_chunk)?;
+                let mut h = sha2::Sha256::new();
+                let mut head = vec![0u8; (JIGDO_BLOCKLEN as u64).min(*len) as usize];
+                let n = view.read_full_at(&mut head, pos)?;
+                ensure!(n == head.len(), "short read at {pos}");
+                let mut left = *len;
+                let mut p = pos;
+                while left > 0 {
+                    let want = (left as usize).min(buf.len());
+                    let n = view.read_full_at(&mut buf[..want], p)?;
+                    ensure!(n == want, "short read at {p}");
+                    image_hash.update(&buf[..n]);
+                    h.update(&buf[..n]);
+                    p += n as u64;
+                    left -= n as u64;
+                }
+                let got: [u8; 32] = h.finalize().into();
+                ensure!(
+                    &got == sha256,
+                    "part at {pos} does not hash to its recipe digest — image changed?"
+                );
+                desc.push(9);
+                desc.extend_from_slice(&u48(*len));
+                desc.extend_from_slice(&rsync64(&head));
+                desc.extend_from_slice(sha256);
+                pos += *len;
+            }
+        }
+    }
+    flush_chunk(&mut tf, &mut lit_chunk)?;
+    ensure!(
+        pos == image_size,
+        "regions tile {pos} of {image_size} bytes"
+    );
+    let got_image: [u8; 32] = image_hash.finalize().into();
+    ensure!(
+        hex_lower(&got_image) == image_sha,
+        "image no longer matches the recipe — re-mint first"
+    );
+    desc.push(8);
+    desc.extend_from_slice(&u48(image_size));
+    desc.extend_from_slice(&got_image);
+    desc.extend_from_slice(&JIGDO_BLOCKLEN.to_le_bytes());
+    let total = 4 + 6 + desc.len() as u64 + 6;
+    tf.write_all(b"DESC")?;
+    tf.write_all(&u48(total))?;
+    tf.write_all(&desc)?;
+    tf.write_all(&u48(total))?;
+    tf.flush()?;
+    drop(tf);
+
+    // The .jigdo text: servers derived from the claim URLs.
+    let template_bytes = std::fs::read(&template_path)?;
+    let template_sha = sha2::Sha256::digest(&template_bytes);
+    let mut servers: Vec<String> = Vec::new(); // prefix, label = S<idx>
+    let mut parts_lines = String::new();
+    for region in &regions {
+        if let JRegion::Part { sha256, urls, .. } = region {
+            for url in urls {
+                let (prefix, path) = jigdo_split_url(url);
+                let idx = match servers.iter().position(|s| *s == prefix) {
+                    Some(i) => i,
+                    None => {
+                        servers.push(prefix);
+                        servers.len() - 1
+                    }
+                };
+                parts_lines.push_str(&format!("{}=S{idx}:{path}\n", b64url(sha256)));
+            }
+        }
+    }
+    let jigdo_path = image_path.with_extension(
+        image_path
+            .extension()
+            .map(|e| format!("{}.jigdo", e.to_string_lossy()))
+            .unwrap_or_else(|| "jigdo".into()),
+    );
+    let template_name = template_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut jt = String::new();
+    jt.push_str("# JigsawDownload\n# Projected by hdx from a verified splice recipe\n\n");
+    jt.push_str("[Jigdo]\nVersion=2.0\n");
+    jt.push_str(&format!(
+        "Generator=hashdex-hdx/{}\n\n",
+        env!("CARGO_PKG_VERSION")
+    ));
+    jt.push_str("[Image]\n");
+    jt.push_str(&format!("Filename={image_name}\n"));
+    jt.push_str(&format!("Template={template_name}\n"));
+    jt.push_str(&format!("Template-SHA256Sum={}\n", b64url(&template_sha)));
+    jt.push_str(&format!("# Image Hex SHA256Sum {image_sha}\n"));
+    jt.push_str(&format!("# Image size {image_size} bytes\n\n"));
+    jt.push_str("[Parts]\n");
+    jt.push_str(&parts_lines);
+    jt.push_str("\n[Servers]\n");
+    for (i, prefix) in servers.iter().enumerate() {
+        jt.push_str(&format!("S{i}={prefix}\n"));
+    }
+    std::fs::write(&jigdo_path, jt)?;
+
+    let nparts = regions
+        .iter()
+        .filter(|r| matches!(r, JRegion::Part { .. }))
+        .count();
+    let part_bytes: u64 = regions
+        .iter()
+        .map(|r| match r {
+            JRegion::Part { len, .. } => *len,
+            _ => 0,
+        })
+        .sum();
+    println!(
+        "jigdo projection: {nparts} parts ({}) fetchable, template {} ({} literal)\n→ {}\n→ {}",
+        human(part_bytes),
+        human(template_bytes.len() as u64),
+        human(image_size - part_bytes),
+        jigdo_path.display(),
+        template_path.display(),
+    );
+    Ok(())
+}
+
+/// jigdo RsyncSum64 byte table (rsyncsum.cc; values explicitly free
+/// for reimplementation under any license).
+#[rustfmt::skip]
+const RSYNC_TABLE: [u32; 256] = [
+    0x51d65c0f, 0x083cd94b, 0x77f73dd8, 0xa0187d36, 0x29803d07, 0x7ea8ac0e, 0xea4c16c9, 0xfc576443,
+    0x6213df29, 0x1c012392, 0xb38946ae, 0x2e20ca31, 0xe4dc532f, 0xcb281c47, 0x8508b6a5, 0xb93c210d,
+    0xef02b5f3, 0x66548c74, 0x9ae2deab, 0x3b59f472, 0x4e546447, 0x45232d1f, 0x0ac0a4b1, 0x6c4c264b,
+    0x5d24ce84, 0x0f2752cc, 0xa35c7ac7, 0x3e31af51, 0x79675a59, 0x581f0e81, 0x49053122, 0x7339c9d8,
+    0xf9833565, 0xa3dbe5b3, 0xcc06eeb9, 0x92d0671c, 0x3eb220a7, 0x64864eae, 0xca100872, 0xc50977a1,
+    0xd90378e1, 0x7a36cab9, 0x15c15f4b, 0x8b9ef749, 0xcc1432dc, 0x1ec578ed, 0x27e6e092, 0xbb06db8f,
+    0x67f661ac, 0x8dd1a3db, 0x2a0ca16b, 0xb229ab84, 0x127a3337, 0x347d846f, 0xe1ea4b50, 0x008dbb91,
+    0x414c1426, 0xd2be76f0, 0x08789a39, 0xb4d93e30, 0x61667760, 0x8871bee9, 0xab7da12d, 0xe3c58620,
+    0xe9fdfbbe, 0x64fb04f7, 0x8cc5bbf0, 0xf5272d30, 0x8f161b50, 0x11122b05, 0x7695e72e, 0xa1c5d169,
+    0x1bfd0e20, 0xef7e6169, 0xf652d08e, 0xa9d0f139, 0x2f70aa04, 0xae2c7d6d, 0xa3cb9241, 0x3ae7d364,
+    0x348788f8, 0xf483b8f1, 0x55a011da, 0x189719dc, 0xb0c5d723, 0x8b344e33, 0x300d46eb, 0xd44fe34f,
+    0x1a2016c1, 0x66ce4cd7, 0xa45ea5e3, 0x55cb708a, 0xbce430df, 0xb01ae6e0, 0x3551163b, 0x2c5b157a,
+    0x574c4209, 0x430fd0e4, 0x3387e4a5, 0xee1d7451, 0xa9635623, 0x873ab89b, 0xb96bc6aa, 0x59898937,
+    0xe646c6e7, 0xb79f8792, 0x3f3235d8, 0xef1b5acf, 0xd975b22b, 0x427acce6, 0xe47a2411, 0x75f8c1e8,
+    0xa63f799d, 0x53886ad8, 0x9b2d6d32, 0xea822016, 0xcdee2254, 0xd98bcd98, 0x2933a544, 0x961f379f,
+    0x49219792, 0xc61c360f, 0x77cc0c64, 0x7b872046, 0xb91c7c12, 0x7577154b, 0x196573be, 0xf788813f,
+    0x41e2e56a, 0xec3cd244, 0x8c7401f1, 0xc2e805fe, 0xe8872fbe, 0x9e2faf7d, 0x6766456b, 0x888e2197,
+    0x28535c6d, 0x2ce45f3f, 0x24261d2a, 0xd6faab8b, 0x7a7b42b8, 0x15f0f6fa, 0xfe1711df, 0x7e5685a6,
+    0x00930268, 0x74755331, 0x1998912c, 0x7b60498b, 0x501a5786, 0x92ace0f6, 0x1d9752fe, 0x5a731add,
+    0x5b3b44fc, 0x473673f9, 0xa42c0321, 0xd82f9f18, 0xb4b225da, 0xfc89ece2, 0x072e1130, 0x5772aae3,
+    0x29010857, 0x542c970c, 0x94f67fe5, 0x71209e9b, 0xdb97ea39, 0x2689b41b, 0xae815804, 0xfc5e2651,
+    0xd4521674, 0x48ed979a, 0x2f617da3, 0xc350353d, 0xc3accd94, 0xbd8d313a, 0xc61a8e77, 0xf34940a4,
+    0x8d2c6b0f, 0x0f0e7225, 0x39e183db, 0xd19ebba9, 0x6a0f37b9, 0xd18922f3, 0x106420c5, 0xaa5a640b,
+    0x7cf0d273, 0xcf3238a7, 0x3b33204f, 0x476be7bb, 0x09d23bca, 0xbe84b2f7, 0xb7a3bace, 0x2528cee1,
+    0x3dcaa1dd, 0x900ad31a, 0xf21dea6d, 0x9ce51463, 0xf1540bba, 0x0fab1bdd, 0x89cfb79a, 0x01a2a6e6,
+    0x6f85d67c, 0xd1669ec4, 0x355db722, 0x00ebd5c4, 0x926eb385, 0x69ead869, 0x0da2b122, 0x402779fe,
+    0xdaed92d0, 0x57e9aabb, 0x3df64854, 0xfcc774b5, 0x2e1740ed, 0xa615e024, 0xf7bac938, 0x377dfd1a,
+    0xd0559d66, 0x25499be8, 0x2d8f2006, 0xfaa9e486, 0x95e980e7, 0x82aeba67, 0x5a7f2561, 0xbc60dff6,
+    0x6c8739a2, 0x7ec59a8b, 0x9998f265, 0xdfe37e5e, 0xb47cee1e, 0x4dd8bc9e, 0x35c57e09, 0x07850b63,
+    0x06eadbcb, 0x6c1f2956, 0x01685c2c, 0xf5725eef, 0xf13b98b5, 0xaab739c2, 0x200b1da2, 0xa716b98b,
+    0xd9ee3058, 0x76acf20b, 0x2f259e04, 0xed11658b, 0x1532b331, 0x0ab43204, 0xf0beb023, 0xb1685483,
+    0x58cbdc4f, 0x079384d3, 0x049b141c, 0xc38184b9, 0xaf551d9a, 0x66222560, 0x059deeca, 0x535f99e2,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

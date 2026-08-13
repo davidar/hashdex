@@ -156,6 +156,14 @@ enum RecipeAction {
         #[arg(long, value_name = "FILE")]
         output: Option<PathBuf>,
     },
+    /// Project a recipe into a .jigdo + .template pair consumable by
+    /// stock jigdo tooling: claimed refs become fetchable parts,
+    /// everything else rides in the template. The image file must sit
+    /// beside the recipe (template data is read from it)
+    Jigdo {
+        /// The recipe document (FILE.recipe.json)
+        recipe: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -303,6 +311,9 @@ async fn main() -> Result<()> {
                 _,
             ) => {
                 recipe_cmd::check(recipe, dir, output.as_deref())?;
+            }
+            (Some(RecipeAction::Jigdo { recipe }), _) => {
+                recipe_cmd::emit_jigdo(recipe)?;
             }
             (None, Some(f)) => recipe_cmd::mint(f, !cli.no_cache, cli.json)?,
             (None, None) => {

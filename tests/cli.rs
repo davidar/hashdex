@@ -2011,3 +2011,119 @@ fn recipe_of_claimed_file_is_one_ref() {
     assert!(doc["residue"].is_null());
     assert!(!env.work().join("paper.pdf.recipe.residue").exists());
 }
+
+#[test]
+fn recipe_jigdo_projection_round_trips() {
+    use sha2::Digest as _;
+    let env = TestEnv::new("recipe-jigdo");
+    // One member the fixture dataset claims (it becomes a fetchable
+    // part), one it doesn't (its bytes must ride in the template).
+    let claimed: Vec<u8> = (0u8..=255).cycle().take(4000).collect();
+    let unclaimed = vec![9u8; 3000];
+    let sha256 = sha256_hex(&claimed);
+    let sha1 = {
+        let mut h = sha1::Sha1::new();
+        h.update(&claimed);
+        format!("{:x}", h.finalize())
+    };
+    let md5 = {
+        use md5::Digest as _;
+        format!("{:x}", md5::Md5::digest(&claimed))
+    };
+    install_fatcat_dataset(&env, &[(&sha1, &sha256, &md5)]);
+    let tarball = plain_tar(&[("claimed.bin", &claimed), ("unclaimed.bin", &unclaimed)]);
+    let tar_path = env.write("demo.tar", &tarball);
+
+    let out = env.hdx(&["--offline", "recipe", tar_path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    let out = env.hdx(&[
+        "recipe",
+        "jigdo",
+        env.work().join("demo.tar.recipe.json").to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "emit failed: {}", stderr(&out));
+
+    // The .jigdo names the claimed part (base64url sha256) against a
+    // server prefix derived from its claim URL.
+    let jigdo = std::fs::read_to_string(env.work().join("demo.tar.jigdo")).unwrap();
+    let key = {
+        let raw = sha2::Sha256::digest(&claimed);
+        data_encoding::BASE64URL_NOPAD.encode(&raw)
+    };
+    assert!(jigdo.contains(&format!("{key}=S0:")), "jigdo: {jigdo}");
+    assert!(jigdo.contains("[Servers]") && jigdo.contains("S0=https://"));
+
+    // Independent template parse: inflate the DATA parts, walk DESC in
+    // image order, splice literal bytes + the claimed file's bytes,
+    // and require the original tar back.
+    let template = std::fs::read(env.work().join("demo.tar.template")).unwrap();
+    let head_end = template
+        .windows(4)
+        .position(|w| w == b"DATA")
+        .expect("no DATA part");
+    let mut pos = head_end;
+    let mut literals: Vec<u8> = Vec::new();
+    let mut desc: Option<&[u8]> = None;
+    while pos < template.len() {
+        let magic = &template[pos..pos + 4];
+        let total = u64::from_le_bytes([
+            template[pos + 4],
+            template[pos + 5],
+            template[pos + 6],
+            template[pos + 7],
+            template[pos + 8],
+            template[pos + 9],
+            0,
+            0,
+        ]) as usize;
+        if magic == b"DATA" {
+            let z = &template[pos + 16..pos + total];
+            let mut dec = flate2::read::ZlibDecoder::new(z);
+            std::io::Read::read_to_end(&mut dec, &mut literals).unwrap();
+        } else if magic == b"DESC" {
+            desc = Some(&template[pos..pos + total]);
+        }
+        pos += total;
+    }
+    let desc = desc.expect("no DESC part");
+    let mut image: Vec<u8> = Vec::new();
+    let mut lit_pos = 0usize;
+    let mut p = 10; // 'DESC' + u48
+    while p < desc.len() - 6 {
+        let t = desc[p];
+        p += 1;
+        let len = u64::from_le_bytes([
+            desc[p],
+            desc[p + 1],
+            desc[p + 2],
+            desc[p + 3],
+            desc[p + 4],
+            desc[p + 5],
+            0,
+            0,
+        ]) as usize;
+        p += 6;
+        match t {
+            2 => {
+                image.extend_from_slice(&literals[lit_pos..lit_pos + len]);
+                lit_pos += len;
+            }
+            9 => {
+                let sha = &desc[p + 8..p + 40];
+                p += 40;
+                assert_eq!(sha, &sha2::Sha256::digest(&claimed)[..], "part digest");
+                assert_eq!(len, claimed.len());
+                image.extend_from_slice(&claimed);
+            }
+            8 => {
+                // image-info: sha256 + blocklen follow the length
+                p += 32 + 4;
+            }
+            other => panic!("unexpected DESC entry type {other}"),
+        }
+    }
+    assert_eq!(
+        image, tarball,
+        "spliced image differs from the original tar"
+    );
+}
