@@ -1806,11 +1806,31 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
+/// (sha1, sha256, md5) of some bytes — a fixture-dataset row: refs
+/// require claims now, so recipe tests register their members.
+fn digest_row(bytes: &[u8]) -> (String, String, String) {
+    let sha1 = {
+        use sha1::Digest;
+        format!("{:x}", sha1::Sha1::digest(bytes))
+    };
+    let md5 = {
+        use md5::Digest;
+        format!("{:x}", md5::Md5::digest(bytes))
+    };
+    (sha1, sha256_hex(bytes), md5)
+}
+
 #[test]
 fn recipe_splices_a_plain_tar() {
     let env = TestEnv::new("recipe-tar");
     let big = vec![0xA5u8; 5000];
     let mid: Vec<u8> = (0u8..=255).cycle().take(600).collect();
+    let rows = [digest_row(&big), digest_row(&mid)];
+    let rows: Vec<(&str, &str, &str)> = rows
+        .iter()
+        .map(|r| (r.0.as_str(), r.1.as_str(), r.2.as_str()))
+        .collect();
+    install_fatcat_dataset(&env, &rows);
     let tarball = plain_tar(&[("a.bin", &big), ("tiny", b"tiny"), ("b.bin", &mid)]);
     let tar_path = env.write("demo.tar", &tarball);
 
@@ -1839,14 +1859,12 @@ fn recipe_splices_a_plain_tar() {
     // are referenced in tar order.
     assert_eq!(refs, vec!["a.bin", "b.bin"]);
     assert!(inputs.iter().any(|i| i["literal"].is_object()));
-    // Residue is fetchability, not structure: nothing here carries a
-    // claim URL, so the WHOLE tar is residue — the digest-only refs
-    // are counted inside it, not as coverage.
+    // Refs exist only through claims (the fixture dataset registers
+    // the two payloads); residue = everything no claim URL fetches.
     let cov = &doc["coverage"];
-    assert_eq!(cov["fetchable_bytes"].as_u64().unwrap(), 0);
-    assert_eq!(cov["residue_digest_only_bytes"].as_u64().unwrap(), 5600);
+    assert_eq!(cov["fetchable_bytes"].as_u64().unwrap(), 5600);
     assert_eq!(
-        cov["residue_bytes"].as_u64().unwrap(),
+        cov["fetchable_bytes"].as_u64().unwrap() + cov["residue_bytes"].as_u64().unwrap(),
         cov["total_bytes"].as_u64().unwrap()
     );
 
@@ -1882,6 +1900,7 @@ fn recipe_splices_a_plain_tar() {
     let se = stderr(&out);
     assert!(se.contains("missing: b.bin"), "stderr: {se}");
     assert!(se.contains(&sha256_hex(&mid)), "stderr: {se}");
+    assert!(se.contains("web.archive.org"), "claim URL missing: {se}");
 }
 
 #[test]
@@ -1890,6 +1909,14 @@ fn recipe_nests_and_rebuilds_from_leaves() {
     let pay1 = vec![1u8; 700];
     let pay2 = vec![2u8; 800];
     let pay3 = vec![3u8; 900];
+    // Leaves are claimed; the inner tar itself is not — it survives
+    // as a build only because its subtree holds verified refs.
+    let rows = [digest_row(&pay1), digest_row(&pay2), digest_row(&pay3)];
+    let rows: Vec<(&str, &str, &str)> = rows
+        .iter()
+        .map(|r| (r.0.as_str(), r.1.as_str(), r.2.as_str()))
+        .collect();
+    install_fatcat_dataset(&env, &rows);
     let inner = plain_tar(&[("inner-a.bin", &pay1), ("inner-b.bin", &pay2)]);
     let outer = plain_tar(&[("inner.tar", &inner), ("outer-c.bin", &pay3)]);
     let outer_path = env.write("outer.tar", &outer);

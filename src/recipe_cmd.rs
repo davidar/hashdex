@@ -1,11 +1,15 @@
 //! Recipes: reconstruction manifests minted from container descents
 //! (splice@0 — the first rung). A recipe is a verified proof of
 //! composition: the container's bytes are a deterministic splice of
-//! member byte ranges — referenced by digest, with claim URLs where
-//! the indexes know the bytes — plus literal gap bytes carried in a
-//! residue sidecar. `check` rebuilds from locally-present blobs and
-//! verifies byte-exactness; it never fetches — the claims tell you
-//! where the missing members live.
+//! refs — member byte ranges the indexes actually name, claim URLs
+//! attached — plus literal bytes carried in a zstd residue sidecar.
+//! Refs require claims: descent's member boundaries are hypotheses
+//! about public availability, and one no index verifies collapses
+//! back into literal bytes (an unwitnessed digest is not knowledge —
+//! you can hash any string). Recipe + sidecar + fetched refs rebuild
+//! the file with nothing else on hand. `check` rebuilds from
+//! locally-present blobs and verifies byte-exactness; it never
+//! fetches — the claims say where the missing members live.
 //!
 //! The credibility rule: every build node is verified at mint time by
 //! re-reading the recorded ranges and reproducing the node's sha256
@@ -228,24 +232,20 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
     let residue = vs.residue.finish()?;
     ticker.clear();
 
-    // Coverage is fetchability: residue is EVERY byte no claim URL
-    // fetches, whether it rides in the sidecar or hides behind a
-    // digest-only ref (those rebuild from a local copy but come from
-    // nowhere — the jigdo projection rightly classifies them as
-    // template data, and so does this count).
+    // Coverage is fetchability, and the artifact matches the metric:
+    // every ref carries claim URLs (planning collapses unverified
+    // member boundaries into literals), so the recipe + sidecar alone
+    // rebuild the file — residue IS the sidecar's uncompressed bytes
+    // plus the inlined runs, and nothing is quietly delegated to "a
+    // copy you happen to have".
     let total = members[root].size;
     let mut fetchable = 0u64;
-    let mut digest_only = 0u64;
     let mut nrefs = 0usize;
     for b in plan.builds.values() {
         for seg in &b.segs {
             if let Seg::Child { idx, len, .. } = seg {
                 if !plan.builds.contains_key(idx) {
-                    if claims_of(*idx).is_empty() {
-                        digest_only += len;
-                    } else {
-                        fetchable += len;
-                    }
+                    fetchable += len;
                 }
             }
         }
@@ -261,46 +261,43 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
         "hdx_recipe": "0",
         "source": source_json(path, &members[root]),
         "root": node_json(root, &members, &plan, &evidence),
-        "residue": residue.as_ref().map(|r| json!({"sha256": hex_lower(&r.0), "size": r.1})),
+        "residue": residue.as_ref().map(|r| json!({
+            "sha256": hex_lower(&r.sha256),
+            "size": r.file_len,
+            "uncompressed_size": r.raw_len,
+            "compression": "zstd",
+        })),
         "coverage": {
             "total_bytes": total,
             "fetchable_bytes": fetchable,
             "residue_bytes": residue_total,
-            "residue_digest_only_bytes": digest_only,
-            "residue_sidecar_bytes": residue.as_ref().map(|r| r.1).unwrap_or(0),
         },
     });
     let out = write_doc(path, &doc)?;
 
     let pct = |x: u64| 100.0 * x as f64 / total as f64;
     let mut line = format!(
-        "{:.1}% fetchable ({} of {}) · residue {} · verified byte-exact",
+        "{:.1}% fetchable ({} of {}) · residue {}",
         pct(fetchable),
         human(fetchable),
         human(total),
         human(residue_total),
     );
-    if digest_only > 0 {
-        line.push_str(&format!(
-            "\nresidue: {} literal in the sidecar + {} digest-only refs (rebuildable from a local copy, fetchable from nowhere)",
-            human(residue.as_ref().map(|r| r.1).unwrap_or(0)),
-            human(digest_only),
-        ));
+    if let Some(r) = &residue {
+        line.push_str(&format!(" (sidecar {} zstd)", human(r.file_len)));
     }
     line.push_str(&format!(
-        "\n→ {} ({} ref{}, {} build{})",
+        " · verified byte-exact\n→ {} ({} ref{}, {} build{})",
         out.display(),
         nrefs,
         s(nrefs),
         plan.builds.len(),
         s(plan.builds.len()),
     ));
-    if fetchable == 0 && digest_only == 0 {
-        line.push_str(
-            "\nnote: nothing referenced — this recipe is a full literal copy of the file",
-        );
+    if fetchable == 0 {
+        line.push_str("\nnote: nothing fetchable — this recipe is a full literal copy of the file");
     }
-    report_summary(json_out, &doc, residue.as_ref().map(|r| r.1), &line);
+    report_summary(json_out, &doc, residue.as_ref().map(|r| r.file_len), &line);
     Ok(())
 }
 
@@ -313,10 +310,15 @@ fn referenced_as_leaf(plan: &Plan, i: usize) -> bool {
         })
 }
 
-/// Plan member `i` as a build if any child survives as a byte range;
-/// otherwise the caller keeps it as a plain ref. Claims stop descent:
-/// a member the indexes already name is one line — its inside needs no
-/// proof.
+/// Plan member `i` as a build. A child earns a place in the splice
+/// only through verification: refs require claim URLs, and an
+/// unclaimed child survives only as a build whose subtree holds
+/// claimed refs. Everything else collapses into literal gaps — a
+/// member boundary the indexes don't verify was a hypothesis about
+/// public availability that failed, and its bytes are just bytes
+/// (you can hash any string; an unwitnessed digest is not knowledge).
+/// Claims stop descent the other way too: a member the indexes
+/// already name is one line — its inside needs no proof.
 fn plan_build(
     i: usize,
     members: &[Member],
@@ -335,6 +337,10 @@ fn plan_build(
         let Some(cruns) = rangeable(members, plan.root_src, c) else {
             continue;
         };
+        let claimed = evidence[c].0.iter().any(|f| !f.claims.is_empty());
+        if !claimed && !plan_build(c, members, kids, evidence, plan) {
+            continue; // unverified hypothesis — bytes stay literal
+        }
         // Map the child's runs into this build's logical space; each
         // run lies inside one of our runs by construction (the child's
         // view was sliced from ours).
@@ -364,6 +370,7 @@ fn plan_build(
                 .all(|p| matches!(p, Seg::Child { at, len, .. } if taken.admits(*at, *len)));
         if !fits {
             dropped += 1;
+            remove_build_subtree(plan, c);
             continue;
         }
         for p in &pieces {
@@ -372,11 +379,6 @@ fn plan_build(
             }
         }
         segs.extend(pieces);
-        // A child the indexes name stays a ref; otherwise try to open
-        // it as a build of its own.
-        if evidence[c].0.iter().all(|f| f.claims.is_empty()) {
-            plan_build(c, members, kids, evidence, plan);
-        }
     }
     if segs.is_empty() && i != plan.root {
         return false;
@@ -424,6 +426,18 @@ fn plan_build(
         },
     );
     true
+}
+
+/// Discard a rejected subtree's build plans (a parent refused the
+/// child on extent overlap after recursion had already planned it).
+fn remove_build_subtree(plan: &mut Plan, i: usize) {
+    if let Some(b) = plan.builds.remove(&i) {
+        for seg in &b.segs {
+            if let Seg::Child { idx, .. } = seg {
+                remove_build_subtree(plan, *idx);
+            }
+        }
+    }
 }
 
 fn rangeable(members: &[Member], root_src: usize, i: usize) -> Option<&[(u64, u64, u64)]> {
@@ -517,45 +531,69 @@ fn hash_root_range(
     Ok(())
 }
 
-/// Residue sidecar, created lazily on the first literal byte.
+/// Residue sidecar: a zstd stream of the literal bytes in document
+/// order, created lazily on the first literal byte. Offsets in the
+/// document index the UNCOMPRESSED stream; the recorded sha256 names
+/// the file as written.
 struct ResidueWriter {
     path: PathBuf,
-    file: Option<std::fs::File>,
-    hash: sha2::Sha256,
+    enc: Option<zstd::stream::write::Encoder<'static, std::fs::File>>,
+    /// Uncompressed bytes written so far — the document's offsets.
     len: u64,
+}
+
+struct Residue {
+    sha256: [u8; 32],
+    file_len: u64,
+    raw_len: u64,
 }
 
 impl ResidueWriter {
     fn new(path: &Path) -> ResidueWriter {
         ResidueWriter {
             path: path.to_path_buf(),
-            file: None,
-            hash: sha2::Sha256::new(),
+            enc: None,
             len: 0,
         }
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        if self.file.is_none() {
-            self.file = Some(
-                std::fs::File::create(&self.path)
-                    .with_context(|| format!("create {}", self.path.display()))?,
-            );
+        if self.enc.is_none() {
+            let f = std::fs::File::create(&self.path)
+                .with_context(|| format!("create {}", self.path.display()))?;
+            self.enc = Some(zstd::stream::write::Encoder::new(f, 3)?);
         }
-        self.file.as_mut().unwrap().write_all(bytes)?;
-        self.hash.update(bytes);
+        self.enc.as_mut().unwrap().write_all(bytes)?;
         self.len += bytes.len() as u64;
         Ok(())
     }
 
-    fn finish(self) -> Result<Option<([u8; 32], u64)>> {
-        match self.file {
-            Some(f) => {
-                f.sync_all().ok();
-                Ok(Some((self.hash.finalize().into(), self.len)))
+    fn finish(self) -> Result<Option<Residue>> {
+        let Some(enc) = self.enc else {
+            return Ok(None);
+        };
+        let f = enc.finish()?;
+        f.sync_all().ok();
+        drop(f);
+        // Hash the file as written (integrity covers the compressed
+        // artifact users copy around).
+        let mut f = std::fs::File::open(&self.path)?;
+        let mut h = sha2::Sha256::new();
+        let mut buf = vec![0u8; 1 << 20];
+        let mut file_len = 0u64;
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
             }
-            None => Ok(None),
+            h.update(&buf[..n]);
+            file_len += n as u64;
         }
+        Ok(Some(Residue {
+            sha256: h.finalize().into(),
+            file_len,
+            raw_len: self.len,
+        }))
     }
 }
 
@@ -818,7 +856,9 @@ pub fn check(recipe: &Path, dir: &Path, output: Option<&Path>) -> Result<()> {
         recipe.display()
     );
 
-    // The residue sidecar sits next to the document.
+    // The residue sidecar sits next to the document: verify the file
+    // as written, then open the uncompressed stream for offset reads
+    // (in RAM when small, a temp file when not).
     let residue = match doc["residue"].is_object() {
         false => None,
         true => {
@@ -838,7 +878,26 @@ pub fn check(recipe: &Path, dir: &Path, output: Option<&Path>) -> Result<()> {
                 "{}: residue does not match the recipe (sha256 {got} != {want})",
                 p.display()
             );
-            Some(bytes)
+            let raw_len = doc["residue"]["uncompressed_size"]
+                .as_u64()
+                .unwrap_or(bytes.len() as u64);
+            let spool = if doc["residue"]["compression"] == json!("zstd") {
+                if raw_len <= CHECK_SPOOL_MAX {
+                    Spool::Mem(zstd::stream::decode_all(&bytes[..])?)
+                } else {
+                    let dir = crate::filter::filters_dir()
+                        .parent()
+                        .map(|d| d.join("tmp"))
+                        .context("no cache dir")?;
+                    std::fs::create_dir_all(&dir)?;
+                    let mut f = tempfile::tempfile_in(&dir)?;
+                    zstd::stream::copy_decode(&bytes[..], &mut f)?;
+                    Spool::File(f)
+                }
+            } else {
+                Spool::Mem(bytes)
+            };
+            Some(spool)
         }
     };
 
@@ -877,7 +936,7 @@ pub fn check(recipe: &Path, dir: &Path, output: Option<&Path>) -> Result<()> {
     };
     let mut ctx = CheckCtx {
         blobs: &blobs,
-        residue: residue.as_deref(),
+        residue,
         built: HashMap::new(),
     };
     let mut h = sha2::Sha256::new();
@@ -901,7 +960,7 @@ pub fn check(recipe: &Path, dir: &Path, output: Option<&Path>) -> Result<()> {
 
 struct CheckCtx<'a> {
     blobs: &'a HashMap<String, PathBuf>,
-    residue: Option<&'a [u8]>,
+    residue: Option<Spool>,
     /// Builds materialized for slicing, by output sha256.
     built: HashMap<String, Spool>,
 }
@@ -1040,11 +1099,14 @@ fn assemble(
         }
         let off = l["residue_offset"].as_u64().context("literal offset")?;
         let len = l["len"].as_u64().context("literal len")?;
-        let res = ctx.residue.context("recipe has literals but no residue")?;
-        let lo = (off as usize).min(res.len());
-        let hi = ((off + len) as usize).min(res.len());
-        ensure!(hi - lo == len as usize, "literal outside the residue");
-        feed(&res[lo..hi])?;
+        let res = ctx
+            .residue
+            .as_ref()
+            .context("recipe has literals but no residue")?;
+        res.read_range(off, len, |b| {
+            feed(b)?;
+            Ok(())
+        })?;
         return Ok(len);
     }
     if node["slice"].is_object() {
