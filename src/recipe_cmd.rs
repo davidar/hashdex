@@ -190,7 +190,7 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
         });
         let out = write_doc(path, &doc)?;
         let line = format!(
-            "100% by claimed reference — the indexes name these bytes; nothing to reconstruct\n→ {}",
+            "100% fetchable — the indexes name these bytes; nothing to reconstruct\n→ {}",
             out.display()
         );
         report_summary(json_out, &doc, None, &line);
@@ -228,19 +228,23 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
     let residue = vs.residue.finish()?;
     ticker.clear();
 
-    // Coverage: every byte belongs to exactly one leaf — a referenced
-    // member's range or some build's literal gap.
+    // Coverage is fetchability: residue is EVERY byte no claim URL
+    // fetches, whether it rides in the sidecar or hides behind a
+    // digest-only ref (those rebuild from a local copy but come from
+    // nowhere — the jigdo projection rightly classifies them as
+    // template data, and so does this count).
     let total = members[root].size;
-    let mut referenced = 0u64;
-    let mut claimed = 0u64;
+    let mut fetchable = 0u64;
+    let mut digest_only = 0u64;
     let mut nrefs = 0usize;
     for b in plan.builds.values() {
         for seg in &b.segs {
             if let Seg::Child { idx, len, .. } = seg {
                 if !plan.builds.contains_key(idx) {
-                    referenced += len;
-                    if !claims_of(*idx).is_empty() {
-                        claimed += len;
+                    if claims_of(*idx).is_empty() {
+                        digest_only += len;
+                    } else {
+                        fetchable += len;
                     }
                 }
             }
@@ -251,6 +255,7 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
             nrefs += 1;
         }
     }
+    let residue_total = total - fetchable;
 
     let doc = json!({
         "hdx_recipe": "0",
@@ -259,35 +264,41 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
         "residue": residue.as_ref().map(|r| json!({"sha256": hex_lower(&r.0), "size": r.1})),
         "coverage": {
             "total_bytes": total,
-            "referenced_bytes": referenced,
-            "claimed_bytes": claimed,
-            "residue_bytes": total - referenced,
+            "fetchable_bytes": fetchable,
+            "residue_bytes": residue_total,
+            "residue_digest_only_bytes": digest_only,
+            "residue_sidecar_bytes": residue.as_ref().map(|r| r.1).unwrap_or(0),
         },
     });
     let out = write_doc(path, &doc)?;
 
     let pct = |x: u64| 100.0 * x as f64 / total as f64;
     let mut line = format!(
-        "{:.1}% by reference ({} of {}), {:.1}% with claim URLs",
-        pct(referenced),
-        human(referenced),
+        "{:.1}% fetchable ({} of {}) · residue {} · verified byte-exact",
+        pct(fetchable),
+        human(fetchable),
         human(total),
-        pct(claimed),
+        human(residue_total),
     );
-    match &residue {
-        Some((_, sz)) => line.push_str(&format!(" · residue {}", human(*sz))),
-        None => line.push_str(" · no residue"),
+    if digest_only > 0 {
+        line.push_str(&format!(
+            "\nresidue: {} literal in the sidecar + {} digest-only refs (rebuildable from a local copy, fetchable from nowhere)",
+            human(residue.as_ref().map(|r| r.1).unwrap_or(0)),
+            human(digest_only),
+        ));
     }
     line.push_str(&format!(
-        " · verified byte-exact\n→ {} ({} ref{}, {} build{})",
+        "\n→ {} ({} ref{}, {} build{})",
         out.display(),
         nrefs,
         s(nrefs),
         plan.builds.len(),
         s(plan.builds.len()),
     ));
-    if referenced == 0 {
-        line.push_str("\nnote: nothing referenced — this recipe is a full copy of the file");
+    if fetchable == 0 && digest_only == 0 {
+        line.push_str(
+            "\nnote: nothing referenced — this recipe is a full literal copy of the file",
+        );
     }
     report_summary(json_out, &doc, residue.as_ref().map(|r| r.1), &line);
     Ok(())

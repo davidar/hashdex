@@ -1839,10 +1839,14 @@ fn recipe_splices_a_plain_tar() {
     // are referenced in tar order.
     assert_eq!(refs, vec!["a.bin", "b.bin"]);
     assert!(inputs.iter().any(|i| i["literal"].is_object()));
+    // Residue is fetchability, not structure: nothing here carries a
+    // claim URL, so the WHOLE tar is residue — the digest-only refs
+    // are counted inside it, not as coverage.
     let cov = &doc["coverage"];
-    assert_eq!(cov["referenced_bytes"].as_u64().unwrap(), 5600);
+    assert_eq!(cov["fetchable_bytes"].as_u64().unwrap(), 0);
+    assert_eq!(cov["residue_digest_only_bytes"].as_u64().unwrap(), 5600);
     assert_eq!(
-        cov["referenced_bytes"].as_u64().unwrap() + cov["residue_bytes"].as_u64().unwrap(),
+        cov["residue_bytes"].as_u64().unwrap(),
         cov["total_bytes"].as_u64().unwrap()
     );
 
@@ -1947,7 +1951,7 @@ fn recipe_wrapped_root_is_all_residue() {
     let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
     assert!(out.status.success(), "mint failed: {}", stderr(&out));
     assert!(
-        stdout(&out).contains("full copy"),
+        stdout(&out).contains("full literal copy"),
         "summary: {}",
         stdout(&out)
     );
@@ -1955,7 +1959,11 @@ fn recipe_wrapped_root_is_all_residue() {
         &std::fs::read_to_string(env.work().join("demo.tar.gz.recipe.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(doc["coverage"]["referenced_bytes"], 0);
+    assert_eq!(doc["coverage"]["fetchable_bytes"], 0);
+    assert_eq!(
+        doc["coverage"]["residue_bytes"],
+        doc["coverage"]["total_bytes"]
+    );
 
     // Totality: even the trivial recipe rebuilds — from the residue
     // alone, with an empty blob dir.
@@ -1996,7 +2004,7 @@ fn recipe_of_claimed_file_is_one_ref() {
     let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
     assert!(out.status.success(), "mint failed: {}", stderr(&out));
     assert!(
-        stdout(&out).contains("100% by claimed reference"),
+        stdout(&out).contains("100% fetchable"),
         "summary: {}",
         stdout(&out)
     );
