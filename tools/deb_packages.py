@@ -11,7 +11,7 @@ construction: mirror base + Filename) plus strong digests:
           rows — the richest crosswalk edges in the distro family)
   kali    MD5sum + SHA1 + SHA256
 
-Ingest is a few dozen HTTP GETs of index metadata, never content:
+Ingest is a few hundred HTTP GETs of index metadata, never content:
 admission-rule clean. Dumps are kept beside the output.
 
 NOTE: fetch() reuses dumps already on disk — a real re-harvest must
@@ -26,14 +26,42 @@ Output TSV columns (one row per deb×witness, "-" = absent):
 where filename is the pool path relative to the archive root; the
 witness prefix picks the archive base URL.
 """
+import asyncio
 import gzip
 import lzma
 import pathlib
 import re
+import socket
 import sys
+import time
 import urllib.request
 
 UA = "hashdex-deb-packages/0.1 (hash index research; index GETs only)"
+
+# Fetch concurrency (fedora_headers.py pattern): the deb archive hosts
+# are ~300ms away and urllib cold-starts TCP+TLS per request, so the
+# harvest is latency-bound. httpx negotiates h2 where offered
+# (deb.debian.org, security.debian.org) and falls back to keepalive
+# h1.1 elsewhere (archive/old-releases.ubuntu.com and kali are
+# h1-only, verified 2026-08-14) — either way the per-request
+# handshake dies.
+STREAMS = 12  # in-flight requests
+CONNECTIONS = 8  # TCP connections in the pool, across all hosts
+
+# Prefer IPv4: urllib has no happy-eyeballs, so on networks with a
+# silently-broken IPv6 path every request burns the full timeout in
+# SYN-SENT before falling back (same fix as install_media.py; bit
+# old-releases.ubuntu.com in practice — only some of its AAAA records
+# blackhole).
+_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_first(host, port, family=0, *args, **kwargs):
+    infos = _getaddrinfo(host, port, family, *args, **kwargs)
+    return sorted(infos, key=lambda i: i[0] != socket.AF_INET)
+
+
+socket.getaddrinfo = _ipv4_first
 
 # (witness, archive base, dists base, components). Architecture is
 # amd64 — arch:all packages ride in the amd64 Packages file.
@@ -49,24 +77,38 @@ SUITES = [
         DEB_COMPONENTS,
     ),
     ("debian-sid", "https://deb.debian.org/debian", "sid", DEB_COMPONENTS),
-    ("ubuntu-noble", "https://archive.ubuntu.com/ubuntu", "noble", UBU_COMPONENTS),
-    ("ubuntu-noble-updates", "https://archive.ubuntu.com/ubuntu", "noble-updates", UBU_COMPONENTS),
-    (
-        "ubuntu-noble-security",
-        "https://archive.ubuntu.com/ubuntu",
-        "noble-security",
-        UBU_COMPONENTS,
-    ),
-    ("ubuntu-jammy", "https://archive.ubuntu.com/ubuntu", "jammy", UBU_COMPONENTS),
-    ("ubuntu-jammy-updates", "https://archive.ubuntu.com/ubuntu", "jammy-updates", UBU_COMPONENTS),
-    (
-        "ubuntu-jammy-security",
-        "https://archive.ubuntu.com/ubuntu",
-        "jammy-security",
-        UBU_COMPONENTS,
-    ),
     ("kali-rolling", "https://http.kali.org/kali", "kali-rolling", DEB_COMPONENTS),
 ]
+
+# Ubuntu is enumerated, not listed: supported releases live on
+# archive.ubuntu.com, EOL releases move wholesale (pool included) to
+# old-releases.ubuntu.com, and between the two every release ever is
+# still fully hosted. src/debs.rs mirrors the EOL codename set to pick
+# the claim-URL base — a re-harvest after a release EOLs must update
+# UBUNTU_EOL there too.
+UBUNTU_HOSTS = [
+    "https://archive.ubuntu.com/ubuntu",
+    "https://old-releases.ubuntu.com/ubuntu",
+]
+HREF = re.compile(r'href="([^"/]+)/"')
+
+
+def ubuntu_suites():
+    """(witness, base, suite, comps) for every Ubuntu release on both
+    hosts: release + -updates + -security pockets, skipping backports/
+    proposed and the devel* symlinks. Pre-gutsy (2007) indexes carry
+    no SHA256, so their rows self-filter in stanza_rows."""
+    entries = []
+    for base in UBUNTU_HOSTS:
+        req = urllib.request.Request(f"{base}/dists/", headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            names = set(HREF.findall(resp.read().decode("utf-8", errors="replace")))
+        codenames = sorted(n for n in names if "-" not in n and n != "devel")
+        for code in codenames:
+            for pocket in ("", "-updates", "-security"):
+                if code + pocket in names:
+                    entries.append((f"ubuntu-{code}{pocket}", base, code + pocket, UBU_COMPONENTS))
+    return entries
 
 HEX = {
     "SHA256": re.compile(r"[0-9a-f]{64}"),
@@ -76,31 +118,104 @@ HEX = {
 }
 
 
-def fetch(base, suite, comp, dest, installer=False):
-    """GET the suite/component Packages index (xz preferred, gz
-    fallback — kali publishes gz only), reusing an existing dump.
-    `installer` fetches the debian-installer sub-index instead — the
-    udebs on install media live there, not in the main Packages."""
+def dump_dest(dumps, witness, comp, installer):
+    tag = f"{comp}-installer" if installer else comp
+    return dumps / f"{witness}-{tag}-Packages"
+
+
+def fetch(dest):
+    """Read a prefetched dump: .xz/.gz cache hit, .404 marker =
+    confirmed absent upstream (both markers persist across runs — a
+    real re-harvest deletes the dumps dir first)."""
     for ext in (".xz", ".gz"):
         cached = dest.with_suffix(dest.suffix + ext)
         if cached.exists():
-            print(f"  reusing {cached.name} ({cached.stat().st_size:,} bytes)", file=sys.stderr)
             return cached.read_bytes()
-    sub = "debian-installer/binary-amd64" if installer else "binary-amd64"
-    last = None
-    for ext in (".xz", ".gz"):
-        url = f"{base}/dists/{suite}/{comp}/{sub}/Packages{ext}"
-        req = urllib.request.Request(url, headers={"User-Agent": UA})
-        try:
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                data = resp.read()
-            out = dest.with_suffix(dest.suffix + ext)
-            out.write_bytes(data)
-            print(f"  fetched {out.name} ({len(data):,} bytes)", file=sys.stderr)
-            return data
-        except Exception as e:  # noqa: BLE001 — try the next extension
-            last = e
-    raise last
+    if dest.with_suffix(dest.suffix + ".404").exists():
+        raise FileNotFoundError("HTTP 404 (cached)")
+    raise FileNotFoundError("not prefetched (transient fetch failure — rerun)")
+
+
+async def prefetch(suites, dumps):
+    """Concurrently download every missing suite/component Packages
+    index (xz preferred, gz fallback — kali publishes gz only) plus
+    the debian-installer udeb sub-indexes, into the dumps cache. 404
+    on both extensions writes a .404 marker; transient failures leave
+    nothing so a rerun retries them."""
+    try:
+        import httpx
+    except ImportError:
+        sys.exit("needs httpx[http2] (pip install 'httpx[http2]')")
+    work = []
+    for witness, base, suite, comps in suites:
+        for installer in (False, True):
+            for comp in comps:
+                work.append((witness, base, suite, comp, installer))
+    sem = asyncio.Semaphore(STREAMS)
+    done = 0
+    fetched = 0
+    absent = 0
+    failed = []
+    t0 = time.time()
+
+    async def one(client, witness, base, suite, comp, installer):
+        nonlocal done, fetched, absent
+        dest = dump_dest(dumps, witness, comp, installer)
+        exists = [dest.with_suffix(dest.suffix + e) for e in (".xz", ".gz", ".404")]
+        if any(p.exists() for p in exists):
+            done += 1
+            return
+        sub = "debian-installer/binary-amd64" if installer else "binary-amd64"
+        async with sem:
+            saw_404 = 0
+            for ext in (".xz", ".gz"):
+                url = f"{base}/dists/{suite}/{comp}/{sub}/Packages{ext}"
+                for attempt in range(4):
+                    try:
+                        r = await client.get(url)
+                    except Exception as exc:  # noqa: BLE001 — retry
+                        if attempt == 3:
+                            failed.append((url, str(exc)))
+                        else:
+                            await asyncio.sleep(1 + attempt)
+                        continue
+                    if r.status_code == 200:
+                        dest.with_suffix(dest.suffix + ext).write_bytes(r.content)
+                        fetched += 1
+                        done += 1
+                        return
+                    if r.status_code == 404:
+                        saw_404 += 1
+                        break
+                    if attempt == 3:
+                        failed.append((url, f"HTTP {r.status_code}"))
+                    else:
+                        await asyncio.sleep(1 + attempt)
+            if saw_404 == 2:
+                dest.with_suffix(dest.suffix + ".404").touch()
+                absent += 1
+            done += 1
+
+    limits = httpx.Limits(max_connections=CONNECTIONS, max_keepalive_connections=CONNECTIONS)
+    async with httpx.AsyncClient(
+        http2=True, follow_redirects=True, limits=limits, timeout=90, headers={"User-Agent": UA}
+    ) as client:
+        tasks = [asyncio.ensure_future(one(client, *w)) for w in work]
+        while not all(t.done() for t in tasks):
+            await asyncio.sleep(5)
+            print(
+                f"  prefetch {done}/{len(work)} ({fetched} fetched, "
+                f"{done / max(time.time() - t0, 1):.0f}/s)",
+                file=sys.stderr,
+            )
+        await asyncio.gather(*tasks)
+    print(
+        f"  prefetch done: {fetched} fetched, {absent} absent (404), "
+        f"{done - fetched - absent} cached, {len(failed)} failed",
+        file=sys.stderr,
+    )
+    for url, err in failed[:10]:
+        print(f"  warning: {url}: {err}", file=sys.stderr)
 
 
 def decompress(data):
@@ -212,18 +327,19 @@ def main():
     seen = set()
     counts = {}
     skipped = 0
+    suites = SUITES + ubuntu_suites()
+    asyncio.run(prefetch(suites, dumps))
     with gzip.open(out, "wt", encoding="utf-8") as fh:
-        for witness, base, suite, comps in SUITES:
+        for witness, base, suite, comps in suites:
             print(f"{witness}:", file=sys.stderr)
             fetches = [(comp, False) for comp in comps]
             # udeb sub-indexes exist only for some suites; a 404 there
             # is routine, not a warning worth shouting about.
             fetches += [(comp, True) for comp in comps]
             for comp, installer in fetches:
-                tag = f"{comp}-installer" if installer else comp
                 try:
-                    data = fetch(base, suite, comp, dumps / f"{witness}-{tag}-Packages", installer)
-                except Exception as e:  # noqa: BLE001 — a missing component is a warning
+                    data = fetch(dump_dest(dumps, witness, comp, installer))
+                except FileNotFoundError as e:
                     if not installer:
                         print(f"  warning: {comp}: {e}", file=sys.stderr)
                     continue

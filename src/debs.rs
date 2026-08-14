@@ -52,14 +52,30 @@ pub struct Row<'a> {
     pub sha512: Option<String>,
 }
 
+/// Ubuntu codenames whose archive (pool included) has moved to
+/// old-releases.ubuntu.com, as of the 2026-08 harvest. When a release
+/// EOLs it joins this list at the next re-harvest — the harvester's
+/// UBUNTU_HOSTS note points back here.
+const UBUNTU_EOL: &[&str] = &[
+    "artful", "breezy", "cosmic", "dapper", "disco", "edgy", "eoan", "feisty", "groovy", "gutsy",
+    "hardy", "hirsute", "hoary", "impish", "intrepid", "jaunty", "karmic", "kinetic", "lucid",
+    "lunar", "mantic", "maverick", "natty", "oneiric", "oracular", "precise", "quantal", "raring",
+    "saucy", "utopic", "vivid", "warty", "wily", "yakkety", "zesty",
+];
+
 /// Archive base URL for a witness — the claim URL is base + Filename.
 fn archive_base(witness: &str) -> &'static str {
     if witness.starts_with("debian-") && witness.ends_with("-security") {
         "https://security.debian.org/debian-security"
     } else if witness.starts_with("debian-") {
         "https://deb.debian.org/debian"
-    } else if witness.starts_with("ubuntu-") {
-        "https://archive.ubuntu.com/ubuntu"
+    } else if let Some(rest) = witness.strip_prefix("ubuntu-") {
+        let code = rest.split('-').next().unwrap_or(rest);
+        if UBUNTU_EOL.contains(&code) {
+            "https://old-releases.ubuntu.com/ubuntu"
+        } else {
+            "https://archive.ubuntu.com/ubuntu"
+        }
     } else {
         "https://http.kali.org/kali"
     }
@@ -234,5 +250,28 @@ mod tests {
             .as_deref()
             .unwrap()
             .starts_with("https://http.kali.org/kali/pool/"));
+    }
+
+    #[test]
+    fn eol_ubuntu_witnesses_point_at_old_releases() {
+        // EOL codenames (pockets included) → old-releases; supported
+        // ones stay on archive; "oracular" must not shadow a
+        // hypothetical supported codename by prefix.
+        assert_eq!(
+            archive_base("ubuntu-lucid-updates"),
+            "https://old-releases.ubuntu.com/ubuntu"
+        );
+        assert_eq!(
+            archive_base("ubuntu-warty"),
+            "https://old-releases.ubuntu.com/ubuntu"
+        );
+        assert_eq!(
+            archive_base("ubuntu-resolute-security"),
+            "https://archive.ubuntu.com/ubuntu"
+        );
+        assert_eq!(
+            archive_base("ubuntu-noble"),
+            "https://archive.ubuntu.com/ubuntu"
+        );
     }
 }
