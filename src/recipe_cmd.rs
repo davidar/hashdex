@@ -71,14 +71,34 @@ struct Build {
     /// sibling (iso hardlinks share extents) — their bytes are still
     /// covered, by the sibling; count kept for the node's note.
     dropped: usize,
+    /// The coordinate space this build splices in — `View::src_id` of
+    /// the source its children's extents name (the root file, or the
+    /// spool of a decompressed wrapper) — and the build's own runs
+    /// there.
+    space: usize,
+    runs: Vec<(u64, u64, u64)>,
+}
+
+/// A compression node: this member's bytes are a cataloged compressor
+/// run over its decompressed child, plus its recorded raw header.
+/// Verified at planning time — the compressor search compares the
+/// recompressed body against the original bytes, so a Compress in the
+/// plan IS a proof, same as a verified splice.
+struct Compress {
+    child: usize,
+    params: crate::compressors::GnuGzip,
+    /// The original gzip header, spliced back verbatim at rebuild
+    /// (embedded names and mtimes never touch the compressor).
+    header: Vec<u8>,
 }
 
 struct Plan {
     /// Member idx → its build plan; members referenced but not built
     /// appear only as `Seg::Child` entries.
     builds: HashMap<usize, Build>,
+    /// Member idx → its compression plan (gzip@0 nodes).
+    compress: HashMap<usize, Compress>,
     root: usize,
-    root_src: usize,
 }
 
 /// Map a member-logical range through its extent runs to root ranges,
@@ -139,6 +159,10 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
         truncated: AtomicBool::new(false),
         dead: Mutex::new(Vec::new()),
         threads,
+        // Recipes need the decompressed bytes of every wrapper again
+        // (splice verification, compressor search), so wrapper
+        // children spool and keep their spaces.
+        spool_wrappers: true,
     };
     let walked = std::thread::scope(|scope| {
         for _ in 0..threads {
@@ -181,6 +205,19 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
         .map(|e| e.src)
         .context("root member carries no extents")?;
 
+    // Space views: every coordinate space extents can name. The walk's
+    // root view is gone, so the recorded root src maps to a fresh one;
+    // wrapper spools are still alive inside their members. (No id can
+    // collide: all spool views coexisted with the walk-time root.)
+    let root_view = View::of_file(path)?;
+    let mut spaces: HashMap<usize, View> = HashMap::new();
+    spaces.insert(root_src, root_view);
+    for m in &members {
+        if let Some(v) = &m.space {
+            spaces.insert(v.src_id(), v.clone());
+        }
+    }
+
     let claims_of = |i: usize| claims_json(&evidence[i].0);
 
     // The indexes already name the whole file: the recipe is a single
@@ -203,32 +240,40 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
 
     let mut plan = Plan {
         builds: HashMap::new(),
+        compress: HashMap::new(),
         root,
-        root_src,
     };
-    plan_build(root, &members, &kids, &evidence, &mut plan);
+    let mut planner = Planner {
+        members: &members,
+        kids: &kids,
+        evidence: &evidence,
+        spaces: &spaces,
+        ticker: &ticker,
+    };
+    let planned = planner.plan_node(root, &mut plan);
+    ticker.clear();
     ensure!(
-        plan.builds.contains_key(&root),
+        planned,
         "no member of {} is reachable as a byte range — nothing beyond a trivial full-literal recipe",
         path.display()
     );
 
     // Verify: every ref re-read from its recorded ranges must
     // reproduce its digest, and every build re-spliced from its
-    // segments must reproduce its own. The residue is written during
-    // the splice pass (document order), so the sidecar is a byproduct
-    // of the proof.
-    let view = View::of_file(path)?;
-    verify_refs(&view, &members, &plan, threads, &ticker)?;
+    // segments must reproduce its own. (Compression nodes were
+    // verified during planning — the search IS the byte comparison.)
+    // The residue is written during the splice pass (document order),
+    // so the sidecar is a byproduct of the proof.
+    verify_refs(&spaces, &members, &plan, threads, &ticker)?;
     let residue = ResidueWriter::new(&residue_path(&doc_path(path)));
     let mut vs = VerifyState {
-        view: &view,
+        spaces: &spaces,
         members: &members,
         residue,
         done: 0,
         ticker: &ticker,
     };
-    verify_build(root, &mut plan, &mut vs)?;
+    verify_node(root, &mut plan, &mut vs)?;
     let residue = vs.residue.finish()?;
     ticker.clear();
 
@@ -238,16 +283,29 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
     // rebuild the file — residue IS the sidecar's uncompressed bytes
     // plus the inlined runs, and nothing is quietly delegated to "a
     // copy you happen to have".
+    // With compression nodes in the tree, refs and literals live in
+    // decompressed spaces, so fetchable + residue no longer tile the
+    // root's compressed size; the honest ratio is between them.
     let total = members[root].size;
+    let is_leaf = |i: &usize| !plan.builds.contains_key(i) && !plan.compress.contains_key(i);
     let mut fetchable = 0u64;
+    let mut residue_total = 0u64;
     let mut nrefs = 0usize;
     for b in plan.builds.values() {
         for seg in &b.segs {
-            if let Seg::Child { idx, len, .. } = seg {
-                if !plan.builds.contains_key(idx) {
-                    fetchable += len;
+            match seg {
+                Seg::Child { idx, len, .. } => {
+                    if is_leaf(idx) {
+                        fetchable += len;
+                    }
                 }
+                Seg::Gap { len, .. } => residue_total += len,
             }
+        }
+    }
+    for c in plan.compress.values() {
+        if is_leaf(&c.child) {
+            fetchable += members[c.child].size;
         }
     }
     for (i, m) in members.iter().enumerate() {
@@ -255,7 +313,6 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
             nrefs += 1;
         }
     }
-    let residue_total = total - fetchable;
 
     let doc = json!({
         "hdx_recipe": "0",
@@ -275,12 +332,12 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
     });
     let out = write_doc(path, &doc)?;
 
-    let pct = |x: u64| 100.0 * x as f64 / total as f64;
+    let covered = fetchable + residue_total;
+    let pct = 100.0 * fetchable as f64 / covered.max(1) as f64;
     let mut line = format!(
-        "{:.1}% fetchable ({} of {}) · residue {}",
-        pct(fetchable),
+        "{pct:.1}% fetchable ({} of {}) · residue {}",
         human(fetchable),
-        human(total),
+        human(covered),
         human(residue_total),
     );
     if let Some(r) = &residue {
@@ -291,9 +348,15 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
         out.display(),
         nrefs,
         s(nrefs),
-        plan.builds.len(),
-        s(plan.builds.len()),
+        plan.builds.len() + plan.compress.len(),
+        s(plan.builds.len() + plan.compress.len()),
     ));
+    let mut compressors: Vec<String> = plan.compress.values().map(|c| c.params.name()).collect();
+    compressors.sort();
+    compressors.dedup();
+    if !compressors.is_empty() {
+        line.push_str(&format!(" · compressors: {}", compressors.join(", ")));
+    }
     if fetchable == 0 {
         line.push_str("\nnote: nothing fetchable — this recipe is a full literal copy of the file");
     }
@@ -303,160 +366,321 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
 
 fn referenced_as_leaf(plan: &Plan, i: usize) -> bool {
     !plan.builds.contains_key(&i)
-        && plan.builds.values().any(|b| {
+        && !plan.compress.contains_key(&i)
+        && (plan.builds.values().any(|b| {
             b.segs
                 .iter()
                 .any(|s| matches!(s, Seg::Child { idx, .. } if *idx == i))
-        })
+        }) || plan.compress.values().any(|c| c.child == i))
 }
 
-/// Plan member `i` as a build. A child earns a place in the splice
-/// only through verification: refs require claim URLs, and an
-/// unclaimed child survives only as a build whose subtree holds
-/// claimed refs. Everything else collapses into literal gaps — a
-/// member boundary the indexes don't verify was a hypothesis about
-/// public availability that failed, and its bytes are just bytes
-/// (you can hash any string; an unwitnessed digest is not knowledge).
-/// Claims stop descent the other way too: a member the indexes
-/// already name is one line — its inside needs no proof.
-fn plan_build(
-    i: usize,
-    members: &[Member],
-    kids: &[Vec<usize>],
-    evidence: &[report::Evidence],
-    plan: &mut Plan,
-) -> bool {
-    let Some(runs) = rangeable(members, plan.root_src, i) else {
-        return false;
-    };
-    let runs = runs.to_vec();
-    let mut segs: Vec<Seg> = Vec::new();
-    let mut taken = Intervals::default();
-    let mut dropped = 0usize;
-    for &c in &kids[i] {
-        let Some(cruns) = rangeable(members, plan.root_src, c) else {
-            continue;
-        };
-        let claimed = evidence[c].0.iter().any(|f| !f.claims.is_empty());
-        if !claimed && !plan_build(c, members, kids, evidence, plan) {
-            continue; // unverified hypothesis — bytes stay literal
+struct Planner<'a> {
+    members: &'a [Member],
+    kids: &'a [Vec<usize>],
+    evidence: &'a [report::Evidence],
+    spaces: &'a HashMap<usize, View>,
+    ticker: &'a Ticker,
+}
+
+impl Planner<'_> {
+    /// Plan member `i` as a non-leaf node: a compression chain when
+    /// it's a compressed wrapper the catalog can reproduce, else a
+    /// splice build. (Claimed members never get here — a claim stops
+    /// descent at the caller.)
+    fn plan_node(&mut self, i: usize, plan: &mut Plan) -> bool {
+        if self.members[i].kind == "gzip" && self.plan_compress(i, plan) {
+            return true;
         }
-        // Map the child's runs into this build's logical space; each
-        // run lies inside one of our runs by construction (the child's
-        // view was sliced from ours).
-        let mut pieces: Vec<Seg> = Vec::new();
-        let mut ok = true;
-        for &(clog, coff, clen) in cruns {
-            match runs
-                .iter()
-                .find(|&&(_, off, len)| off <= coff && coff + clen <= off + len)
-            {
-                Some(&(rlog, roff, _)) => pieces.push(Seg::Child {
-                    idx: c,
-                    from: clog,
-                    len: clen,
-                    at: rlog + (coff - roff),
-                    root_off: coff,
-                }),
-                None => {
-                    ok = false;
-                    break;
+        self.plan_build(i, plan)
+    }
+
+    /// Plan wrapper `i` as a gzip@0 node: its single decompressed
+    /// child must itself be plannable (a claimed ref, or a verified
+    /// build/chain), and a catalog compressor must reproduce the
+    /// wrapper's body byte-exact from the child's bytes. The search
+    /// IS the verification — no node is emitted on faith.
+    fn plan_compress(&mut self, i: usize, plan: &mut Plan) -> bool {
+        let m = &self.members[i];
+        if m.size < IDENTITY_MIN_BYTES || m.digests.is_none() {
+            return false;
+        }
+        let &[c] = &self.kids[i][..] else {
+            return false;
+        };
+        let child = &self.members[c];
+        if child.digests.is_none() || child.size < IDENTITY_MIN_BYTES {
+            return false;
+        }
+        // The child's bytes (the search input) come from its spool;
+        // the wrapper's own bytes (the target) from its extents.
+        let Some(cview) = child.space.clone() else {
+            return false;
+        };
+        let Some(wext) = m.extents.as_ref() else {
+            return false;
+        };
+        let Some(wspace) = self.spaces.get(&wext.src) else {
+            return false;
+        };
+        let claimed = self.evidence[c].0.iter().any(|f| !f.claims.is_empty());
+        if !claimed && !self.plan_node(c, plan) {
+            return false;
+        }
+        let wruns: Vec<(u64, u64)> = wext.runs.iter().map(|&(_, off, len)| (off, len)).collect();
+        let wview = wspace.slice(&wruns);
+        let header = match crate::compressors::parse_gzip_header(&mut wview.rewound()) {
+            Ok(Some(h)) => h,
+            _ => {
+                remove_plan_subtree(plan, c);
+                return false;
+            }
+        };
+        let name = leaf_name(m).to_string();
+        self.ticker
+            .update(1, 0, || format!("searching compressors… {name}"));
+        match search_gzip(&wview, header.len() as u64, &cview) {
+            Some(params) => {
+                plan.compress.insert(
+                    i,
+                    Compress {
+                        child: c,
+                        params,
+                        header,
+                    },
+                );
+                true
+            }
+            None => {
+                // No catalog compressor reproduces these bytes — the
+                // wrapper stays literal, honestly.
+                remove_plan_subtree(plan, c);
+                false
+            }
+        }
+    }
+
+    /// Plan member `i` as a build. A child earns a place in the splice
+    /// only through verification: refs require claim URLs, and an
+    /// unclaimed child survives only as a build whose subtree holds
+    /// claimed refs. Everything else collapses into literal gaps — a
+    /// member boundary the indexes don't verify was a hypothesis about
+    /// public availability that failed, and its bytes are just bytes
+    /// (you can hash any string; an unwitnessed digest is not knowledge).
+    /// Claims stop descent the other way too: a member the indexes
+    /// already name is one line — its inside needs no proof.
+    fn plan_build(&mut self, i: usize, plan: &mut Plan) -> bool {
+        let members = self.members;
+        let m = &members[i];
+        if m.size < IDENTITY_MIN_BYTES || m.digests.is_none() {
+            return false;
+        }
+        // A spooled member owns a fresh space and covers all of it; a
+        // ranged member splices inside its own source.
+        let (space, runs): (usize, Vec<(u64, u64, u64)>) = match &m.space {
+            Some(v) => (v.src_id(), vec![(0, 0, m.size)]),
+            None => match m.extents.as_ref() {
+                Some(e) => (e.src, e.runs.to_vec()),
+                None => return false,
+            },
+        };
+        let mut segs: Vec<Seg> = Vec::new();
+        let mut taken = Intervals::default();
+        let mut dropped = 0usize;
+        for &c in self.kids[i].iter() {
+            let Some(cruns) = rangeable(members, space, c) else {
+                continue;
+            };
+            let claimed = self.evidence[c].0.iter().any(|f| !f.claims.is_empty());
+            if !claimed && !self.plan_node(c, plan) {
+                continue; // unverified hypothesis — bytes stay literal
+            }
+            // Map the child's runs into this build's logical space;
+            // each run lies inside one of our runs by construction
+            // (the child's view was sliced from ours).
+            let mut pieces: Vec<Seg> = Vec::new();
+            let mut ok = true;
+            for &(clog, coff, clen) in cruns {
+                match runs
+                    .iter()
+                    .find(|&&(_, off, len)| off <= coff && coff + clen <= off + len)
+                {
+                    Some(&(rlog, roff, _)) => pieces.push(Seg::Child {
+                        idx: c,
+                        from: clog,
+                        len: clen,
+                        at: rlog + (coff - roff),
+                        root_off: coff,
+                    }),
+                    None => {
+                        ok = false;
+                        break;
+                    }
                 }
             }
-        }
-        let fits = ok
-            && pieces
-                .iter()
-                .all(|p| matches!(p, Seg::Child { at, len, .. } if taken.admits(*at, *len)));
-        if !fits {
-            dropped += 1;
-            remove_build_subtree(plan, c);
-            continue;
-        }
-        for p in &pieces {
-            if let Seg::Child { at, len, .. } = p {
-                taken.insert(*at, *len);
+            let fits = ok
+                && pieces
+                    .iter()
+                    .all(|p| matches!(p, Seg::Child { at, len, .. } if taken.admits(*at, *len)));
+            if !fits {
+                dropped += 1;
+                remove_plan_subtree(plan, c);
+                continue;
             }
+            for p in &pieces {
+                if let Seg::Child { at, len, .. } = p {
+                    taken.insert(*at, *len);
+                }
+            }
+            segs.extend(pieces);
         }
-        segs.extend(pieces);
-    }
-    if segs.is_empty() && i != plan.root {
-        return false;
-    }
-    segs.sort_by_key(|s| match s {
-        Seg::Child { at, .. } | Seg::Gap { at, .. } => *at,
-    });
-    // Gaps between accepted segments become literals; the tiling must
-    // come out exact or the plan is wrong.
-    let mut tiled: Vec<Seg> = Vec::new();
-    let mut pos = 0u64;
-    for seg in segs {
-        let at = match &seg {
+        if segs.is_empty() && i != plan.root {
+            return false;
+        }
+        segs.sort_by_key(|s| match s {
             Seg::Child { at, .. } | Seg::Gap { at, .. } => *at,
-        };
-        assert!(at >= pos, "overlapping splice segments survived planning");
-        if at > pos {
+        });
+        // Gaps between accepted segments become literals; the tiling
+        // must come out exact or the plan is wrong.
+        let mut tiled: Vec<Seg> = Vec::new();
+        let mut pos = 0u64;
+        for seg in segs {
+            let at = match &seg {
+                Seg::Child { at, .. } | Seg::Gap { at, .. } => *at,
+            };
+            assert!(at >= pos, "overlapping splice segments survived planning");
+            if at > pos {
+                tiled.push(Seg::Gap {
+                    at: pos,
+                    len: at - pos,
+                    residue_off: None,
+                    inline: None,
+                });
+            }
+            pos = at
+                + match &seg {
+                    Seg::Child { len, .. } | Seg::Gap { len, .. } => *len,
+                };
+            tiled.push(seg);
+        }
+        let size = members[i].size;
+        if pos < size {
             tiled.push(Seg::Gap {
                 at: pos,
-                len: at - pos,
+                len: size - pos,
                 residue_off: None,
                 inline: None,
             });
         }
-        pos = at
-            + match &seg {
-                Seg::Child { len, .. } | Seg::Gap { len, .. } => *len,
-            };
-        tiled.push(seg);
+        plan.builds.insert(
+            i,
+            Build {
+                segs: tiled,
+                dropped,
+                space,
+                runs,
+            },
+        );
+        true
     }
-    let size = members[i].size;
-    if pos < size {
-        tiled.push(Seg::Gap {
-            at: pos,
-            len: size - pos,
-            residue_off: None,
-            inline: None,
-        });
-    }
-    plan.builds.insert(
-        i,
-        Build {
-            segs: tiled,
-            dropped,
-        },
-    );
-    true
 }
 
-/// Discard a rejected subtree's build plans (a parent refused the
-/// child on extent overlap after recursion had already planned it).
-fn remove_build_subtree(plan: &mut Plan, i: usize) {
+/// Discard a rejected subtree's plans (a parent refused the child on
+/// extent overlap or a failed compressor search after recursion had
+/// already planned it).
+fn remove_plan_subtree(plan: &mut Plan, i: usize) {
+    if let Some(c) = plan.compress.remove(&i) {
+        remove_plan_subtree(plan, c.child);
+    }
     if let Some(b) = plan.builds.remove(&i) {
         for seg in &b.segs {
             if let Seg::Child { idx, .. } = seg {
-                remove_build_subtree(plan, *idx);
+                remove_plan_subtree(plan, *idx);
             }
         }
     }
 }
 
-fn rangeable(members: &[Member], root_src: usize, i: usize) -> Option<&[(u64, u64, u64)]> {
+fn rangeable(members: &[Member], space: usize, i: usize) -> Option<&[(u64, u64, u64)]> {
     let m = &members[i];
     if m.size < IDENTITY_MIN_BYTES || m.digests.is_none() {
         return None;
     }
     m.extents
         .as_ref()
-        .filter(|e| e.src == root_src)
+        .filter(|e| e.src == space)
         .map(|e| &e.runs[..])
+}
+
+/// Try catalog compressors until one reproduces the wrapper's body —
+/// everything after its recorded header, trailer included — from the
+/// decompressed child's bytes. Mismatched candidates abort on their
+/// first differing chunk.
+fn search_gzip(
+    wrapper: &View,
+    header_len: u64,
+    input: &View,
+) -> Option<crate::compressors::GnuGzip> {
+    use crate::compressors::{gzip_body, GnuGzip, GNU_GZIP_CANDIDATES};
+    let end = wrapper.len();
+    if header_len >= end {
+        return None;
+    }
+    for level in GNU_GZIP_CANDIDATES {
+        for rsyncable in [false, true] {
+            let params = GnuGzip { level, rsyncable };
+            let mut inp = input.rewound();
+            let mut pos = header_len;
+            let mut cmp = vec![0u8; 1 << 20];
+            let run = gzip_body(params, &mut inp, &mut |b: &[u8]| {
+                if pos + b.len() as u64 > end {
+                    return Ok(false);
+                }
+                let mut off = 0;
+                while off < b.len() {
+                    let n = (b.len() - off).min(cmp.len());
+                    let got = wrapper.read_full_at(&mut cmp[..n], pos)?;
+                    if got < n || cmp[..n] != b[off..off + n] {
+                        return Ok(false);
+                    }
+                    pos += n as u64;
+                    off += n;
+                }
+                Ok(true)
+            });
+            // Errors (no gzip on PATH, --rsyncable unsupported) just
+            // mean this candidate can't be tried — never a wrong node.
+            if matches!(run, Ok(true)) && pos == end {
+                return Some(params);
+            }
+        }
+    }
+    None
 }
 
 // ------------------------------------------------------------ verifying
 
+/// The space view and runs a member's bytes are read back through: a
+/// spooled member reads its whole spool, a ranged member its recorded
+/// extents.
+fn member_ranges<'s>(
+    m: &Member,
+    spaces: &'s HashMap<usize, View>,
+) -> (&'s View, Vec<(u64, u64, u64)>) {
+    if let Some(v) = &m.space {
+        let view = spaces
+            .get(&v.src_id())
+            .expect("spooled member's space view");
+        return (view, vec![(0, 0, m.size)]);
+    }
+    let e = m.extents.as_ref().expect("ref has extents");
+    let view = spaces.get(&e.src).expect("ranged member's space view");
+    (view, e.runs.to_vec())
+}
+
 /// Re-read every referenced member's recorded ranges (logical order)
 /// and require its sha256 back, in parallel.
 fn verify_refs(
-    view: &View,
+    spaces: &HashMap<usize, View>,
     members: &[Member],
     plan: &Plan,
     threads: usize,
@@ -479,9 +703,9 @@ fn verify_refs(
                     }
                     let i = refs[k];
                     let m = &members[i];
-                    let runs = m.extents.as_ref().expect("ref has extents");
+                    let (view, runs) = member_ranges(m, spaces);
                     let mut h = sha2::Sha256::new();
-                    for &(_, off, len) in runs.runs.iter() {
+                    for &(_, off, len) in runs.iter() {
                         if let Err(e) = hash_root_range(view, off, len, &mut buf, |b| h.update(b))
                         {
                             *failed.lock().unwrap() = Some(e.context(m.path.clone()));
@@ -598,11 +822,25 @@ impl ResidueWriter {
 }
 
 struct VerifyState<'a> {
-    view: &'a View,
+    spaces: &'a HashMap<usize, View>,
     members: &'a [Member],
     residue: ResidueWriter,
     done: usize,
     ticker: &'a Ticker,
+}
+
+/// Verify the node at `i` in document order: builds re-splice and
+/// capture their residue; compression nodes were byte-verified at
+/// planning time, so only their input subtree still needs the pass.
+fn verify_node(i: usize, plan: &mut Plan, vs: &mut VerifyState) -> Result<()> {
+    if let Some(c) = plan.compress.get(&i) {
+        let child = c.child;
+        if plan.builds.contains_key(&child) || plan.compress.contains_key(&child) {
+            return verify_node(child, plan, vs);
+        }
+        return Ok(());
+    }
+    verify_build(i, plan, vs)
 }
 
 /// Re-splice build `i` from its segments and require its sha256 back;
@@ -610,12 +848,13 @@ struct VerifyState<'a> {
 /// through. Child builds recurse at their position, so residue order
 /// is document order.
 fn verify_build(i: usize, plan: &mut Plan, vs: &mut VerifyState) -> Result<()> {
-    let mut segs = std::mem::take(&mut plan.builds.get_mut(&i).expect("planned build").segs);
-    let runs = vs.members[i]
-        .extents
-        .as_ref()
-        .expect("build has extents")
-        .runs
+    let build = plan.builds.get_mut(&i).expect("planned build");
+    let mut segs = std::mem::take(&mut build.segs);
+    let runs = build.runs.clone();
+    let view = vs
+        .spaces
+        .get(&build.space)
+        .expect("build space view")
         .clone();
     let mut h = sha2::Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
@@ -624,11 +863,13 @@ fn verify_build(i: usize, plan: &mut Plan, vs: &mut VerifyState) -> Result<()> {
             Seg::Child {
                 idx, root_off, len, ..
             } => {
-                hash_root_range(vs.view, *root_off, *len, &mut buf, |b| h.update(b))
+                hash_root_range(&view, *root_off, *len, &mut buf, |b| h.update(b))
                     .with_context(|| vs.members[*idx].path.clone())?;
                 let idx = *idx;
-                if plan.builds.contains_key(&idx) && !plan.builds[&idx].segs.is_empty() {
-                    verify_build(idx, plan, vs)?;
+                let planned_build =
+                    plan.builds.contains_key(&idx) && !plan.builds[&idx].segs.is_empty();
+                if planned_build || plan.compress.contains_key(&idx) {
+                    verify_node(idx, plan, vs)?;
                 }
             }
             Seg::Gap {
@@ -647,7 +888,7 @@ fn verify_build(i: usize, plan: &mut Plan, vs: &mut VerifyState) -> Result<()> {
                     let end = off + l;
                     while pos < end {
                         let want = ((end - pos) as usize).min(buf.len());
-                        let n = vs.view.read_full_at(&mut buf[..want], pos)?;
+                        let n = view.read_full_at(&mut buf[..want], pos)?;
                         ensure!(n == want, "short read in gap at {pos}");
                         h.update(&buf[..n]);
                         if small {
@@ -752,6 +993,19 @@ fn source_json(path: &Path, root: &Member) -> Value {
 
 fn node_json(i: usize, members: &[Member], plan: &Plan, evidence: &[report::Evidence]) -> Value {
     let m = &members[i];
+    if let Some(c) = plan.compress.get(&i) {
+        return json!({ "build": {
+            "builder": "gzip@0",
+            "name": leaf_name(m),
+            "params": {
+                "compressor": c.params.name(),
+                "header_hex": hex_lower(&c.header),
+            },
+            "output": { "sha256": hex_lower(&m.digests.as_ref().expect("digests").sha256),
+                        "size": m.size },
+            "inputs": [node_json(c.child, members, plan, evidence)],
+        } });
+    }
     match plan.builds.get(&i) {
         None => ref_json(m, claims_json(&evidence[i].0)),
         Some(b) => {
@@ -972,6 +1226,15 @@ enum Spool {
 }
 
 impl Spool {
+    /// A sequential reader over the spool (positional reads — the
+    /// spool is shared).
+    fn reader(&self) -> SpoolReader<'_> {
+        SpoolReader {
+            spool: self,
+            pos: 0,
+        }
+    }
+
     fn read_range(
         &self,
         from: u64,
@@ -1002,6 +1265,30 @@ impl Spool {
                 Ok(())
             }
         }
+    }
+}
+
+struct SpoolReader<'a> {
+    spool: &'a Spool,
+    pos: u64,
+}
+
+impl Read for SpoolReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = match self.spool {
+            Spool::Mem(v) => {
+                let start = (self.pos as usize).min(v.len());
+                let n = buf.len().min(v.len() - start);
+                buf[..n].copy_from_slice(&v[start..start + n]);
+                n
+            }
+            #[cfg(unix)]
+            Spool::File(f) => std::os::unix::fs::FileExt::read_at(f, buf, self.pos)?,
+            #[cfg(windows)]
+            Spool::File(f) => std::os::windows::fs::FileExt::seek_read(f, buf, self.pos)?,
+        };
+        self.pos += n as u64;
+        Ok(n)
     }
 }
 
@@ -1173,6 +1460,15 @@ fn assemble(
                                           "name": b["name"] } });
             return assemble(&as_ref, ctx, feed);
         }
+        let builder = b["builder"].as_str().unwrap_or("splice@0");
+        match builder {
+            "splice@0" => {}
+            "gzip@0" => return assemble_gzip(b, &sha, ctx, feed),
+            other => bail!(
+                "{}: unknown builder {other:?} — this recipe needs a newer hdx",
+                node_name(node)
+            ),
+        }
         let mut h = sha2::Sha256::new();
         let mut n = 0u64;
         let inputs = b["inputs"].as_array().context("build inputs")?.clone();
@@ -1198,6 +1494,58 @@ fn assemble(
         return Ok(n);
     }
     bail!("unknown recipe node: {node}")
+}
+
+/// Rebuild a gzip@0 node: materialize its input (whose own assembly
+/// verifies its digest), splice the recorded header back on, and run
+/// the named compressor over the input for the body — trailer
+/// included, since crc and length are functions of the same bytes.
+fn assemble_gzip(
+    b: &Value,
+    sha: &str,
+    ctx: &mut CheckCtx,
+    feed: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+) -> Result<u64> {
+    let name = b["name"].as_str().unwrap_or("?").to_string();
+    let cname = b["params"]["compressor"]
+        .as_str()
+        .context("gzip@0 compressor name")?;
+    let params = crate::compressors::GnuGzip::parse(cname)
+        .with_context(|| format!("unknown compressor {cname:?} — this recipe needs a newer hdx"))?;
+    let header = data_encoding::HEXLOWER
+        .decode(
+            b["params"]["header_hex"]
+                .as_str()
+                .context("gzip@0 header_hex")?
+                .as_bytes(),
+        )
+        .context("bad gzip@0 header_hex")?;
+    let inputs = b["inputs"].as_array().context("build inputs")?;
+    ensure!(inputs.len() == 1, "gzip@0 takes exactly one input");
+    let spool = materialize(&inputs[0], ctx)?;
+
+    let mut h = sha2::Sha256::new();
+    let mut n = 0u64;
+    h.update(&header);
+    feed(&header)?;
+    n += header.len() as u64;
+    let ran = crate::compressors::gzip_body(params, &mut spool.reader(), &mut |bytes| {
+        h.update(bytes);
+        feed(bytes)?;
+        n += bytes.len() as u64;
+        Ok(true)
+    })
+    .with_context(|| format!("{name}: running {cname}"))?;
+    ensure!(ran, "{name}: {cname} run aborted");
+    let got = hex_lower(&h.finalize());
+    ensure!(
+        got == sha,
+        "{name}: recompression hashes to {got}, recipe says {sha} — is the system gzip the same GNU gzip that minted this?"
+    );
+    if let Some(size) = b["output"]["size"].as_u64() {
+        ensure!(n == size, "{name}: rebuilt {n} bytes, recipe says {size}");
+    }
+    Ok(n)
 }
 
 /// Materialize a node's bytes for random access (slices of rebuilt

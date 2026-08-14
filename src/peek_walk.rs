@@ -216,6 +216,13 @@ pub(crate) struct Walk<'a, 'f> {
     pub(crate) dead: Mutex<Vec<usize>>,
     /// Worker count for parallel container descent (squashfs).
     pub(crate) threads: usize,
+    /// Spool every decompressed wrapper child instead of streaming it
+    /// (recipe minting): children then carry extents in the spool's
+    /// coordinate space and the member keeps the spool as its `space`,
+    /// which is what lets a recipe splice the inside of a tar.gz and
+    /// verify a recompression against the original bytes. Scans leave
+    /// this off — a scan never needs the decompressed bytes again.
+    pub(crate) spool_wrappers: bool,
 }
 
 /// How far a walk follows containers it meets. Explicitly named
@@ -368,6 +375,100 @@ impl Walk<'_, '_> {
         self.run_member(r, meta, feed, path, name, depth, ctx)
     }
 
+    /// Descend a wrapper's decompressed child: streamed normally,
+    /// spooled when recipes need the decompressed bytes addressable.
+    #[allow(clippy::too_many_arguments)]
+    fn wrapper_child(
+        &self,
+        dec: &mut dyn Read,
+        kind: Kind,
+        path: &str,
+        name: &str,
+        depth: usize,
+        own: usize,
+        ctx: &mut Ctx,
+    ) -> Result<()> {
+        let child = unwrapped_name(name, kind);
+        let cpath = format!("{path}!{child}");
+        if self.spool_wrappers {
+            self.process_stream_spooled(dec, cpath, &child, depth + 1, Some(own), ctx)
+        } else {
+            self.process_stream(dec, None, cpath, &child, depth + 1, Some(own), ctx)
+        }
+    }
+
+    /// Spool a stream-fed member so its bytes become a seekable space:
+    /// the member keeps the spool as its `space`, and its children are
+    /// walked ranged over it (extents in the spool's coordinates).
+    fn process_stream_spooled(
+        &self,
+        r: &mut dyn Read,
+        path: String,
+        name: &str,
+        depth: usize,
+        parent: Option<usize>,
+        ctx: &mut Ctx,
+    ) -> Result<()> {
+        if self.capped(ctx) {
+            drain(r);
+            return Ok(());
+        }
+        let pool = self.pool;
+        let (meta, mut feed) = pool.member(path.clone(), depth, parent, None, None, None);
+        ctx.slots.push(meta.slot());
+        let own = meta.slot();
+        let view = match spool_stream(r, |b| feed.push(pool, b)) {
+            Ok(v) => v,
+            Err(e) => {
+                feed.close(pool);
+                meta.close(pool, Kind::Plain.label(), 0, None);
+                return Err(e);
+            }
+        };
+        feed.close(pool);
+        meta.set_space(view.clone());
+        let mut head = vec![0u8; HEAD];
+        let got = match view.read_full_at(&mut head, 0) {
+            Ok(n) => n,
+            Err(e) => {
+                meta.close(pool, Kind::Plain.label(), 0, None);
+                return Err(e.into());
+            }
+        };
+        head.truncate(got);
+        let mut kind = sniff(&head, name);
+        if kind == Kind::Plain && view.len() >= 32774 {
+            let mut magic = [0u8; 5];
+            if matches!(view.read_full_at(&mut magic, 32769), Ok(5)) && &magic == b"CD001" {
+                kind = Kind::Iso;
+            }
+        }
+        let too_deep = depth.saturating_sub(ctx.base_depth) >= MAX_DEPTH
+            && !matches!(kind, Kind::Plain | Kind::SevenZ);
+        let res = if too_deep {
+            Ok((
+                0,
+                Some(format!(
+                    "nested deeper than {MAX_DEPTH} levels — not descended"
+                )),
+            ))
+        } else if !ctx.descent.enters(kind) && kind != Kind::Plain {
+            Ok((0, None))
+        } else {
+            self.descend_retrying(kind, &view, &path, name, depth, own, ctx)
+        };
+        match res {
+            Ok((children, note)) => {
+                meta.close(pool, kind.label(), children, note);
+                Ok(())
+            }
+            Err(e) => {
+                meta.close(pool, kind.label(), 0, None);
+                Err(e)
+            }
+        }
+    }
+
     /// Hash and descend a member whose handles are already allocated
     /// (the squashfs walker allocates a whole batch up front so slot
     /// order stays sibling order, then workers run the members in
@@ -429,6 +530,9 @@ impl Walk<'_, '_> {
                 }
             };
             feed.close(pool);
+            if self.spool_wrappers {
+                meta.set_space(view.clone());
+            }
             return match self.descend_retrying(kind, &view, &path, name, depth, own, ctx) {
                 Ok((children, note)) => {
                     meta.close(pool, kind.label(), children, note);
@@ -501,16 +605,7 @@ impl Walk<'_, '_> {
             }
             Kind::Gzip => {
                 let mut dec = flate2::read::MultiGzDecoder::new(&mut *tee);
-                let child = unwrapped_name(name, kind);
-                let r = self.process_stream(
-                    &mut dec,
-                    None,
-                    format!("{path}!{child}"),
-                    &child,
-                    depth + 1,
-                    Some(own),
-                    ctx,
-                );
+                let r = self.wrapper_child(&mut dec, kind, path, name, depth, own, ctx);
                 children = 1;
                 drop(dec);
                 note = swallow(r, "decompression stopped")?;
@@ -518,16 +613,7 @@ impl Walk<'_, '_> {
             }
             Kind::Xz => {
                 let mut dec = liblzma::read::XzDecoder::new_multi_decoder(&mut *tee);
-                let child = unwrapped_name(name, kind);
-                let r = self.process_stream(
-                    &mut dec,
-                    None,
-                    format!("{path}!{child}"),
-                    &child,
-                    depth + 1,
-                    Some(own),
-                    ctx,
-                );
+                let r = self.wrapper_child(&mut dec, kind, path, name, depth, own, ctx);
                 children = 1;
                 drop(dec);
                 note = swallow(r, "decompression stopped")?;
@@ -535,16 +621,7 @@ impl Walk<'_, '_> {
             }
             Kind::Zstd => {
                 let mut dec = zstd::stream::read::Decoder::new(&mut *tee)?;
-                let child = unwrapped_name(name, kind);
-                let r = self.process_stream(
-                    &mut dec,
-                    None,
-                    format!("{path}!{child}"),
-                    &child,
-                    depth + 1,
-                    Some(own),
-                    ctx,
-                );
+                let r = self.wrapper_child(&mut dec, kind, path, name, depth, own, ctx);
                 children = 1;
                 drop(dec);
                 note = swallow(r, "decompression stopped")?;
@@ -552,16 +629,7 @@ impl Walk<'_, '_> {
             }
             Kind::Bzip2 => {
                 let mut dec = bzip2::read::MultiBzDecoder::new(&mut *tee);
-                let child = unwrapped_name(name, kind);
-                let r = self.process_stream(
-                    &mut dec,
-                    None,
-                    format!("{path}!{child}"),
-                    &child,
-                    depth + 1,
-                    Some(own),
-                    ctx,
-                );
+                let r = self.wrapper_child(&mut dec, kind, path, name, depth, own, ctx);
                 children = 1;
                 drop(dec);
                 note = swallow(r, "decompression stopped")?;
@@ -818,62 +886,26 @@ impl Walk<'_, '_> {
             Kind::Gzip => {
                 let mut dec = flate2::read::MultiGzDecoder::new(BufReader::new(view.rewound()));
                 children = 1;
-                let child = unwrapped_name(name, kind);
-                let r = self.process_stream(
-                    &mut dec,
-                    None,
-                    format!("{path}!{child}"),
-                    &child,
-                    depth + 1,
-                    Some(own),
-                    ctx,
-                );
+                let r = self.wrapper_child(&mut dec, kind, path, name, depth, own, ctx);
                 swallow(r, "decompression stopped")?
             }
             Kind::Xz => {
                 let mut dec =
                     liblzma::read::XzDecoder::new_multi_decoder(BufReader::new(view.rewound()));
                 children = 1;
-                let child = unwrapped_name(name, kind);
-                let r = self.process_stream(
-                    &mut dec,
-                    None,
-                    format!("{path}!{child}"),
-                    &child,
-                    depth + 1,
-                    Some(own),
-                    ctx,
-                );
+                let r = self.wrapper_child(&mut dec, kind, path, name, depth, own, ctx);
                 swallow(r, "decompression stopped")?
             }
             Kind::Zstd => {
                 let mut dec = zstd::stream::read::Decoder::new(BufReader::new(view.rewound()))?;
                 children = 1;
-                let child = unwrapped_name(name, kind);
-                let r = self.process_stream(
-                    &mut dec,
-                    None,
-                    format!("{path}!{child}"),
-                    &child,
-                    depth + 1,
-                    Some(own),
-                    ctx,
-                );
+                let r = self.wrapper_child(&mut dec, kind, path, name, depth, own, ctx);
                 swallow(r, "decompression stopped")?
             }
             Kind::Bzip2 => {
                 let mut dec = bzip2::read::MultiBzDecoder::new(BufReader::new(view.rewound()));
                 children = 1;
-                let child = unwrapped_name(name, kind);
-                let r = self.process_stream(
-                    &mut dec,
-                    None,
-                    format!("{path}!{child}"),
-                    &child,
-                    depth + 1,
-                    Some(own),
-                    ctx,
-                );
+                let r = self.wrapper_child(&mut dec, kind, path, name, depth, own, ctx);
                 swallow(r, "decompression stopped")?
             }
             Kind::Tar => self.tar_ranged(view, path, depth, own, &mut children, ctx)?,

@@ -2009,6 +2009,305 @@ fn recipe_wrapped_root_is_all_residue() {
     assert_eq!(std::fs::read(&rebuilt).unwrap(), tgz);
 }
 
+/// Run the system's GNU gzip (what mint's compressor search and
+/// check's rebuild shell out to — the gzip@0 tests need it on PATH).
+fn system_gzip(args: &[&str], input: &[u8]) -> Vec<u8> {
+    use std::io::{Read as _, Write as _};
+    let mut child = std::process::Command::new("gzip")
+        .args(args)
+        .args(["-n", "-c"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("GNU gzip on PATH (required by the gzip@0 tests)");
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = std::thread::spawn({
+        let input = input.to_vec();
+        move || stdin.write_all(&input)
+    });
+    let mut out = Vec::new();
+    child.stdout.take().unwrap().read_to_end(&mut out).unwrap();
+    writer.join().unwrap().unwrap();
+    assert!(child.wait().unwrap().success());
+    out
+}
+
+/// Deterministic mixed-entropy payload: compressible runs with seeded
+/// noise, long enough that rsyncable window resets actually fire.
+fn noisy_payload(len: usize, mut seed: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let b = (seed >> 33) as u8;
+        let run = 1 + (seed >> 41) as usize % 32;
+        for _ in 0..run.min(len - out.len()) {
+            out.push(b);
+        }
+        if seed & 7 == 0 {
+            out.push((seed >> 25) as u8);
+        }
+    }
+    out.truncate(len);
+    out
+}
+
+#[test]
+fn recipe_gzip_chain_mints_and_rebuilds() {
+    let env = TestEnv::new("recipe-gzip");
+    let pay1 = noisy_payload(40_000, 7);
+    let pay2 = noisy_payload(25_000, 99);
+    let rows = [digest_row(&pay1), digest_row(&pay2)];
+    let rows: Vec<(&str, &str, &str)> = rows
+        .iter()
+        .map(|r| (r.0.as_str(), r.1.as_str(), r.2.as_str()))
+        .collect();
+    install_fatcat_dataset(&env, &rows);
+    let tarball = plain_tar(&[("one.bin", &pay1), ("two.bin", &pay2)]);
+    let tgz = system_gzip(&["-9"], &tarball);
+    let path = env.write("demo.tar.gz", &tgz);
+
+    let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    let so = stdout(&out);
+    assert!(so.contains("compressors: gnu-9"), "summary: {so}");
+    assert!(so.contains("verified byte-exact"), "summary: {so}");
+
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("demo.tar.gz.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    let root = &doc["root"]["build"];
+    assert_eq!(root["builder"], "gzip@0");
+    assert_eq!(root["params"]["compressor"], "gnu-9");
+    // `-n` to stdout writes the fixed 10-byte header.
+    assert_eq!(
+        root["params"]["header_hex"].as_str().unwrap().len(),
+        20,
+        "header: {}",
+        root["params"]["header_hex"]
+    );
+    assert_eq!(root["output"]["sha256"], sha256_hex(&tgz).as_str());
+    let inner = &root["inputs"][0]["build"];
+    assert_eq!(inner["builder"], "splice@0");
+    let refs: Vec<&str> = inner["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["ref"]["name"].as_str())
+        .collect();
+    assert_eq!(refs, vec!["one.bin", "two.bin"]);
+    // Refs and literals live in the decompressed space now — the
+    // coverage ratio is between them, not against the compressed size.
+    let cov = &doc["coverage"];
+    assert_eq!(cov["fetchable_bytes"].as_u64().unwrap(), 65_000);
+    assert_eq!(cov["total_bytes"].as_u64().unwrap(), tgz.len() as u64);
+
+    // The compressed root rebuilds from the leaf payloads alone.
+    let blobs = env.work().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join("p1"), &pay1).unwrap();
+    std::fs::write(blobs.join("p2"), &pay2).unwrap();
+    let rebuilt = env.work().join("rebuilt.tar.gz");
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        env.work().join("demo.tar.gz.recipe.json").to_str().unwrap(),
+        blobs.to_str().unwrap(),
+        "--output",
+        rebuilt.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    assert_eq!(std::fs::read(&rebuilt).unwrap(), tgz);
+}
+
+#[test]
+fn recipe_gzip_chains_nest() {
+    // tar.gz inside tar.gz: the inner wrapper's compressor search and
+    // splice run in the OUTER spool's coordinate space, not the root
+    // file's — the whole space machinery in one fixture.
+    let env = TestEnv::new("recipe-gzip-nest");
+    let pay = noisy_payload(30_000, 3);
+    let row = digest_row(&pay);
+    install_fatcat_dataset(&env, &[(&row.0, &row.1, &row.2)]);
+    let inner_tar = plain_tar(&[("leaf.bin", &pay)]);
+    let inner_tgz = system_gzip(&["-9"], &inner_tar);
+    let outer_tar = plain_tar(&[("inner.tar.gz", &inner_tgz)]);
+    let outer_tgz = system_gzip(&["-6"], &outer_tar);
+    let path = env.write("outer.tar.gz", &outer_tgz);
+
+    let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("outer.tar.gz.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    // gzip@0 → splice@0 → gzip@0 → splice@0 → ref, alternating spaces.
+    let outer = &doc["root"]["build"];
+    assert_eq!(outer["builder"], "gzip@0");
+    assert_eq!(outer["params"]["compressor"], "gnu-6");
+    let outer_splice = &outer["inputs"][0]["build"];
+    assert_eq!(outer_splice["builder"], "splice@0");
+    let inner = outer_splice["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["build"]["builder"] == "gzip@0")
+        .expect("nested gzip@0 node");
+    assert_eq!(inner["build"]["params"]["compressor"], "gnu-9");
+    let inner_splice = &inner["build"]["inputs"][0]["build"];
+    assert_eq!(inner_splice["builder"], "splice@0");
+    assert_eq!(inner_splice["inputs"][1]["ref"]["name"], "leaf.bin");
+
+    // The doubly-compressed root rebuilds from the one leaf payload.
+    let blobs = env.work().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join("p"), &pay).unwrap();
+    let rebuilt = env.work().join("rebuilt.tar.gz");
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        env.work()
+            .join("outer.tar.gz.recipe.json")
+            .to_str()
+            .unwrap(),
+        blobs.to_str().unwrap(),
+        "--output",
+        rebuilt.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    assert_eq!(std::fs::read(&rebuilt).unwrap(), outer_tgz);
+}
+
+#[test]
+fn recipe_gzip_chain_finds_rsyncable() {
+    let env = TestEnv::new("recipe-gzip-rsync");
+    let pay = noisy_payload(120_000, 42);
+    let row = digest_row(&pay);
+    install_fatcat_dataset(&env, &[(&row.0, &row.1, &row.2)]);
+    let tarball = plain_tar(&[("data.bin", &pay)]);
+    let plain = system_gzip(&["-9"], &tarball);
+    let rsync = system_gzip(&["-9", "--rsyncable"], &tarball);
+    // The payload is long enough that the rolling-window resets fire —
+    // otherwise this test would be telling us nothing.
+    assert_ne!(plain, rsync, "payload too small to distinguish rsyncable");
+    let path = env.write("demo.tar.gz", &rsync);
+
+    let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("demo.tar.gz.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        doc["root"]["build"]["params"]["compressor"],
+        "gnu-9-rsyncable"
+    );
+}
+
+#[test]
+fn recipe_gzip_header_with_name_round_trips() {
+    let env = TestEnv::new("recipe-gzip-name");
+    let pay = noisy_payload(30_000, 5);
+    let row = digest_row(&pay);
+    install_fatcat_dataset(&env, &[(&row.0, &row.1, &row.2)]);
+    let tarball = plain_tar(&[("file.bin", &pay)]);
+    // Compress a real file WITHOUT -n: the header embeds the original
+    // name and mtime. The recipe records those bytes verbatim and the
+    // rebuild splices them back — the compressor never sees them.
+    let inner = env.write("inner.tar", &tarball);
+    let st = std::process::Command::new("gzip")
+        .args(["-9", "inner.tar"])
+        .current_dir(env.work())
+        .status()
+        .expect("GNU gzip on PATH");
+    assert!(st.success());
+    let tgz = std::fs::read(env.work().join("inner.tar.gz")).unwrap();
+    drop(inner);
+
+    let out = env.hdx(&[
+        "--offline",
+        "recipe",
+        env.work().join("inner.tar.gz").to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("inner.tar.gz.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    let header = doc["root"]["build"]["params"]["header_hex"]
+        .as_str()
+        .unwrap();
+    assert!(header.len() > 20, "expected FNAME in header: {header}");
+    assert!(
+        header.contains(&data_encoding::HEXLOWER.encode(b"inner.tar")),
+        "embedded name missing from header: {header}"
+    );
+
+    let blobs = env.work().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join("p"), &pay).unwrap();
+    let rebuilt = env.work().join("rebuilt.tar.gz");
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        env.work()
+            .join("inner.tar.gz.recipe.json")
+            .to_str()
+            .unwrap(),
+        blobs.to_str().unwrap(),
+        "--output",
+        rebuilt.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    assert_eq!(std::fs::read(&rebuilt).unwrap(), tgz);
+}
+
+#[test]
+fn recipe_unreproducible_gzip_stays_literal() {
+    use std::io::Write as _;
+    let env = TestEnv::new("recipe-gzip-alien");
+    // The member IS claimed — the chain fails only because no catalog
+    // compressor reproduces a flate2-compressed stream. The planned
+    // child subtree must be discarded, not half-kept.
+    let pay = noisy_payload(20_000, 11);
+    let row = digest_row(&pay);
+    install_fatcat_dataset(&env, &[(&row.0, &row.1, &row.2)]);
+    let tarball = plain_tar(&[("data.bin", &pay)]);
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(9));
+    gz.write_all(&tarball).unwrap();
+    let tgz = gz.finish().unwrap();
+    let path = env.write("demo.tar.gz", &tgz);
+
+    let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("full literal copy"),
+        "summary: {}",
+        stdout(&out)
+    );
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("demo.tar.gz.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(doc["coverage"]["fetchable_bytes"], 0);
+    // Totality holds: rebuilds from residue alone.
+    let blobs = env.work().join("empty");
+    std::fs::create_dir_all(&blobs).unwrap();
+    let rebuilt = env.work().join("rebuilt.tar.gz");
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        env.work().join("demo.tar.gz.recipe.json").to_str().unwrap(),
+        blobs.to_str().unwrap(),
+        "--output",
+        rebuilt.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    assert_eq!(std::fs::read(&rebuilt).unwrap(), tgz);
+}
+
 #[test]
 fn recipe_of_claimed_file_is_one_ref() {
     use sha2::Digest as _;

@@ -243,6 +243,7 @@ fn materialize_cached(
                     sha1_git: m.sha1_git,
                 }),
                 extents: None,
+                space: None,
                 matched,
                 children: m.children,
                 note: m.note.clone(),
@@ -360,6 +361,7 @@ pub async fn scan(
         truncated: AtomicBool::new(false),
         dead: Mutex::new(Vec::new()),
         threads,
+        spool_wrappers: false,
     };
     std::thread::scope(|scope| {
         // The hash/read pool: container descent (root files) feeds
@@ -415,6 +417,7 @@ pub async fn scan(
                             fs: true,
                             digests: None,
                             extents: None,
+                            space: None,
                             matched: Vec::new(),
                             children: d.children,
                             note: None,
@@ -611,6 +614,7 @@ pub async fn scan(
                                                 sha1_git: None,
                                             }),
                                             extents: None,
+                                            space: None,
                                             matched,
                                             children: c.children,
                                             note: c.note.clone(),
@@ -720,6 +724,7 @@ pub async fn scan(
                                             sha1_git: None,
                                         }),
                                         extents: None,
+                                        space: None,
                                         matched,
                                         children,
                                         note,

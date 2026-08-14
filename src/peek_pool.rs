@@ -118,6 +118,11 @@ pub struct Member {
     /// Byte ranges of this member within a shared source (ranged
     /// members only; stream-fed members have no home in any source).
     pub extents: Option<Extents>,
+    /// The spool holding this member's own bytes, when the walk kept
+    /// one (a decompressed wrapper child, a seek-needing container fed
+    /// by a stream). Its `src_id` is the coordinate space the member's
+    /// children's extents are relative to — recipes splice against it.
+    pub(crate) space: Option<View>,
     pub matched: Vec<String>,
     pub children: usize,
     pub note: Option<String>,
@@ -205,6 +210,7 @@ struct Meta {
     children: usize,
     note: Option<String>,
     extents: Option<Extents>,
+    space: Option<View>,
 }
 
 impl Build {
@@ -253,6 +259,7 @@ impl Build {
             fs: false,
             digests: Some(digests),
             extents: meta.extents,
+            space: meta.space,
             matched,
             children: meta.children,
             note: meta.note,
@@ -335,6 +342,14 @@ impl MetaClose {
     /// everything it creates while descending this member.
     pub(crate) fn slot(&self) -> usize {
         self.build.slot
+    }
+
+    /// Record the spool that holds this member's own bytes (set before
+    /// `close`); children walked from it carry extents in its space.
+    pub(crate) fn set_space(&self, view: View) {
+        if let Some(m) = self.build.meta.lock().unwrap().as_mut() {
+            m.space = Some(view);
+        }
     }
 
     pub(crate) fn close(
@@ -524,6 +539,7 @@ impl<'f> Pool<'f> {
                 children: 0,
                 note: None,
                 extents,
+                space: None,
             })),
             parts: Mutex::new(Partial::default()),
             // One part per hash job, plus the walker's metadata close.

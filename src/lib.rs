@@ -23,6 +23,8 @@ pub mod backends;
 #[cfg(feature = "cli")]
 pub mod cache;
 #[cfg(feature = "cli")]
+pub mod compressors;
+#[cfg(feature = "cli")]
 pub mod coords_cmd;
 #[cfg(feature = "cli")]
 pub mod datasets;

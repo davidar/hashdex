@@ -32,9 +32,11 @@ hdx scan <paths>      # scan against filters + attribute what it can
                       #   content-addressed in local.db and replay
 hdx recipe FILE       # reconstruction manifest: verified splice of
                       #   member byte ranges (refs by digest + claim
-                      #   URLs) + literal residue → FILE.recipe.json;
-                      #   `hdx recipe check RECIPE DIR` rebuilds from
-                      #   local blobs, never fetches
+                      #   URLs) + gzip@0 compression nodes (GNU gzip
+                      #   catalog via shell-out, byte-verified — the
+                      #   disarchive trick) + literal residue →
+                      #   FILE.recipe.json; `hdx recipe check RECIPE
+                      #   DIR` rebuilds from local blobs, never fetches
 hdx index pull tarballs           # local copy of a published dataset
                                   #   (same parquet, mmap'd; resolution
                                   #   is remote range reads by default)
