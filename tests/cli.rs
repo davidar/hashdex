@@ -2309,6 +2309,111 @@ fn recipe_unreproducible_gzip_stays_literal() {
 }
 
 #[test]
+fn recipe_disarchive_projection_matches_git() {
+    let env = TestEnv::new("recipe-disarchive");
+    // No dataset: the chain survives via the structural fallback
+    // (gzip@0 over a literal tar), which is exactly what the
+    // disarchive projection needs — its content store is SWH, not
+    // our refs.
+    let pay1 = noisy_payload(20_000, 21);
+    let pay2 = noisy_payload(9_000, 22);
+    let tarball = {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut add = |name: &str, mode: u32, data: &[u8]| {
+            let mut h = tar::Header::new_ustar();
+            h.set_size(data.len() as u64);
+            h.set_mode(mode);
+            h.set_mtime(1700000000);
+            h.set_cksum();
+            b.append_data(&mut h, name, data).unwrap();
+        };
+        add("pkg-1.0/README", 0o644, &pay1);
+        add("pkg-1.0/bin/tool", 0o755, &pay2);
+        b.into_inner().unwrap()
+    };
+    let tgz = system_gzip(&["-9"], &tarball);
+    let path = env.write("pkg-1.0.tar.gz", &tgz);
+
+    let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    let out = env.hdx(&[
+        "recipe",
+        "disarchive",
+        env.work()
+            .join("pkg-1.0.tar.gz.recipe.json")
+            .to_str()
+            .unwrap(),
+    ]);
+    assert!(out.status.success(), "emit failed: {}", stderr(&out));
+    let sexp = std::fs::read_to_string(env.work().join("pkg-1.0.tar.gz.disarchive")).unwrap();
+    assert!(sexp.contains("(compressor gnu-best)"), "sexp: {sexp}");
+    assert!(sexp.contains("(name \"pkg-1.0.tar\")"), "sexp: {sexp}");
+    assert!(
+        sexp.contains(&sha256_hex(&tarball)),
+        "tarball digest missing"
+    );
+    let swhid_hex = sexp
+        .split("swh:1:dir:")
+        .nth(1)
+        .expect("swhid present")
+        .chars()
+        .take(40)
+        .collect::<String>();
+
+    // Independent oracle: extract the tar and let REAL git compute
+    // the tree hash of the extraction directory.
+    let extract = env.work().join("extract");
+    std::fs::create_dir_all(&extract).unwrap();
+    tar::Archive::new(&tarball[..]).unpack(&extract).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&extract)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git on PATH");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-q", "."]);
+    git(&["add", "-A"]);
+    let tree = git(&["write-tree"]);
+    assert_eq!(swhid_hex, tree, "our swh:1:dir must equal git's tree hash");
+}
+
+#[test]
+fn recipe_disarchive_refuses_extension_headers() {
+    let env = TestEnv::new("recipe-disarchive-ext");
+    // A >100-char path forces a GNU long-name extension header,
+    // which the projection's field model refuses rather than
+    // guessing at.
+    let long = format!("pkg-1.0/{}/file.bin", "d".repeat(120));
+    let tarball = plain_tar(&[(long.as_str(), &noisy_payload(5000, 9))]);
+    let tgz = system_gzip(&["-9"], &tarball);
+    let path = env.write("long.tar.gz", &tgz);
+    let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    let out = env.hdx(&[
+        "recipe",
+        "disarchive",
+        env.work().join("long.tar.gz.recipe.json").to_str().unwrap(),
+    ]);
+    assert!(!out.status.success(), "must refuse extension headers");
+    assert!(
+        stderr(&out).contains("extension headers"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn recipe_of_claimed_file_is_one_ref() {
     use sha2::Digest as _;
     let env = TestEnv::new("recipe-claimed");

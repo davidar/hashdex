@@ -422,16 +422,21 @@ impl Planner<'_> {
         let Some(wspace) = self.spaces.get(&wext.src) else {
             return false;
         };
+        // An unclaimed, unplannable child doesn't kill the chain: the
+        // decompressed bytes ride in the sidecar as an all-literal
+        // build. Fetchability stays at zero — honestly — but the
+        // verified structure survives (and tar bytes zstd far better
+        // than the gzip stream they came from).
         let claimed = self.evidence[c].0.iter().any(|f| !f.claims.is_empty());
-        if !claimed && !self.plan_node(c, plan) {
-            return false;
-        }
+        let synthetic = !claimed && !self.plan_node(c, plan);
         let wruns: Vec<(u64, u64)> = wext.runs.iter().map(|&(_, off, len)| (off, len)).collect();
         let wview = wspace.slice(&wruns);
         let header = match crate::compressors::parse_gzip_header(&mut wview.rewound()) {
             Ok(Some(h)) => h,
             _ => {
-                remove_plan_subtree(plan, c);
+                if !synthetic {
+                    remove_plan_subtree(plan, c);
+                }
                 return false;
             }
         };
@@ -440,6 +445,22 @@ impl Planner<'_> {
             .update(1, 0, || format!("searching compressors… {name}"));
         match search_gzip(&wview, header.len() as u64, &cview) {
             Some(params) => {
+                if synthetic {
+                    plan.builds.insert(
+                        c,
+                        Build {
+                            segs: vec![Seg::Gap {
+                                at: 0,
+                                len: child.size,
+                                residue_off: None,
+                                inline: None,
+                            }],
+                            dropped: 0,
+                            space: cview.src_id(),
+                            runs: vec![(0, 0, child.size)],
+                        },
+                    );
+                }
                 plan.compress.insert(
                     i,
                     Compress {
@@ -453,7 +474,9 @@ impl Planner<'_> {
             None => {
                 // No catalog compressor reproduces these bytes — the
                 // wrapper stays literal, honestly.
-                remove_plan_subtree(plan, c);
+                if !synthetic {
+                    remove_plan_subtree(plan, c);
+                }
                 false
             }
         }

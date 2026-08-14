@@ -164,6 +164,14 @@ enum RecipeAction {
         /// The recipe document (FILE.recipe.json)
         recipe: PathBuf,
     },
+    /// Project a gzip-chain recipe into disarchive's sexp format
+    /// (gzip-member → tarball → directory-ref, swh:1:dir minted from
+    /// the tar itself); stock disarchive assembles it. The file must
+    /// sit beside the recipe
+    Disarchive {
+        /// The recipe document (FILE.recipe.json)
+        recipe: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -314,6 +322,9 @@ async fn main() -> Result<()> {
             }
             (Some(RecipeAction::Jigdo { recipe }), _) => {
                 recipe_cmd::emit_jigdo(recipe)?;
+            }
+            (Some(RecipeAction::Disarchive { recipe }), _) => {
+                hashdex::recipe_disarchive::emit(recipe)?;
             }
             (None, Some(f)) => recipe_cmd::mint(f, !cli.no_cache, cli.json)?,
             (None, None) => {
