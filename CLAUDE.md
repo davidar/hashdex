@@ -37,8 +37,10 @@ hdx recipe FILE       # reconstruction manifest: verified splice of
                       #   disarchive trick) + literal residue →
                       #   FILE.recipe.json; `hdx recipe check RECIPE
                       #   DIR` rebuilds from local blobs, never
-                      #   fetches; `hdx recipe jigdo|disarchive` emit
-                      #   stock-tool-consumable projections
+                      #   fetches; `hdx recipe jigdo` emits a stock-
+                      #   tool-consumable .jigdo/.template pair (the
+                      #   disarchive projection is referee-only test
+                      #   code now: tests/disarchive/)
 hdx index pull tarballs           # local copy of a published dataset
                                   #   (same parquet, mmap'd; resolution
                                   #   is remote range reads by default)

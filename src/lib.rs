@@ -13,6 +13,7 @@ pub mod dcso;
 pub mod debs;
 pub mod fatcat;
 pub mod finding;
+pub mod git_tree;
 pub mod media;
 pub mod parquet_index;
 pub mod range_store;
@@ -44,8 +45,6 @@ mod peek_source;
 mod peek_walk;
 #[cfg(feature = "cli")]
 pub mod recipe_cmd;
-#[cfg(feature = "cli")]
-pub mod recipe_disarchive;
 #[cfg(feature = "cli")]
 mod report;
 #[cfg(feature = "cli")]

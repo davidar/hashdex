@@ -7,6 +7,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// The disarchive projection: referee-only test code (see its module
+/// doc). Not part of the shipped crate.
+mod disarchive;
+
 // Digests of the bytes "abc" (verified against python hashlib / git).
 const ABC_MD5: &str = "900150983cd24fb0d6963f7d28e17f72";
 const ABC_SHA1: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
@@ -2336,15 +2340,7 @@ fn recipe_disarchive_projection_matches_git() {
 
     let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
     assert!(out.status.success(), "mint failed: {}", stderr(&out));
-    let out = env.hdx(&[
-        "recipe",
-        "disarchive",
-        env.work()
-            .join("pkg-1.0.tar.gz.recipe.json")
-            .to_str()
-            .unwrap(),
-    ]);
-    assert!(out.status.success(), "emit failed: {}", stderr(&out));
+    disarchive::emit(&env.work().join("pkg-1.0.tar.gz.recipe.json")).expect("emit failed");
     let sexp = std::fs::read_to_string(env.work().join("pkg-1.0.tar.gz.disarchive")).unwrap();
     assert!(sexp.contains("(compressor gnu-best)"), "sexp: {sexp}");
     assert!(sexp.contains("(name \"pkg-1.0.tar\")"), "sexp: {sexp}");
@@ -2400,16 +2396,11 @@ fn recipe_disarchive_refuses_extension_headers() {
     let path = env.write("long.tar.gz", &tgz);
     let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
     assert!(out.status.success(), "mint failed: {}", stderr(&out));
-    let out = env.hdx(&[
-        "recipe",
-        "disarchive",
-        env.work().join("long.tar.gz.recipe.json").to_str().unwrap(),
-    ]);
-    assert!(!out.status.success(), "must refuse extension headers");
+    let err = disarchive::emit(&env.work().join("long.tar.gz.recipe.json"))
+        .expect_err("must refuse extension headers");
     assert!(
-        stderr(&out).contains("extension headers"),
-        "stderr: {}",
-        stderr(&out)
+        format!("{err:#}").contains("extension headers"),
+        "error: {err:#}"
     );
 }
 
