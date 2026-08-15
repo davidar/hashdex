@@ -152,6 +152,16 @@ Notes:
   technique ports to all of them with zero discovery cost. filelists
   .xml on all four = paths only, no digests (confirmed). openSUSE:
   pkgid is **sha512** and repodata is `.zst` not `.gz`.
+  **HARVESTED 2026-08-15** → `hf.co/datasets/david-ar/rpm-files`
+  (tools/rpm_files_job.py): 348 witness repos — Fedora Core 2→44
+  +updates, EPEL 4→10, CentOS vault 3.7→8.5 + Stream, Alma/Rocky
+  vaults, openSUSE Leap 15.0→16.x + Tumbleweed, RPM Fusion (current
+  only — no EOL archive exists), VS Code — 567.9M file rows /
+  3.77M packages, one header range-GET each, never content.
+  Core-era FILEDIGESTS are md5 (35.5M weak rows). Metadata warts
+  found: fedora-20-updates ships an unexpanded `%{srcname}` macro as
+  a location (URL 400s forever); CentOS vault + openSUSE state the
+  same pkgid at two locations (`comps.rpm`, `boot/<arch>/` aliases).
 - **Arch** 🔀 — repo .db files (sha256 only today); **Arch Linux
   Archive**: daily .db snapshots back to 2013, and 2013–~2022 DBs carry
   **MD5+SHA256** → historical 2-way edges. Archive keeps every package
