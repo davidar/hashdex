@@ -169,30 +169,6 @@ pub static BLOOMS: &[BloomEntry] = &[
         huge: false,
     },
     BloomEntry {
-        name: "fedora",
-        scheme: "sha256",
-        urls: &["https://huggingface.co/datasets/david-ar/rpm-header-blooms/resolve/main/fedora.sha256.bloom"],
-        size: "16 MiB",
-        source: "Fedora repo metadata: per-file RPM FILEDIGESTS",
-        huge: false,
-    },
-    BloomEntry {
-        name: "rpmfusion",
-        scheme: "sha256",
-        urls: &["https://huggingface.co/datasets/david-ar/rpm-header-blooms/resolve/main/rpmfusion.sha256.bloom"],
-        size: "188 KiB",
-        source: "RPM Fusion free+nonfree per-file digests",
-        huge: false,
-    },
-    BloomEntry {
-        name: "vscode",
-        scheme: "sha256",
-        urls: &["https://huggingface.co/datasets/david-ar/rpm-header-blooms/resolve/main/vscode.sha256.bloom"],
-        size: "288 KiB",
-        source: "Microsoft VS Code yum repo per-file digests",
-        huge: false,
-    },
-    BloomEntry {
         name: "fatcat",
         scheme: "sha1",
         urls: &["https://huggingface.co/datasets/david-ar/fatcat-file-bloom/resolve/main/fatcat.sha1.bloom"],
@@ -264,12 +240,15 @@ pub static BLOOMS: &[BloomEntry] = &[
         source: "distro install-media checksum documents (32 witnesses)",
         huge: false,
     },
+    // Replaces the rpm-header-blooms trio (fedora/rpmfusion/vscode):
+    // one bloom over every harvested rpm repo, with the rpm-files
+    // dataset behind it turning hits into package+path claims.
     BloomEntry {
         name: "rpm-files",
         scheme: "sha256",
         urls: &["https://huggingface.co/datasets/david-ar/rpm-files/resolve/main/rpm-files.sha256.bloom"],
-        size: "~16 MiB",
-        source: "RPM repo metadata: per-file digests + package checksums",
+        size: "~450 MiB",
+        source: "RPM repos (Fedora/EPEL/CentOS/Alma/Rocky/openSUSE/…): per-file digests + package checksums",
         huge: false,
     },
     BloomEntry {

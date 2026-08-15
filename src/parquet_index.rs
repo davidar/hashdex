@@ -298,6 +298,49 @@ fn read_columns<'a, R: ChunkReader + 'static>(
         .collect()
 }
 
+/// Read whole rows by absolute row index — the file's row order used
+/// as a foreign key from another table (a normalized dataset's ref
+/// column). Each index resolves through the row-group row counts,
+/// then page-skips to the record; the result keeps `indices` order.
+pub fn rows_at<R: ChunkReader + 'static>(
+    reader: &Arc<R>,
+    meta: &ParquetMetaData,
+    cols: &[&str],
+    indices: &[u64],
+) -> Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(indices.len());
+    for &idx in indices {
+        let (mut rgi, mut rg_start) = (0usize, 0u64);
+        loop {
+            anyhow::ensure!(
+                rgi < meta.num_row_groups(),
+                "row index {idx} past end of file"
+            );
+            let n = meta.row_group(rgi).num_rows() as u64;
+            if idx < rg_start + n {
+                break;
+            }
+            rg_start += n;
+            rgi += 1;
+        }
+        let first = (idx - rg_start) as usize;
+        let mut obj = serde_json::Map::new();
+        for (name, vals) in read_columns(reader, meta, rgi, cols, first, 1) {
+            let v = match vals? {
+                ColValues::Str(v) => v
+                    .first()
+                    .and_then(|o| o.as_ref())
+                    .map_or(Value::Null, |s| json!(s)),
+                ColValues::I32(v) => v.first().and_then(|o| *o).map_or(Value::Null, |n| json!(n)),
+                ColValues::I64(v) => v.first().and_then(|o| *o).map_or(Value::Null, |n| json!(n)),
+            };
+            obj.insert(name.to_string(), v);
+        }
+        out.push(Value::Object(obj));
+    }
+    Ok(out)
+}
+
 /// Point lookup in a parquet file sorted by `key_col`: rows (as JSON
 /// objects of the requested columns) whose key equals `key`, plus the
 /// total number of matching rows.

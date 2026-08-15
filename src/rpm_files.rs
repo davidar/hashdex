@@ -1,20 +1,27 @@
 //! The rpm-files dataset, transport-free: identity, routing, and
 //! claim rendering for the per-file digest index harvested from RPM
 //! repo metadata (tools/rpm_files.py: one header range-GET per rpm;
-//! FILEDIGESTS is the witness statement). Published as one
-//! page-indexed parquet table per key scheme
-//! (`data/rpm-<scheme>.parquet`), sorted by digest.
+//! FILEDIGESTS is the witness statement).
 //!
-//! Two row shapes share the table: file rows (digest of an installed
-//! file's contents, `path` + `pkgid` present) and package rows
-//! (digest of the .rpm artifact itself, `path`/`pkgid` null). The
-//! `location` column is the full URL of the rpm — a claim URL by
-//! construction — and the witness is carried as a string, so new
-//! repos never change the schema or this module.
+//! The published layout is normalized — package identity is stated
+//! once, not repeated per file:
+//!
+//! - `data/packages.parquet` — one row per package × witness
+//!   (pkgid, scheme, witness, name, evr, arch, location), **sorted by
+//!   pkgid**, so the rpm artifact's own checksum is a direct lookup
+//!   key. `location` is the full URL of the rpm — a claim URL by
+//!   construction — and the witness is a string, so new repos never
+//!   change the schema or this module.
+//! - `data/files-sha256-{0..f}.parquet` (sharded by first digest
+//!   nibble) plus single-file `files-md5` / `files-sha1` tables for
+//!   ancient repos — (digest, path, pkg), sorted by digest, where
+//!   `pkg` is the absolute row index into packages.parquet. All file
+//!   tables exist even when empty: routing is static, absence is
+//!   proved by footer stats.
 
 use crate::coord::{Coord, Scheme};
 use crate::finding::{Claim, Finding};
-use crate::parquet_index::find_rows;
+use crate::parquet_index::{find_rows, rows_at};
 use anyhow::Result;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::reader::ChunkReader;
@@ -26,123 +33,186 @@ use std::sync::Arc;
 /// COPYING), so the cap is higher than artifact-level datasets'.
 pub const MAX_ROWS: usize = 40;
 
-/// Schemes with a published table. F44-era repos state sha256 only;
-/// md5 joins when ancient releases are harvested (the TSV's scheme
-/// column is ready for it).
-const KEY_SCHEMES: &[(Scheme, &str)] = &[(Scheme::Sha256, "sha256")];
+/// Columns fetched from packages.parquet, whether by pkgid key or by
+/// row index.
+pub const PKG_COLS: &[&str] = &["witness", "name", "evr", "arch", "location"];
 
 pub fn supports(s: Scheme) -> bool {
-    KEY_SCHEMES.iter().any(|(k, _)| *k == s)
+    matches!(
+        s,
+        Scheme::Sha256 | Scheme::Sha512 | Scheme::Sha1 | Scheme::Md5
+    )
 }
 
-fn key_col(s: Scheme) -> Option<&'static str> {
-    KEY_SCHEMES.iter().find(|(k, _)| *k == s).map(|(_, c)| *c)
-}
-
-pub const DATA_COLS: &[&str] = &[
-    "witness", "name", "evr", "arch", "path", "pkgid", "location",
-];
-
-/// Repo-relative paths a lookup of `coord` starts in.
-pub fn start_paths(coord: &Coord) -> Vec<String> {
-    match key_col(coord.scheme) {
-        Some(col) => vec![format!("data/rpm-{col}.parquet")],
-        None => vec![],
+/// The file-digest table for a scheme. sha256 (every modern repo) is
+/// nibble-sharded; the weak schemes of ancient repos are single small
+/// files. sha512 has no file table — it appears only as openSUSE's
+/// pkgid scheme.
+fn file_table(coord: &Coord) -> Option<String> {
+    match coord.scheme {
+        Scheme::Sha256 => Some(format!(
+            "data/files-sha256-{}.parquet",
+            coord.hex().chars().next().unwrap_or('0')
+        )),
+        Scheme::Md5 => Some("data/files-md5.parquet".to_string()),
+        Scheme::Sha1 => Some("data/files-sha1.parquet".to_string()),
+        _ => None,
     }
 }
 
-/// One row's fields. `path` is None for package rows (the digest is
-/// the rpm artifact's own).
-pub struct Row<'a> {
+/// Repo-relative paths a lookup of `coord` starts in.
+pub fn start_paths(coord: &Coord) -> Vec<String> {
+    let mut paths: Vec<String> = file_table(coord).into_iter().collect();
+    if supports(coord.scheme) {
+        paths.push("data/packages.parquet".to_string());
+    }
+    paths
+}
+
+/// One package's identity, however it was fetched.
+pub struct Pkg<'a> {
     pub witness: &'a str,
     pub name: &'a str,
     pub evr: &'a str,
     pub arch: &'a str,
-    pub path: Option<&'a str>,
     pub location: &'a str,
 }
 
-/// Known witness projects: (slug prefix, display name). A witness is
-/// `<project>-<repo detail>`; longest matching prefix wins so
-/// multi-segment slugs like centos-stream parse. Unknown projects
-/// degrade to the first dash split, rendered verbatim.
-const PROJECTS: &[(&str, &str)] = &[
-    ("fedora", "Fedora"),
-    ("epel", "EPEL"),
-    ("centos-stream", "CentOS Stream"),
-    ("almalinux", "AlmaLinux"),
-    ("rockylinux", "Rocky Linux"),
-    ("opensuse", "openSUSE"),
-    ("rpmfusion", "RPM Fusion"),
+/// Known witness projects: (slug prefix, backend tag, display name).
+/// Longest matching prefix wins, so multi-segment slugs parse
+/// ("fedora-core-4" before "fedora"); the remainder joins the display
+/// name with dashes as spaces ("fedora-44-updates" → "Fedora 44
+/// updates"). Unknown projects degrade to the first dash split,
+/// rendered verbatim.
+const PROJECTS: &[(&str, &str, &str)] = &[
+    ("fedora-core", "fedora", "Fedora Core"),
+    ("fedora", "fedora", "Fedora"),
+    ("epel", "epel", "EPEL"),
+    ("rpmfusion-free", "rpmfusion", "RPM Fusion free"),
+    ("rpmfusion-nonfree", "rpmfusion", "RPM Fusion nonfree"),
+    ("vscode", "vscode", "Microsoft VS Code"),
+    ("centos-stream", "centos", "CentOS Stream"),
+    ("centos", "centos", "CentOS"),
+    ("almalinux", "almalinux", "AlmaLinux"),
+    ("rocky", "rocky", "Rocky Linux"),
+    ("opensuse-leap", "opensuse", "openSUSE Leap"),
+    ("opensuse", "opensuse", "openSUSE"),
 ];
 
-/// (backend slug, human name with the repo detail appended):
-/// "fedora-44-updates" → ("fedora", "Fedora 44 updates").
+/// (backend tag, human name with the repo detail appended).
 fn witness_display(witness: &str) -> (&str, String) {
-    for (slug, human) in PROJECTS {
-        if let Some(rest) = witness.strip_prefix(slug) {
-            if rest.is_empty() {
-                return (slug, human.to_string());
-            }
-            if let Some(detail) = rest.strip_prefix('-') {
-                return (slug, format!("{human} {}", detail.replace('-', " ")));
-            }
+    let mut best: Option<&(&str, &str, &str)> = None;
+    for p in PROJECTS {
+        let matches =
+            witness == p.0 || witness.starts_with(p.0) && witness.as_bytes()[p.0.len()] == b'-';
+        if matches && best.is_none_or(|b| p.0.len() > b.0.len()) {
+            best = Some(p);
         }
     }
+    if let Some((slug, backend, human)) = best {
+        let rest = &witness[slug.len()..];
+        return match rest.strip_prefix('-') {
+            Some(detail) => (backend, format!("{human} {}", detail.replace('-', " "))),
+            None => (backend, human.to_string()),
+        };
+    }
     let (project, detail) = witness.split_once('-').unwrap_or((witness, ""));
-    (project, format!("{project} {}", detail.replace('-', " ")))
+    if detail.is_empty() {
+        (project, project.to_string())
+    } else {
+        (project, format!("{project} {}", detail.replace('-', " ")))
+    }
 }
 
-/// Render one witness row. The backend is the project (matching the
-/// scan tag convention the fedora bloom established); the repo detail
-/// lives in the statement.
-pub fn finding(row: &Row, scheme: Scheme, hex: &str) -> Finding {
-    let (project, human) = witness_display(row.witness);
-    let rpm = row.location.rsplit('/').next().unwrap_or(row.location);
-    let statement = match row.path {
-        Some(path) => format!("{human} ships these bytes as {path} in {rpm}"),
-        None => format!(
-            "{human} packages these bytes as {rpm} ({} {})",
-            row.name, row.evr
-        ),
-    };
+/// Render a file row joined with its package.
+pub fn file_finding(path: &str, pkg: &Pkg, scheme: Scheme, hex: &str) -> Finding {
+    let (backend, human) = witness_display(pkg.witness);
+    let rpm = pkg.location.rsplit('/').next().unwrap_or(pkg.location);
     Finding {
-        backend: project.into(),
-        claims: vec![Claim::new(statement, Some(row.location.to_string()))],
+        backend: backend.into(),
+        claims: vec![Claim::new(
+            format!("{human} ships these bytes as {path} in {rpm}"),
+            Some(pkg.location.to_string()),
+        )],
         coords: vec![format!("{}:{hex}", scheme.as_str())],
     }
 }
 
-fn json_row(v: &Value) -> Row<'_> {
+/// Render a package row — the digest is the rpm artifact's own.
+pub fn pkg_finding(pkg: &Pkg, scheme: Scheme, hex: &str) -> Finding {
+    let (backend, human) = witness_display(pkg.witness);
+    let rpm = pkg.location.rsplit('/').next().unwrap_or(pkg.location);
+    Finding {
+        backend: backend.into(),
+        claims: vec![Claim::new(
+            format!(
+                "{human} packages these bytes as {rpm} ({} {})",
+                pkg.name, pkg.evr
+            ),
+            Some(pkg.location.to_string()),
+        )],
+        coords: vec![format!("{}:{hex}", scheme.as_str())],
+    }
+}
+
+fn json_pkg(v: &Value) -> Pkg<'_> {
     let s = |k: &str| v[k].as_str().unwrap_or("");
-    Row {
+    Pkg {
         witness: s("witness"),
         name: s("name"),
         evr: s("evr"),
         arch: s("arch"),
-        path: v["path"].as_str(),
         location: s("location"),
     }
 }
 
 /// The whole lookup, generic over how a repo-relative path becomes a
-/// readable file: the coord's scheme routes to that scheme's table,
-/// whose key column is never null by construction.
+/// readable file: file rows resolve their package by row index into
+/// packages.parquet (the second hop), and the digest doubles as a
+/// pkgid key into the same packages table.
 pub fn lookup_with<R, F>(open: F, coord: &Coord) -> Result<Vec<Finding>>
 where
     R: ChunkReader + 'static,
     F: Fn(&str) -> Result<(Arc<R>, Arc<ParquetMetaData>)>,
 {
-    let Some(col) = key_col(coord.scheme) else {
+    if !supports(coord.scheme) {
         return Ok(Vec::new());
-    };
-    let (reader, meta) = open(&format!("data/rpm-{col}.parquet"))?;
+    }
     let hex = coord.hex();
-    let (rows, _) = find_rows(&reader, &meta, "digest", DATA_COLS, &hex, MAX_ROWS)?;
-    Ok(rows
-        .iter()
-        .map(|r| finding(&json_row(r), coord.scheme, &hex))
-        .collect())
+    let mut findings = Vec::new();
+
+    if let Some(table) = file_table(coord) {
+        let (reader, meta) = open(&table)?;
+        let (rows, _) = find_rows(&reader, &meta, "digest", &["path", "pkg"], &hex, MAX_ROWS)?;
+        if !rows.is_empty() {
+            let mut refs: Vec<u64> = rows
+                .iter()
+                .filter_map(|r| r["pkg"].as_u64())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            refs.truncate(MAX_ROWS);
+            let (preader, pmeta) = open("data/packages.parquet")?;
+            let pkgs = rows_at(&preader, &pmeta, PKG_COLS, &refs)?;
+            for row in &rows {
+                let (Some(path), Some(pref)) = (row["path"].as_str(), row["pkg"].as_u64()) else {
+                    continue;
+                };
+                let Some(i) = refs.iter().position(|r| *r == pref) else {
+                    continue;
+                };
+                findings.push(file_finding(path, &json_pkg(&pkgs[i]), coord.scheme, &hex));
+            }
+        }
+    }
+
+    let (preader, pmeta) = open("data/packages.parquet")?;
+    let (rows, _) = find_rows(&preader, &pmeta, "pkgid", PKG_COLS, &hex, MAX_ROWS)?;
+    findings.extend(
+        rows.iter()
+            .map(|r| pkg_finding(&json_pkg(r), coord.scheme, &hex)),
+    );
+    Ok(findings)
 }
 
 #[cfg(test)]
@@ -152,18 +222,14 @@ mod tests {
     #[test]
     fn renders_file_and_package_rows() {
         let hex = "2c".repeat(32);
-        let file = finding(
-            &Row {
-                witness: "fedora-44",
-                name: "bash",
-                evr: "5.3.9-3.fc44",
-                arch: "x86_64",
-                path: Some("/usr/bin/bash"),
-                location: "https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Everything/x86_64/os/Packages/b/bash-5.3.9-3.fc44.x86_64.rpm",
-            },
-            Scheme::Sha256,
-            &hex,
-        );
+        let pkg = Pkg {
+            witness: "fedora-44",
+            name: "bash",
+            evr: "5.3.9-3.fc44",
+            arch: "x86_64",
+            location: "https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Everything/x86_64/os/Packages/b/bash-5.3.9-3.fc44.x86_64.rpm",
+        };
+        let file = file_finding("/usr/bin/bash", &pkg, Scheme::Sha256, &hex);
         assert_eq!(file.backend, "fedora");
         assert_eq!(
             file.claims[0].statement,
@@ -176,34 +242,43 @@ mod tests {
             .starts_with("https://dl.fedoraproject.org/"));
         assert_eq!(file.coords, vec![format!("sha256:{hex}")]);
 
-        let pkg = finding(
-            &Row {
-                witness: "fedora-44-updates",
-                name: "bash",
-                evr: "5.3.9-4.fc44",
-                arch: "x86_64",
-                path: None,
-                location: "https://dl.fedoraproject.org/pub/fedora/linux/updates/44/Everything/x86_64/Packages/b/bash-5.3.9-4.fc44.x86_64.rpm",
-            },
-            Scheme::Sha256,
-            &hex,
-        );
-        assert_eq!(pkg.backend, "fedora");
+        let p = pkg_finding(&pkg, Scheme::Sha256, &hex);
         assert_eq!(
-            pkg.claims[0].statement,
-            "Fedora 44 updates packages these bytes as bash-5.3.9-4.fc44.x86_64.rpm (bash 5.3.9-4.fc44)"
+            p.claims[0].statement,
+            "Fedora 44 packages these bytes as bash-5.3.9-3.fc44.x86_64.rpm (bash 5.3.9-3.fc44)"
         );
     }
 
     #[test]
     fn witness_slugs_parse_and_degrade() {
         assert_eq!(
-            witness_display("centos-stream-10"),
-            ("centos-stream", "CentOS Stream 10".to_string())
+            witness_display("fedora-44-updates"),
+            ("fedora", "Fedora 44 updates".to_string())
+        );
+        // longest prefix wins over the shorter project
+        assert_eq!(
+            witness_display("fedora-core-4"),
+            ("fedora", "Fedora Core 4".to_string())
         );
         assert_eq!(
-            witness_display("opensuse-tumbleweed"),
-            ("opensuse", "openSUSE tumbleweed".to_string())
+            witness_display("rpmfusion-free-fedora-44"),
+            ("rpmfusion", "RPM Fusion free fedora 44".to_string())
+        );
+        assert_eq!(
+            witness_display("centos-stream-10"),
+            ("centos", "CentOS Stream 10".to_string())
+        );
+        assert_eq!(
+            witness_display("centos-7.9"),
+            ("centos", "CentOS 7.9".to_string())
+        );
+        assert_eq!(
+            witness_display("vscode"),
+            ("vscode", "Microsoft VS Code".to_string())
+        );
+        assert_eq!(
+            witness_display("opensuse-leap-15.6"),
+            ("opensuse", "openSUSE Leap 15.6".to_string())
         );
         // unknown projects degrade to the first dash split, verbatim
         assert_eq!(
@@ -218,13 +293,25 @@ mod tests {
             scheme: Scheme::Sha256,
             digest: vec![0xab; 32],
         };
-        assert_eq!(start_paths(&sha256), vec!["data/rpm-sha256.parquet"]);
+        assert_eq!(
+            start_paths(&sha256),
+            vec!["data/files-sha256-a.parquet", "data/packages.parquet"]
+        );
+        // sha512 digests are pkgid-only (openSUSE)
+        let sha512 = Coord {
+            scheme: Scheme::Sha512,
+            digest: vec![0xab; 64],
+        };
+        assert_eq!(start_paths(&sha512), vec!["data/packages.parquet"]);
+        // ancient repos state md5 file digests
         let md5 = Coord {
             scheme: Scheme::Md5,
-            digest: vec![0xab; 16],
+            digest: vec![0x01; 16],
         };
-        assert!(start_paths(&md5).is_empty());
-        assert!(supports(Scheme::Sha256));
-        assert!(!supports(Scheme::Md5));
+        assert_eq!(
+            start_paths(&md5),
+            vec!["data/files-md5.parquet", "data/packages.parquet"]
+        );
+        assert!(!supports(Scheme::Blake2s256));
     }
 }

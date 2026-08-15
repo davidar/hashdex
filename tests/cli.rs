@@ -486,56 +486,88 @@ fn install_media_dataset(env: &TestEnv, rows: &[MediaRow]) {
     std::fs::write(root.join("revision"), "test-fixture").unwrap();
 }
 
-/// A fixture rpm-files dataset: one sha256-keyed table mixing file
-/// rows (path + pkgid present) and package rows (both null).
-/// Row: (digest, witness, name, evr, path, pkgid, location).
-type RpmRow<'a> = (
-    &'a str,
-    &'a str,
-    &'a str,
-    &'a str,
-    Option<&'a str>,
-    Option<&'a str>,
-    &'a str,
-);
+/// A fixture rpm-files dataset in the normalized layout: a
+/// pkgid-sorted packages table plus nibble-sharded file tables whose
+/// `pkg` column is the row index into it (every sha256 shard exists,
+/// empty ones included — routing is static).
+/// Package: (pkgid, witness, name, evr, location).
+/// File: (digest, path, index into `packages`).
+type RpmPkg<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
 
-fn install_rpm_files_dataset(env: &TestEnv, rows: &[RpmRow]) {
+fn install_rpm_files_dataset(env: &TestEnv, packages: &[RpmPkg], files: &[(&str, &str, usize)]) {
     let root = env.root.join("cache/hashdex/datasets/rpm-files");
-    let mut rows: Vec<&RpmRow> = rows.iter().collect();
-    rows.sort_by_key(|r| r.0);
     let opt = |vals: Vec<Option<&str>>| {
         Col::opt_str(vals.into_iter().map(|v| v.map(str::to_string)).collect())
     };
+
+    // packages.parquet sorted by pkgid; remember where each landed so
+    // file rows can reference by row number.
+    let mut order: Vec<usize> = (0..packages.len()).collect();
+    order.sort_by_key(|&i| packages[i].0);
+    let mut row_of = vec![0i64; packages.len()];
+    for (row, &i) in order.iter().enumerate() {
+        row_of[i] = row as i64;
+    }
+    let sorted: Vec<&RpmPkg> = order.iter().map(|&i| &packages[i]).collect();
     write_parquet(
-        &root.join("data/rpm-sha256.parquet"),
-        "message rpm {
-            required binary digest (UTF8);
+        &root.join("data/packages.parquet"),
+        "message packages {
+            required binary pkgid (UTF8);
+            optional binary scheme (UTF8);
             optional binary witness (UTF8);
             optional binary name (UTF8);
             optional binary evr (UTF8);
             optional binary arch (UTF8);
-            optional binary path (UTF8);
-            optional binary pkgid (UTF8);
             optional binary location (UTF8);
         }",
         vec![
-            Col::req_str(rows.iter().map(|r| r.0.to_string()).collect()),
-            opt(rows.iter().map(|r| Some(r.1)).collect()),
-            opt(rows.iter().map(|r| Some(r.2)).collect()),
-            opt(rows.iter().map(|r| Some(r.3)).collect()),
-            opt(rows.iter().map(|_| Some("x86_64")).collect()),
-            opt(rows.iter().map(|r| r.4).collect()),
-            opt(rows.iter().map(|r| r.5).collect()),
-            opt(rows.iter().map(|r| Some(r.6)).collect()),
+            Col::req_str(sorted.iter().map(|p| p.0.to_string()).collect()),
+            opt(sorted.iter().map(|_| Some("sha256")).collect()),
+            opt(sorted.iter().map(|p| Some(p.1)).collect()),
+            opt(sorted.iter().map(|p| Some(p.2)).collect()),
+            opt(sorted.iter().map(|p| Some(p.3)).collect()),
+            opt(sorted.iter().map(|_| Some("x86_64")).collect()),
+            opt(sorted.iter().map(|p| Some(p.4)).collect()),
         ],
     );
+
+    let file_schema = "message files {
+        required binary digest (UTF8);
+        required binary path (UTF8);
+        required int64 pkg;
+    }";
+    for nibble in "0123456789abcdef".chars() {
+        let mut shard: Vec<&(&str, &str, usize)> =
+            files.iter().filter(|f| f.0.starts_with(nibble)).collect();
+        shard.sort_by_key(|f| f.0);
+        write_parquet(
+            &root.join(format!("data/files-sha256-{nibble}.parquet")),
+            file_schema,
+            vec![
+                Col::req_str(shard.iter().map(|f| f.0.to_string()).collect()),
+                Col::req_str(shard.iter().map(|f| f.1.to_string()).collect()),
+                Col::req_i64(shard.iter().map(|f| row_of[f.2]).collect()),
+            ],
+        );
+    }
+    for weak in ["md5", "sha1"] {
+        write_parquet(
+            &root.join(format!("data/files-{weak}.parquet")),
+            file_schema,
+            vec![
+                Col::req_str(vec![]),
+                Col::req_str(vec![]),
+                Col::req_i64(vec![]),
+            ],
+        );
+    }
     // Written last, same as a real pull: this marks the copy complete.
     std::fs::write(root.join("revision"), "test-fixture").unwrap();
 }
 
 enum Col {
     Str(Vec<Option<String>>, bool),
-    I64(Vec<Option<i64>>),
+    I64(Vec<Option<i64>>, bool),
 }
 
 impl Col {
@@ -546,7 +578,10 @@ impl Col {
         Col::Str(v, false)
     }
     fn opt_i64(v: Vec<Option<i64>>) -> Col {
-        Col::I64(v)
+        Col::I64(v, false)
+    }
+    fn req_i64(v: Vec<i64>) -> Col {
+        Col::I64(v.into_iter().map(Some).collect(), true)
     }
 }
 
@@ -579,11 +614,11 @@ fn write_parquet(path: &Path, schema: &str, cols: Vec<Col>) {
                     .write_batch(&present, (!required).then_some(&defs[..]), None)
                     .unwrap();
             }
-            Col::I64(vals) => {
+            Col::I64(vals, required) => {
                 let present: Vec<i64> = vals.iter().flatten().copied().collect();
                 let defs: Vec<i16> = vals.iter().map(|v| v.is_some() as i16).collect();
                 c.typed::<Int64Type>()
-                    .write_batch(&present, Some(&defs), None)
+                    .write_batch(&present, (!required).then_some(&defs[..]), None)
                     .unwrap();
             }
         }
@@ -671,29 +706,10 @@ fn rpm_files_resolves_file_and_package_rows() {
     let rpm_url = "https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Everything/x86_64/os/Packages/b/bash-5.3.9-3.fc44.x86_64.rpm";
     install_rpm_files_dataset(
         &env,
-        &[
-            // a file the rpm ships (two packages legitimately carrying
-            // the same content stack as separate witness rows)
-            (
-                &file256,
-                "fedora-44",
-                "bash",
-                "5.3.9-3.fc44",
-                Some("/usr/bin/bash"),
-                Some(&pkg256),
-                rpm_url,
-            ),
-            // the rpm artifact itself, keyed by its pkgid
-            (
-                &pkg256,
-                "fedora-44",
-                "bash",
-                "5.3.9-3.fc44",
-                None,
-                None,
-                rpm_url,
-            ),
-        ],
+        // the package (keyed by its pkgid in packages.parquet) …
+        &[(&pkg256, "fedora-44", "bash", "5.3.9-3.fc44", rpm_url)],
+        // … and a file row referencing it by row index
+        &[(&file256, "/usr/bin/bash", 0)],
     );
 
     let out = env.hdx(&["--offline", &file256]);
@@ -1406,7 +1422,7 @@ fn fetch_registry_works_offline() {
     let text = stdout(&out);
     for name in [
         "circl",
-        "fedora",
+        "rpm-files",
         "fatcat",
         "depsdev",
         "rekor",

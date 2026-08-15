@@ -1370,9 +1370,10 @@ fn backend_for_filter(name: &str) -> Option<&'static str> {
         "ia-census" => Some("ia-census"),
         "debs" => Some("debs"),
         "install-media" => Some("install-media"),
-        // The fedora bloom predates the dataset; its hits route to the
-        // same rpm-files probes (a probe miss is a cheap absence proof).
-        "rpm-files" | "fedora" => Some("rpm-files"),
+        // The rpm-header-blooms trio predates the dataset; installed
+        // copies keep routing to the same rpm-files probes (a probe
+        // miss is a cheap absence proof).
+        "rpm-files" | "fedora" | "rpmfusion" | "vscode" => Some("rpm-files"),
         "circl" => Some(crate::backends::circl::NAME),
         "depsdev" => Some(crate::backends::depsdev::NAME),
         "rekor" => Some(crate::backends::rekor::NAME),
