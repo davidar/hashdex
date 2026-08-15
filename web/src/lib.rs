@@ -17,7 +17,8 @@ use blake2::Blake2s256;
 use bytes::Bytes;
 use hashdex::coord::{Coord, Scheme};
 use hashdex::range_store::RangeStore;
-use hashdex::{dcso, fatcat, tarballs};
+use hashdex::registry::{BloomEntry, Spec, BLOOMS, SPECS};
+use hashdex::{dcso, registry};
 use md5::Md5;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use serde::Serialize;
@@ -102,83 +103,18 @@ impl Hasher {
 
 // --------------------------------------------------------------- filters
 
-/// The published membership filters the page can probe remotely.
-/// Mirrors the CLI registry (src/filters_cmd.rs), HF URLs only.
-struct FilterEntry {
-    name: &'static str,
-    scheme: Scheme,
-    url: &'static str,
-    source: &'static str,
+/// Filters come from the core registry (`hashdex::registry::BLOOMS`)
+/// — the page probes `urls[0]` (an HF mirror) with ranged reads, so a
+/// bloom added to the registry is probeable here at the next build.
+fn scheme_of(s: &str) -> Option<Scheme> {
+    match s {
+        "md5" => Some(Scheme::Md5),
+        "sha1" => Some(Scheme::Sha1),
+        "sha256" => Some(Scheme::Sha256),
+        "sha512" => Some(Scheme::Sha512),
+        _ => None,
+    }
 }
-
-const FILTERS: &[FilterEntry] = &[
-    FilterEntry {
-        name: "circl",
-        scheme: Scheme::Sha1,
-        url: "https://huggingface.co/datasets/david-ar/circl-hashlookup-mirror/resolve/main/circl.sha1.bloom",
-        source: "CIRCL hashlookup: NSRL, Windows, distros",
-    },
-    FilterEntry {
-        name: "fedora",
-        scheme: Scheme::Sha256,
-        url: "https://huggingface.co/datasets/david-ar/rpm-header-blooms/resolve/main/fedora.sha256.bloom",
-        source: "Fedora repo metadata: per-file RPM digests",
-    },
-    FilterEntry {
-        name: "rpmfusion",
-        scheme: Scheme::Sha256,
-        url: "https://huggingface.co/datasets/david-ar/rpm-header-blooms/resolve/main/rpmfusion.sha256.bloom",
-        source: "RPM Fusion free+nonfree per-file digests",
-    },
-    FilterEntry {
-        name: "vscode",
-        scheme: Scheme::Sha256,
-        url: "https://huggingface.co/datasets/david-ar/rpm-header-blooms/resolve/main/vscode.sha256.bloom",
-        source: "Microsoft VS Code yum repo per-file digests",
-    },
-    FilterEntry {
-        name: "fatcat",
-        scheme: Scheme::Sha1,
-        url: "https://huggingface.co/datasets/david-ar/fatcat-file-bloom/resolve/main/fatcat.sha1.bloom",
-        source: "IA fatcat: 122M scholarly-file hashes",
-    },
-    FilterEntry {
-        name: "fatcat",
-        scheme: Scheme::Sha256,
-        url: "https://huggingface.co/datasets/david-ar/fatcat-file-bloom/resolve/main/fatcat.sha256.bloom",
-        source: "IA fatcat: 122M scholarly-file hashes",
-    },
-    FilterEntry {
-        name: "depsdev",
-        scheme: Scheme::Sha1,
-        url: "https://huggingface.co/datasets/david-ar/depsdev-bloom/resolve/main/depsdev.sha1.bloom",
-        source: "deps.dev package-file hashes",
-    },
-    FilterEntry {
-        name: "depsdev",
-        scheme: Scheme::Sha256,
-        url: "https://huggingface.co/datasets/david-ar/depsdev-bloom/resolve/main/depsdev.sha256.bloom",
-        source: "deps.dev package-file hashes",
-    },
-    FilterEntry {
-        name: "rekor",
-        scheme: Scheme::Sha256,
-        url: "https://huggingface.co/datasets/david-ar/rekor-bloom/resolve/main/rekor.sha256.bloom",
-        source: "Sigstore Rekor transparency-log digests",
-    },
-    FilterEntry {
-        name: "cc",
-        scheme: Scheme::Sha1,
-        url: "https://huggingface.co/datasets/david-ar/cc-document-bloom/resolve/main/cc.sha1.bloom",
-        source: "Common Crawl document payload digests",
-    },
-    FilterEntry {
-        name: "swh",
-        scheme: Scheme::Sha256,
-        url: "https://huggingface.co/datasets/david-ar/swh-content-bloom/resolve/main/2026-06-04/swh.sha256.bloom",
-        source: "Software Heritage: 29.3B archived file contents",
-    },
-];
 
 #[derive(Serialize)]
 struct FilterInfo {
@@ -190,11 +126,11 @@ struct FilterInfo {
 /// JSON array of probeable filters, for the page to fan out over.
 #[wasm_bindgen]
 pub fn filter_list() -> String {
-    let list: Vec<FilterInfo> = FILTERS
+    let list: Vec<FilterInfo> = BLOOMS
         .iter()
         .map(|f| FilterInfo {
             name: f.name,
-            scheme: f.scheme.as_str(),
+            scheme: f.scheme,
             source: f.source,
         })
         .collect();
@@ -218,41 +154,42 @@ pub async fn probe_filter(name: String, scheme: String, coord: String) -> Result
 
 async fn probe_filter_inner(name: &str, scheme: &str, coord: &str) -> Result<bool> {
     let coord = Coord::parse(coord)?;
-    let entry = FILTERS
+    let entry: &BloomEntry = BLOOMS
         .iter()
-        .find(|f| f.name == name && f.scheme.as_str() == scheme)
+        .find(|f| f.name == name && f.scheme == scheme)
         .with_context(|| format!("unknown filter {name}.{scheme}"))?;
-    if coord.scheme != entry.scheme {
+    let entry_scheme =
+        scheme_of(entry.scheme).with_context(|| format!("unprobeable scheme {}", entry.scheme))?;
+    if coord.scheme != entry_scheme {
         bail!(
             "{name}.{scheme} cannot be probed with a {} digest",
             coord.scheme.as_str()
         );
     }
-    let header = match BLOOM_HEADERS.with(|h| h.borrow().get(entry.url).copied()) {
+    let url: &'static str = entry.urls[0];
+    let header = match BLOOM_HEADERS.with(|h| h.borrow().get(url).copied()) {
         Some(h) => h,
         None => {
             // Fetching the header first also memoizes the post-redirect
             // URL, so the k probe reads below go straight to the CDN.
-            let bytes = fetch::get_range(entry.url, 0, dcso::HEADER_LEN).await?;
-            let h = dcso::Header::parse(&bytes, entry.url)?;
-            BLOOM_HEADERS.with(|m| m.borrow_mut().insert(entry.url, h));
+            let bytes = fetch::get_range(url, 0, dcso::HEADER_LEN).await?;
+            let h = dcso::Header::parse(&bytes, url)?;
+            BLOOM_HEADERS.with(|m| m.borrow_mut().insert(url, h));
             h
         }
     };
     // Key convention from the filter builders: sha1 filters store
     // UPPERCASE hex (CIRCL's), sha256 filters lowercase.
-    let key = match entry.scheme {
+    let key = match entry_scheme {
         Scheme::Sha1 => coord.hex().to_ascii_uppercase(),
         _ => coord.hex(),
     };
     let locs: Vec<(u64, u64)> = dcso::bit_positions(key.as_bytes(), header.k, header.m)
         .map(dcso::bit_location)
         .collect();
-    let words = futures::future::try_join_all(
-        locs.iter()
-            .map(|(off, _)| fetch::get_range(entry.url, *off, 8)),
-    )
-    .await?;
+    let words =
+        futures::future::try_join_all(locs.iter().map(|(off, _)| fetch::get_range(url, *off, 8)))
+            .await?;
     Ok(locs
         .iter()
         .zip(&words)
@@ -261,29 +198,15 @@ async fn probe_filter_inner(name: &str, scheme: &str, coord: &str) -> Result<boo
 
 // -------------------------------------------------------------- datasets
 
-/// Cold-open speculative suffix: length (via Content-Range) + footer +
-/// page-index region in one request. The fatcat data files' index
-/// region is ~4.8 MB; 8 MB covers it with margin.
-const SUFFIX: usize = 8 << 20;
-
-/// A published parquet dataset the page can point-look-up into. The
-/// session machinery (revision pin, opened files, miss feeding) is
-/// keyed per dataset; the lookup logic itself lives in the core crate.
-#[derive(Clone, Copy)]
-struct Dataset {
-    base: &'static str,
-    revision_api: &'static str,
-}
-
-const FATCAT: Dataset = Dataset {
-    base: fatcat::DATASET_BASE,
-    revision_api: fatcat::REVISION_API,
-};
-const TARBALLS: Dataset = Dataset {
-    base: tarballs::DATASET_BASE,
-    revision_api: tarballs::REVISION_API,
-};
-
+/// Datasets come from the core registry (`hashdex::registry::SPECS`):
+/// the session machinery below (revision pin, opened files, miss
+/// feeding) is keyed per dataset name; routing, lookup, and claim
+/// rendering live in each dataset's core module, dispatched by
+/// `registry::lookup_in`. A dataset added to the registry resolves
+/// here at the next build. Cold opens read `spec.suffix` (length via
+/// Content-Range + footer + page-index region in one request) —
+/// dataset-sized, so small indexes are not opened with fatcat-scale
+/// requests.
 struct Opened {
     url: String,
     store: RangeStore,
@@ -299,25 +222,25 @@ thread_local! {
 
 /// The dataset revision to read, pinned once per page session so a
 /// mid-session republish can't tear a lookup. Falls back to "main".
-async fn pinned_revision(ds: &Dataset) -> String {
-    if let Some(rev) = REVISIONS.with(|r| r.borrow().get(ds.revision_api).cloned()) {
+async fn pinned_revision(ds: &'static Spec) -> String {
+    if let Some(rev) = REVISIONS.with(|r| r.borrow().get(ds.name).cloned()) {
         return rev;
     }
-    let rev = match fetch::get_json(ds.revision_api).await {
+    let rev = match fetch::get_json(&ds.revision_api()).await {
         Ok(v) => v["sha"].as_str().unwrap_or("main").to_string(),
         Err(_) => "main".to_string(),
     };
-    REVISIONS.with(|r| r.borrow_mut().insert(ds.revision_api, rev.clone()));
+    REVISIONS.with(|r| r.borrow_mut().insert(ds.name, rev.clone()));
     rev
 }
 
-async fn ensure_open(ds: &Dataset, path: &str) -> Result<()> {
-    if OPENED.with(|f| f.borrow().contains_key(&(ds.base, path.to_string()))) {
+async fn ensure_open(ds: &'static Spec, path: &str) -> Result<()> {
+    if OPENED.with(|f| f.borrow().contains_key(&(ds.name, path.to_string()))) {
         return Ok(());
     }
     let rev = pinned_revision(ds).await;
-    let url = format!("{}/{}/{}", ds.base, rev, path);
-    let (total, start, bytes) = fetch::get_suffix(&url, SUFFIX).await?;
+    let url = format!("{}/{}/{}", ds.resolve_base(), rev, path);
+    let (total, start, bytes) = fetch::get_suffix(&url, ds.suffix as usize).await?;
     let store = RangeStore::new(total);
     store.insert(start, Bytes::from(bytes));
     // Drive the metadata parse: the suffix nearly always suffices, but
@@ -339,7 +262,7 @@ async fn ensure_open(ds: &Dataset, path: &str) -> Result<()> {
     };
     OPENED.with(|f| {
         f.borrow_mut().insert(
-            (ds.base, path.to_string()),
+            (ds.name, path.to_string()),
             Rc::new(Opened { url, store, meta }),
         )
     });
@@ -351,7 +274,7 @@ async fn ensure_open(ds: &Dataset, path: &str) -> Result<()> {
 /// revealed), fetch that and run it again. Identical in shape to the
 /// range_store test Driver, with awaited fetches.
 async fn drive_lookup<T>(
-    ds: &Dataset,
+    ds: &'static Spec,
     start_paths: &[String],
     run: impl Fn(&dyn Fn(&str) -> Result<(Arc<RangeStore>, Arc<ParquetMetaData>)>) -> Result<T>,
 ) -> Result<T> {
@@ -362,7 +285,7 @@ async fn drive_lookup<T>(
         let files: HashMap<String, Rc<Opened>> = OPENED.with(|f| {
             f.borrow()
                 .iter()
-                .filter(|((base, _), _)| *base == ds.base)
+                .filter(|((name, _), _)| *name == ds.name)
                 .map(|((_, path), o)| (path.clone(), Rc::clone(o)))
                 .collect()
         });
@@ -403,42 +326,47 @@ async fn drive_lookup<T>(
     bail!("lookup did not converge")
 }
 
-/// Resolve one coordinate against the fatcat file dataset. Returns a
-/// JSON array of findings (one per distinct content — a weak digest
-/// can reach several; empty = no hits), or "null" for unsupported
-/// schemes.
-#[wasm_bindgen]
-pub async fn fatcat_lookup(coord: String) -> Result<String, JsValue> {
-    fatcat_lookup_inner(&coord).await.map_err(err_js)
+#[derive(Serialize)]
+struct DatasetInfo {
+    name: &'static str,
+    schemes: Vec<&'static str>,
 }
 
-async fn fatcat_lookup_inner(coord: &str) -> Result<String> {
+/// JSON array of resolvable datasets with the schemes each can be
+/// keyed by, for the page to fan out over.
+#[wasm_bindgen]
+pub fn dataset_list() -> String {
+    let all = [Scheme::Sha256, Scheme::Sha512, Scheme::Sha1, Scheme::Md5];
+    let list: Vec<DatasetInfo> = SPECS
+        .iter()
+        .map(|s| DatasetInfo {
+            name: s.name,
+            schemes: all
+                .iter()
+                .filter(|sch| (s.supports)(**sch))
+                .map(|sch| sch.as_str())
+                .collect(),
+        })
+        .collect();
+    serde_json::to_string(&list).unwrap()
+}
+
+/// Resolve one coordinate against a registry dataset. Returns a JSON
+/// array of findings (one per witness row or distinct content; empty
+/// = no hits), or "null" for schemes the dataset has no key for.
+#[wasm_bindgen]
+pub async fn dataset_lookup(name: String, coord: String) -> Result<String, JsValue> {
+    dataset_lookup_inner(&name, &coord).await.map_err(err_js)
+}
+
+async fn dataset_lookup_inner(name: &str, coord: &str) -> Result<String> {
+    let ds = registry::spec(name).with_context(|| format!("unknown dataset {name}"))?;
     let coord = Coord::parse(coord)?;
-    if !fatcat::supports(coord.scheme) {
+    if !(ds.supports)(coord.scheme) {
         return Ok("null".to_string());
     }
-    let findings = drive_lookup(&FATCAT, &fatcat::start_paths(&coord), |open| {
-        fatcat::lookup_with(|p| open(p), &coord)
-    })
-    .await?;
-    Ok(serde_json::to_string(&findings)?)
-}
-
-/// Resolve one coordinate against the release-tarballs dataset.
-/// Returns a JSON array of findings (one per witness row; empty =
-/// no hits), or "null" for unsupported schemes.
-#[wasm_bindgen]
-pub async fn tarballs_lookup(coord: String) -> Result<String, JsValue> {
-    tarballs_lookup_inner(&coord).await.map_err(err_js)
-}
-
-async fn tarballs_lookup_inner(coord: &str) -> Result<String> {
-    let coord = Coord::parse(coord)?;
-    if !tarballs::supports(coord.scheme) {
-        return Ok("null".to_string());
-    }
-    let findings = drive_lookup(&TARBALLS, &tarballs::start_paths(&coord), |open| {
-        tarballs::lookup_with(|p| open(p), &coord)
+    let findings = drive_lookup(ds, &(ds.start_paths)(&coord), |open| {
+        registry::lookup_in(ds.name, |p| open(p), &coord)
     })
     .await?;
     Ok(serde_json::to_string(&findings)?)

@@ -3,139 +3,7 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use std::io::Write;
 
-/// One downloadable filter file. `urls` are tried in order — mirrors
-/// first, canonical host as fallback — so a missing mirror degrades to
-/// slow rather than broken.
-struct RegistryEntry {
-    name: &'static str,
-    scheme: &'static str,
-    urls: &'static [&'static str],
-    size: &'static str,
-    source: &'static str,
-    /// Excluded from `--all`; must be named explicitly.
-    huge: bool,
-}
-
-const HF: &str = "https://huggingface.co/datasets/david-ar";
-
-const REGISTRY: &[RegistryEntry] = &[
-    RegistryEntry {
-        name: "circl",
-        scheme: "sha1",
-        urls: &[
-            // CIRCL's own host is very slow; mirror first (CC-BY-4.0).
-            "https://huggingface.co/datasets/david-ar/circl-hashlookup-mirror/resolve/main/circl.sha1.bloom",
-            "https://cra.circl.lu/hashlookup/hashlookup-full.bloom",
-        ],
-        size: "956 MiB",
-        source: "CIRCL hashlookup: NSRL, Windows, distros (CC-BY-4.0)",
-        huge: false,
-    },
-    RegistryEntry {
-        name: "fedora",
-        scheme: "sha256",
-        urls: &["https://huggingface.co/datasets/david-ar/rpm-header-blooms/resolve/main/fedora.sha256.bloom"],
-        size: "16 MiB",
-        source: "Fedora repo metadata: per-file RPM FILEDIGESTS",
-        huge: false,
-    },
-    RegistryEntry {
-        name: "rpmfusion",
-        scheme: "sha256",
-        urls: &["https://huggingface.co/datasets/david-ar/rpm-header-blooms/resolve/main/rpmfusion.sha256.bloom"],
-        size: "188 KiB",
-        source: "RPM Fusion free+nonfree per-file digests",
-        huge: false,
-    },
-    RegistryEntry {
-        name: "vscode",
-        scheme: "sha256",
-        urls: &["https://huggingface.co/datasets/david-ar/rpm-header-blooms/resolve/main/vscode.sha256.bloom"],
-        size: "288 KiB",
-        source: "Microsoft VS Code yum repo per-file digests",
-        huge: false,
-    },
-    RegistryEntry {
-        name: "fatcat",
-        scheme: "sha1",
-        urls: &["https://huggingface.co/datasets/david-ar/fatcat-file-bloom/resolve/main/fatcat.sha1.bloom"],
-        size: "279 MiB",
-        source: "IA fatcat: 122M scholarly-file hashes (CC0)",
-        huge: false,
-    },
-    RegistryEntry {
-        name: "fatcat",
-        scheme: "sha256",
-        urls: &["https://huggingface.co/datasets/david-ar/fatcat-file-bloom/resolve/main/fatcat.sha256.bloom"],
-        size: "279 MiB",
-        source: "IA fatcat: 122M scholarly-file hashes (CC0)",
-        huge: false,
-    },
-    RegistryEntry {
-        name: "depsdev",
-        scheme: "sha1",
-        urls: &["https://huggingface.co/datasets/david-ar/depsdev-bloom/resolve/main/depsdev.sha1.bloom"],
-        size: "395 MiB",
-        source: "deps.dev package-file hashes (CC-BY-4.0)",
-        huge: false,
-    },
-    RegistryEntry {
-        name: "depsdev",
-        scheme: "sha256",
-        urls: &["https://huggingface.co/datasets/david-ar/depsdev-bloom/resolve/main/depsdev.sha256.bloom"],
-        size: "395 MiB",
-        source: "deps.dev package-file hashes (CC-BY-4.0)",
-        huge: false,
-    },
-    RegistryEntry {
-        name: "rekor",
-        scheme: "sha256",
-        urls: &["https://huggingface.co/datasets/david-ar/rekor-bloom/resolve/main/rekor.sha256.bloom"],
-        size: "19 MiB",
-        source: "Sigstore Rekor transparency-log subject digests",
-        huge: false,
-    },
-    RegistryEntry {
-        name: "cc",
-        scheme: "sha1",
-        urls: &["https://huggingface.co/datasets/david-ar/cc-document-bloom/resolve/main/cc.sha1.bloom"],
-        size: "71 MiB",
-        source: "Common Crawl document payload digests",
-        huge: false,
-    },
-    RegistryEntry {
-        name: "tarballs",
-        scheme: "sha256",
-        urls: &["https://huggingface.co/datasets/david-ar/release-tarballs/resolve/main/tarballs.sha256.bloom"],
-        size: "359 KiB",
-        source: "Debian sid / Homebrew / Guix release-artifact checksums",
-        huge: false,
-    },
-    RegistryEntry {
-        name: "debs",
-        scheme: "sha256",
-        urls: &["https://huggingface.co/datasets/david-ar/deb-packages/resolve/main/debs.sha256.bloom"],
-        size: "~2 MiB",
-        source: "Debian/Ubuntu/Kali binary-package (.deb) checksums",
-        huge: false,
-    },
-    RegistryEntry {
-        name: "ia-census",
-        scheme: "sha1",
-        urls: &["https://huggingface.co/datasets/david-ar/ia-census/resolve/main/ia-census.sha1.bloom"],
-        size: "311 MiB",
-        source: "Internet Archive 2016 census: every public item's files",
-        huge: false,
-    },
-    RegistryEntry {
-        name: "swh",
-        scheme: "sha256",
-        urls: &["https://huggingface.co/datasets/david-ar/swh-content-bloom/resolve/main/2026-06-04/swh.sha256.bloom"],
-        size: "70 GiB",
-        source: "Software Heritage: 29.3B archived file contents (CC-BY-4.0)",
-        huge: true,
-    },
-];
+use crate::registry::{BloomEntry, BLOOMS};
 
 /// Download membership filters into the cache dir. With no names, list
 /// what's available. `--all` fetches everything except entries marked
@@ -147,7 +15,6 @@ pub async fn fetch(
     all: bool,
     from: Option<&str>,
 ) -> Result<()> {
-    let _ = HF; // referenced by docs; keeps the base URL greppable
     if let Some(url) = from {
         let [spec]: &[String; 1] = names
             .try_into()
@@ -159,7 +26,7 @@ pub async fn fetch(
     }
     if names.is_empty() && !all {
         println!("available filters (hdx filters fetch <name>... | --all):");
-        for e in REGISTRY {
+        for e in BLOOMS {
             println!(
                 "  {:<10} {:<7} {:>8}  {}",
                 e.name, e.scheme, e.size, e.source
@@ -167,15 +34,15 @@ pub async fn fetch(
         }
         return Ok(());
     }
-    let wanted: Vec<&RegistryEntry> = if all {
-        REGISTRY
+    let wanted: Vec<&BloomEntry> = if all {
+        BLOOMS
             .iter()
             .filter(|e| !e.huge || names.iter().any(|n| n == e.name))
             .collect()
     } else {
         let unknown: Vec<&String> = names
             .iter()
-            .filter(|n| !REGISTRY.iter().any(|e| e.name == n.as_str()))
+            .filter(|n| !BLOOMS.iter().any(|e| e.name == n.as_str()))
             .collect();
         if !unknown.is_empty() {
             anyhow::bail!(
@@ -187,7 +54,7 @@ pub async fn fetch(
                     .join(", ")
             );
         }
-        REGISTRY
+        BLOOMS
             .iter()
             .filter(|e| names.iter().any(|n| n == e.name))
             .collect()

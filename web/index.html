@@ -123,7 +123,7 @@
 </main>
 
 <script type="module">
-import init, { parse_coord, Hasher, filter_list, probe_filter, fatcat_lookup, tarballs_lookup }
+import init, { parse_coord, Hasher, filter_list, probe_filter, dataset_list, dataset_lookup }
   from "./pkg/hashdex_web.js";
 
 const $ = (id) => document.getElementById(id);
@@ -141,11 +141,13 @@ const IDENTITY_FLOOR = 32;
 const CHUNK = 8 << 20;
 
 let FILTERS = [];
+let DATASETS = [];
 let runToken = 0; // invalidates in-flight renders when a new resolve starts
 
 async function main() {
   await init();
   FILTERS = JSON.parse(filter_list());
+  DATASETS = JSON.parse(dataset_list());
 
   $("drop").addEventListener("click", () => $("filein").click());
   $("drop").addEventListener("dragover", (e) => { e.preventDefault(); $("drop").classList.add("hover"); });
@@ -262,29 +264,35 @@ async function resolveCoords(coords, file, token) {
   const claimNote = el("p", "note", "asking the published indexes…");
   claimSection.append(claimCard, claimNote);
 
-  // The parquet datasets the page can point-look-up into, each fed the
-  // strongest coordinate it speaks. Lookups return findings whose
+  // The parquet datasets the page can point-look-up into come from
+  // the wasm registry (hashdex::registry::SPECS) — each is fed the
+  // strongest coordinate it speaks; a dataset added to the registry
+  // fans out here with no page edits. Lookups return findings whose
   // claims render as they land.
-  const fatcatCoord = ["sha256", "sha1", "md5"].find((s) => coords[s]);
-  const tarballsCoord = ["sha256", "md5"].find((s) => coords[s]);
+  const STRENGTH = ["sha256", "sha512", "sha1", "md5"];
   const TARBALL_ATTESTORS = {
     debian: "the Debian sid Sources index",
     homebrew: "the Homebrew formulae API",
     guix: "GNU Guix sources.json",
   };
+  // Per-dataset attestor phrasing; unknown datasets and witnesses get
+  // the generic line so new registry entries degrade gracefully.
+  const ATTESTOR_FNS = {
+    fatcat: (f) => `attested by ${f.backend} (IA fatcat bulk export, 2024-02-18)`,
+    tarballs: (f) => `attested by ${TARBALL_ATTESTORS[f.backend] || f.backend}`,
+    "install-media": (f) => `attested by the ${f.backend} release checksums`,
+  };
   const datasets = [];
-  if (fatcatCoord) datasets.push({
-    label: "fatcat",
-    call: () => fatcat_lookup(`${fatcatCoord}:${coords[fatcatCoord]}`),
-    findings: (v) => v || [],
-    attestor: (f) => `attested by ${f.backend} (IA fatcat bulk export, 2024-02-18)`,
-  });
-  if (tarballsCoord) datasets.push({
-    label: "release tarballs",
-    call: () => tarballs_lookup(`${tarballsCoord}:${coords[tarballsCoord]}`),
-    findings: (v) => v || [],
-    attestor: (f) => `attested by ${TARBALL_ATTESTORS[f.backend] || f.backend}`,
-  });
+  for (const d of DATASETS) {
+    const s = STRENGTH.find((s) => d.schemes.includes(s) && coords[s]);
+    if (!s) continue;
+    datasets.push({
+      label: d.name,
+      call: () => dataset_lookup(d.name, `${s}:${coords[s]}`),
+      findings: (v) => v || [],
+      attestor: ATTESTOR_FNS[d.name] || ((f) => `attested by ${f.backend}`),
+    });
+  }
 
   if (applicable.length) result.append(srcSection);
   if (datasets.length) result.append(claimSection);
@@ -361,7 +369,7 @@ async function resolveCoords(coords, file, token) {
     if (!claimed) {
       if (!failures.length) {
         claimSection.append(el("p", "note",
-          "No attribution found in the published indexes (fatcat, release tarballs)."));
+          `No attribution found in the published indexes (${datasets.map((d) => d.label).join(", ")}).`));
       }
       claimCard.remove();
     } else if (extras.size) {

@@ -5,7 +5,7 @@
 //! lookups then run over an mmap of the very same parquet — one wire
 //! format, two transports.
 
-use crate::coord::{Coord, Scheme};
+use crate::coord::Coord;
 use crate::finding::Finding;
 use anyhow::{Context, Result};
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
@@ -14,119 +14,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
-/// One published dataset: identity and routing. The digest→path logic
-/// lives in the dataset's core module (`fatcat`, `tarballs`); this is
-/// the registry the transports and the CLI share.
-pub struct Spec {
-    pub name: &'static str,
-    /// Hub repo id, e.g. "david-ar/fatcat-files".
-    pub repo: &'static str,
-    /// Rough published size, shown before a pull.
-    pub approx_size: &'static str,
-    /// Cold-open speculative suffix: must cover magic + footer + the
-    /// page-index region in one ranged request. Dataset-sized: fatcat's
-    /// multi-GB files carry ~5 MB of page index; tarballs' whole data
-    /// file is 15 MB.
-    pub suffix: u64,
-    pub supports: fn(Scheme) -> bool,
-    pub start_paths: fn(&Coord) -> Vec<String>,
-}
-
-impl Spec {
-    pub fn resolve_base(&self) -> String {
-        format!("https://huggingface.co/datasets/{}/resolve", self.repo)
-    }
-    pub fn revision_api(&self) -> String {
-        format!(
-            "https://huggingface.co/api/datasets/{}/revision/main",
-            self.repo
-        )
-    }
-    pub fn tree_api(&self, revision: &str) -> String {
-        // expand=true adds LFS metadata per entry; lfs.oid is the
-        // file's sha256, which is what `hdx index verify` checks
-        // local copies against.
-        format!(
-            "https://huggingface.co/api/datasets/{}/tree/{revision}?recursive=true&expand=true",
-            self.repo
-        )
-    }
-}
-
-pub static FATCAT: Spec = Spec {
-    name: "fatcat",
-    repo: "david-ar/fatcat-files",
-    approx_size: "~52 GB",
-    suffix: 8 << 20,
-    supports: crate::fatcat::supports,
-    start_paths: crate::fatcat::start_paths,
+// Identity and routing (Spec, SPECS, lookup_in, …) live in the core
+// registry — the single source of truth the web page also enumerates.
+// This module owns only the local transport: pulled copies on disk.
+pub use crate::registry::{
+    is_dataset, lookup_in, spec, Spec, CENSUS, DEBS, FATCAT, MEDIA, SPECS, TARBALLS,
 };
-
-pub static TARBALLS: Spec = Spec {
-    name: "tarballs",
-    repo: "david-ar/release-tarballs",
-    approx_size: "~25 MB",
-    suffix: 1 << 20,
-    supports: crate::tarballs::supports,
-    start_paths: crate::tarballs::start_paths,
-};
-
-pub static CENSUS: Spec = Spec {
-    name: "ia-census",
-    repo: "david-ar/ia-census",
-    approx_size: "~14 GB",
-    suffix: 8 << 20,
-    supports: crate::census::supports,
-    start_paths: crate::census::start_paths,
-};
-
-pub static DEBS: Spec = Spec {
-    name: "debs",
-    repo: "david-ar/deb-packages",
-    approx_size: "~200 MB",
-    suffix: 4 << 20,
-    supports: crate::debs::supports,
-    start_paths: crate::debs::start_paths,
-};
-
-pub static MEDIA: Spec = Spec {
-    name: "install-media",
-    repo: "david-ar/install-media",
-    approx_size: "~40 MB",
-    suffix: 1 << 20,
-    supports: crate::media::supports,
-    start_paths: crate::media::start_paths,
-};
-
-pub static SPECS: &[&Spec] = &[&FATCAT, &TARBALLS, &CENSUS, &DEBS, &MEDIA];
-
-pub fn spec(name: &str) -> Option<&'static Spec> {
-    SPECS.iter().find(|s| s.name == name).copied()
-}
-
-/// Backends that are range reads against our published static datasets:
-/// probing them discloses digests to no one.
-pub fn is_dataset(backend: &str) -> bool {
-    spec(backend).is_some()
-}
-
-/// One lookup, dispatched to the dataset's core module — generic over
-/// the transport (remote range reads or a local mmap), monomorphized
-/// per open-fn.
-pub fn lookup_in<R, F>(name: &str, open: F, coord: &Coord) -> Result<Vec<Finding>>
-where
-    R: ChunkReader + 'static,
-    F: Fn(&str) -> Result<(Arc<R>, Arc<ParquetMetaData>)>,
-{
-    match name {
-        "fatcat" => crate::fatcat::lookup_with(open, coord),
-        "tarballs" => crate::tarballs::lookup_with(open, coord),
-        "ia-census" => crate::census::lookup_with(open, coord),
-        "debs" => crate::debs::lookup_with(open, coord),
-        "install-media" => crate::media::lookup_with(open, coord),
-        _ => Ok(Vec::new()),
-    }
-}
 
 pub fn datasets_dir() -> PathBuf {
     crate::cache::cache_dir().join("datasets")
