@@ -44,6 +44,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -94,7 +95,7 @@ def parse_primary(xml):
     missing header-range (pre-createrepo-0.4 relics) are counted and
     skipped, not fatal."""
     pkgs = []
-    skipped = {"arch": 0, "norange": 0, "malformed": 0}
+    skipped = {"arch": 0, "norange": 0, "malformed": 0, "macro": 0}
     for m in re.finditer(rb"<package type=\"rpm\">(.*?)</package>", xml, re.DOTALL):
         blk = m.group(1)
         try:
@@ -115,6 +116,12 @@ def parse_primary(xml):
             loc = xml_unescape(re.search(rb'<location href="([^"]+)"', blk).group(1).decode())
         except AttributeError:
             skipped["malformed"] += 1
+            continue
+        if "%{" in loc:
+            # unexpanded rpm macro leaked into the repo metadata itself
+            # (real case: python3-%{srcname}-….fc20 in fedora-20-updates);
+            # the URL 400s forever, so it can never harvest
+            skipped["macro"] += 1
             continue
         e = epoch.group(1).decode() if epoch else "0"
         evr = f"{ver}-{rel}" if e in ("", "0") else f"{e}:{ver}-{rel}"
@@ -631,13 +638,6 @@ async def lane_run(host, lane_id, streams, repos, tsv_dir):
             except Exception as e:  # noqa: BLE001 — one repo must not kill the lane
                 log(f"{w}: ERROR {e}")
                 stats["failed"].append(w)
-            else:
-                if w not in stats["failed"] and w not in stats["empty"]:
-                    # off the event loop: an LFS upload must not stall
-                    # the lane's fetches
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, upload_checkpoint, tsv_dir / f"{w}.tsv.gz"
-                    )
 
     async with httpx.AsyncClient(
         http2=True,
@@ -692,26 +692,66 @@ def harvest_all(repos, tsv_dir, done_witnesses):
     return [w for w, _ in todo if w not in present]
 
 
-def upload_checkpoint(path):
-    if SMOKE:
-        return
-    from huggingface_hub import HfApi
+class CheckpointSweeper:
+    """Batch-uploads completed witness tsvs, ONE commit per sweep.
 
-    api = HfApi()
-    for attempt in range(5):
+    The Hub caps repo commits at 256/hour — per-witness upload_file
+    commits blew through it mid-harvest (2026-08-15). One folder
+    commit every SWEEP_S covers any number of new tsvs; a failed
+    sweep just waits for the next one (the files stay on disk), so a
+    429 costs latency, never work.
+    """
+
+    SWEEP_S = 300
+
+    def __init__(self, tsv_dir, already_on_hub):
+        self.tsv_dir = tsv_dir
+        self.uploaded = {f"{w}.tsv.gz" for w in already_on_hub}
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        if not SMOKE:
+            self.thread.start()
+
+    def sweep(self):
+        """One upload attempt; True if nothing left pending."""
+        new = sorted(
+            p.name for p in self.tsv_dir.glob("*.tsv.gz") if p.name not in self.uploaded
+        )
+        if not new:
+            return True
+        from huggingface_hub import HfApi
+
         try:
-            api.upload_file(
-                path_or_fileobj=str(path),
-                path_in_repo=f"tsv/{path.name}",
+            HfApi().upload_folder(
+                folder_path=str(self.tsv_dir),
+                path_in_repo="tsv",
                 repo_id=REPO,
                 repo_type="dataset",
-                commit_message=f"tsv: {path.name}",
+                allow_patterns=new,
+                commit_message=f"tsv checkpoint: {len(new)} witnesses",
             )
+        except Exception as e:  # noqa: BLE001 — retried next sweep
+            log(f"checkpoint sweep failed ({len(new)} tsvs pending): {e}")
+            return False
+        self.uploaded.update(new)
+        log(f"checkpointed {len(new)} tsvs ({len(self.uploaded)} on hub)")
+        return True
+
+    def _run(self):
+        while not self.stop.wait(self.SWEEP_S):
+            self.sweep()
+
+    def drain(self):
+        """Block until every tsv on disk is on the hub."""
+        if SMOKE:
             return
-        except Exception as e:  # noqa: BLE001
-            log(f"upload {path.name} failed (attempt {attempt + 1}): {e}")
-            time.sleep(30 * (attempt + 1))
-    sys.exit(f"giving up uploading {path.name}")
+        self.stop.set()
+        self.thread.join()
+        while not self.sweep():
+            log(f"retrying final checkpoint sweep in {self.SWEEP_S}s")
+            time.sleep(self.SWEEP_S)
 
 
 # -------------------------------------------------------------- parquet
@@ -752,22 +792,43 @@ def build_parquet(tsv_dir, outdir):
     log(f"parquet: {n_raw:,} raw rows")
 
     con.execute(
+        """CREATE OR REPLACE TABLE pkg_stmts AS
+           SELECT DISTINCT digest AS pkgid, scheme, witness, name, evr, arch, location
+           FROM raw WHERE path IS NULL"""
+    )
+    # a repo's primary.xml can list the same rpm twice (same pkgid,
+    # different location) — the join key must be unique, so keep one
+    # deterministic row per (witness, pkgid) and say what collapsed
+    dupes = con.execute(
+        """SELECT witness, pkgid, list(location ORDER BY location)
+           FROM pkg_stmts GROUP BY witness, pkgid HAVING count(*) > 1"""
+    ).fetchall()
+    if dupes:
+        log(f"parquet: {len(dupes)} (witness, pkgid) pairs stated more than once, e.g.")
+        for w, p, locs in dupes[:5]:
+            log(f"  {w} {p[:16]}…: {locs}")
+    con.execute(
         """CREATE OR REPLACE TABLE packages AS
            SELECT row_number() OVER (ORDER BY pkgid, witness, location) - 1 AS pkg,
                   pkgid, scheme, witness, name, evr, arch, location
-           FROM (SELECT DISTINCT digest AS pkgid, scheme, witness, name, evr, arch, location
-                 FROM raw WHERE path IS NULL)"""
+           FROM (SELECT *, row_number() OVER (PARTITION BY witness, pkgid
+                                              ORDER BY location, name, evr, arch) AS rn
+                 FROM pkg_stmts)
+           WHERE rn = 1"""
     )
     n_pkgs = con.execute("SELECT count(*) FROM packages").fetchone()[0]
 
     con.execute(
         """CREATE OR REPLACE TABLE files AS
-           SELECT r.scheme, r.digest, r.path, p.pkg
+           SELECT DISTINCT r.scheme, r.digest, r.path, p.pkg
            FROM raw r JOIN packages p ON r.witness = p.witness AND r.pkgid = p.pkgid
            WHERE r.path IS NOT NULL"""
     )
     n_files = con.execute("SELECT count(*) FROM files").fetchone()[0]
-    n_file_rows = con.execute("SELECT count(*) FROM raw WHERE path IS NOT NULL").fetchone()[0]
+    n_file_rows = con.execute(
+        """SELECT count(*) FROM (SELECT DISTINCT scheme, digest, path, witness, pkgid
+                                 FROM raw WHERE path IS NOT NULL)"""
+    ).fetchone()[0]
     log(f"parquet: {n_pkgs:,} packages, {n_files:,} file rows")
     if n_files != n_file_rows:
         sys.exit(f"JOIN LOST ROWS: {n_file_rows:,} file rows, {n_files:,} joined")
@@ -1005,22 +1066,29 @@ def main():
             print(f"{w}\t{b}")
         return
 
-    done = hub_done_witnesses()
+    hub_done = hub_done_witnesses()
+    done = set(hub_done)
     done |= {p.name.removesuffix(".tsv.gz") for p in tsv_dir.glob("*.tsv.gz")}
     done |= {p.name.removesuffix(".empty") for p in tsv_dir.glob("*.empty")}
+    sweeper = CheckpointSweeper(tsv_dir, hub_done)
+    sweeper.start()
     failed = harvest_all(repos, tsv_dir, done)
     if failed:
         log(f"FAILED witnesses (relaunch to retry): {sorted(failed)}")
+        sweeper.drain()
         sys.exit(1)
 
     if not SMOKE:
         fetch_hub_tsvs(hub_done_witnesses(), tsv_dir)
 
     outdir = WORK / "out"
+    # the sweeper keeps running through the build — if uploads are
+    # rate-limited, the ~1h parquet phase absorbs the cooldown
     outputs, keys, n_keys = build_parquet(tsv_dir, outdir)
     bloom = outdir / "rpm-files.sha256.bloom"
     build_bloom(keys, n_keys, bloom)
     outputs.append(bloom)
+    sweeper.drain()
 
     if SMOKE:
         log(f"smoke: outputs in {outdir}, skipping upload")
@@ -1028,25 +1096,22 @@ def main():
 
     from huggingface_hub import HfApi
 
-    api = HfApi()
-    for path in outputs:
-        rel = path.relative_to(outdir)
-        for attempt in range(5):
-            try:
-                api.upload_file(
-                    path_or_fileobj=str(path),
-                    path_in_repo=str(rel),
-                    repo_id=REPO,
-                    repo_type="dataset",
-                    commit_message=f"data: {rel}",
-                )
-                log(f"uploaded {rel}")
-                break
-            except Exception as e:  # noqa: BLE001
-                log(f"upload {rel} failed (attempt {attempt + 1}): {e}")
-                time.sleep(30 * (attempt + 1))
-        else:
-            sys.exit(f"giving up on {rel}")
+    rels = sorted(str(p.relative_to(outdir)) for p in outputs)
+    for attempt in range(10):
+        try:
+            HfApi().upload_folder(
+                folder_path=str(outdir),
+                repo_id=REPO,
+                repo_type="dataset",
+                allow_patterns=rels,
+                commit_message=f"data: {len(rels)} files",
+            )
+            break
+        except Exception as e:  # noqa: BLE001
+            log(f"data upload failed (attempt {attempt + 1}): {e}")
+            time.sleep(300)
+    else:
+        sys.exit("giving up on data upload")
     log("ALL UPLOADS DONE")
 
 
