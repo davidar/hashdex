@@ -89,6 +89,43 @@
   footer a { color: var(--dim); }
   progress { width: 100%; height: 4px; margin-top: 0.75rem; accent-color: var(--accent); }
   .hidden { display: none; }
+
+  /* Once a resolution is active the intake collapses to a slim bar so
+     the answer renders above the fold. */
+  body.compact .tagline, body.compact .or, body.compact #drop br,
+  body.compact #drop .droptail { display: none; }
+  body.compact #drop { padding: 0.55rem 1rem; }
+  body.compact #hashform { margin-top: 0.6rem; }
+  body.compact #result { margin-top: 1.5rem; }
+
+  .spin {
+    width: 0.65em; height: 0.65em; border-radius: 50%; flex: none;
+    border: 2px solid var(--line); border-top-color: var(--accent);
+    animation: spin 0.8s linear infinite; display: inline-block;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 0.45rem;
+    border: 1px solid var(--line); border-radius: 999px;
+    padding: 0.12rem 0.7rem; font-size: 0.83rem; background: var(--card);
+    cursor: default;
+  }
+  .chip .mark { font-weight: 600; }
+  .chip .mark.ok { color: var(--ok); }
+  .chip .mark.miss { color: var(--miss); }
+  .chip .mark.warn { color: var(--warn); }
+  .chip.miss { opacity: 0.5; }
+
+  .pendrow {
+    display: flex; gap: 0.6rem; padding: 0.55rem 0.9rem; align-items: center;
+    border-bottom: 1px solid var(--line); font-size: 0.88rem; color: var(--dim);
+  }
+  .pendrow:last-child { border-bottom: none; }
+  .pendrow .name { font-weight: 600; color: var(--fg); min-width: 6.5rem; }
+  .pendrow .mark { min-width: 1.1rem; text-align: center; flex: none; }
+  .pendrow .mark.warn { color: var(--warn); }
 </style>
 </head>
 <body>
@@ -98,7 +135,7 @@
 
   <div id="drop" tabindex="0">
     <strong>Drop a file here</strong> or click to choose one.<br>
-    It is hashed in your browser and never leaves this device.
+    <span class="droptail">It is hashed in your browser and never leaves this device.</span>
     <progress id="hashprog" class="hidden" max="1" value="0"></progress>
   </div>
   <input type="file" id="filein" class="hidden">
@@ -169,6 +206,7 @@ async function main() {
   $("home").addEventListener("click", (e) => {
     e.preventDefault();
     history.replaceState(null, "", location.pathname);
+    document.body.classList.remove("compact");
     $("result").replaceChildren();
     $("status").textContent = "";
     $("hashin").value = "";
@@ -184,6 +222,7 @@ function fromFragment() {
 
 async function resolveFile(file) {
   const token = ++runToken;
+  document.body.classList.add("compact");
   $("status").textContent = `hashing ${file.name} (${fmtBytes(file.size)})…`;
   const prog = $("hashprog");
   prog.classList.remove("hidden");
@@ -235,34 +274,38 @@ async function resolveHash(input, opts = {}) {
 // pasted hash. Fans out over every applicable source in parallel and
 // renders each result as it lands.
 async function resolveCoords(coords, file, token) {
+  document.body.classList.add("compact");
   const result = $("result");
   result.replaceChildren();
   $("status").textContent = "";
-  renderCoords(coords, file);
 
+  // The answer (attributions) renders first and above the fold;
+  // membership filters are compact chips below it; the coordinate
+  // card comes last as reference material.
   const applicable = FILTERS.filter((f) => coords[f.scheme]);
   const srcSection = el("section");
   srcSection.append(el("h2", null, "membership filters"));
-  const srcCard = el("div", "card");
-  srcSection.append(srcCard);
+  const chipWrap = el("div", "chips");
+  srcSection.append(chipWrap);
 
-  // One row per source name; sha1+sha256 hits on the same source
-  // corroborate rather than duplicate (the CLI's dedup rule).
+  // One chip per source name; sha1+sha256 hits on the same source
+  // corroborate rather than duplicate (the CLI's dedup rule). The
+  // source description lives in the tooltip.
   const rows = new Map();
   for (const f of applicable) {
     if (rows.has(f.name)) { rows.get(f.name).schemes.push(f.scheme); continue; }
-    const row = el("div", "srcrow pending");
-    const mark = el("span", "mark", "·");
-    row.append(mark, el("span", "name", f.name), el("span", "what", f.source));
-    srcCard.append(row);
-    rows.set(f.name, { row, mark, schemes: [f.scheme], matched: [], failed: [], settled: 0 });
+    const chip = el("span", "chip");
+    chip.title = f.source;
+    const mark = el("span", "spin");
+    chip.append(mark, el("span", null, f.name));
+    chipWrap.append(chip);
+    rows.set(f.name, { chip, mark, schemes: [f.scheme], matched: [], failed: [], settled: 0 });
   }
 
   const claimSection = el("section");
   claimSection.append(el("h2", null, "attributions"));
   const claimCard = el("div", "card");
-  const claimNote = el("p", "note", "asking the published indexes…");
-  claimSection.append(claimCard, claimNote);
+  claimSection.append(claimCard);
 
   // The parquet datasets the page can point-look-up into come from
   // the wasm registry (hashdex::registry::SPECS) — each is fed the
@@ -294,13 +337,15 @@ async function resolveCoords(coords, file, token) {
     });
   }
 
-  if (applicable.length) result.append(srcSection);
   if (datasets.length) result.append(claimSection);
+  if (applicable.length) result.append(srcSection);
   if (!applicable.length && !datasets.length) {
     result.append(el("p", "note",
       "No published source speaks this hash scheme yet — sha1 and sha256 reach the most."));
+    renderCoords(coords, file);
     return;
   }
+  renderCoords(coords, file);
 
   const probes = applicable.map(async (f) => {
     const r = rows.get(f.name);
@@ -312,33 +357,54 @@ async function resolveCoords(coords, file, token) {
     }
     if (token !== runToken) return;
     if (++r.settled < r.schemes.length) return;
-    r.row.classList.remove("pending");
+    const settle = (glyph, cls) => {
+      const m = el("span", `mark ${cls}`, glyph);
+      r.mark.replaceWith(m);
+      r.mark = m;
+    };
     if (r.matched.length) {
-      r.mark.textContent = "✓";
-      r.mark.className = "mark ok";
-      r.row.querySelector(".what").textContent =
-        r.matched.length > 1 ? `${r.row.querySelector(".what").textContent} — corroborated (${r.matched.join(" + ")})`
-                             : r.row.querySelector(".what").textContent;
+      settle("✓", "ok");
+      if (r.matched.length > 1) r.chip.title += ` — corroborated (${r.matched.join(" + ")})`;
     } else if (r.failed.length === r.schemes.length) {
-      r.mark.textContent = "!";
-      r.mark.className = "mark warn";
-      r.row.querySelector(".what").textContent = "unreachable right now";
-      r.row.title = r.failed.join("\n");
+      settle("!", "warn");
+      r.chip.title = `unreachable right now\n${r.failed.join("\n")}`;
     } else {
-      r.mark.textContent = "–";
-      r.mark.className = "mark miss";
-      r.row.style.opacity = 0.6;
+      settle("–", "miss");
+      r.chip.classList.add("miss");
     }
   });
 
+  // One live status row per dataset: a spinner and an elapsed counter
+  // while its lookup is in flight (cold parquet opens legitimately
+  // take tens of seconds), replaced in place by its claims when they
+  // land. Misses collapse into one summary line at the end.
+  const pendRows = new Map();
+  for (const src of datasets) {
+    const row = el("div", "pendrow");
+    row.append(el("span", "spin"), el("span", "name", src.label), el("span", "wait", "querying…"));
+    claimCard.append(row);
+    pendRows.set(src.label, row);
+  }
+  const started = performance.now();
+  const tick = setInterval(() => {
+    if (token !== runToken) { clearInterval(tick); return; }
+    const s = Math.round((performance.now() - started) / 1000);
+    for (const row of pendRows.values()) {
+      const w = row.querySelector(".wait");
+      if (w) w.textContent = `querying… ${s}s`;
+    }
+  }, 1000);
+
   const known = new Set(Object.entries(coords).map(([s, h]) => `${s}:${h}`));
   const extras = new Set();
-  let claimed = 0, settledLookups = 0;
-  const failures = [];
+  let claimed = 0, settledLookups = 0, failed = 0;
+  const misses = [];
   const lookups = datasets.map(async (src) => {
+    const row = pendRows.get(src.label);
     try {
       const findings = src.findings(JSON.parse(await src.call()));
       if (token !== runToken) return;
+      const divs = [];
       for (const f of findings) {
         if (!f || !f.claims || !f.claims.length) continue;
         claimed++;
@@ -353,26 +419,38 @@ async function resolveCoords(coords, file, token) {
             div.append(a);
           }
           div.append(el("div", "attestor", src.attestor(f)));
-          claimCard.append(div);
+          divs.push(div);
         }
         for (const c of f.coords || []) if (!known.has(c)) extras.add(c);
       }
+      if (divs.length) {
+        row.replaceWith(...divs);
+        pendRows.delete(src.label);
+      } else {
+        misses.push(src.label);
+      }
     } catch (e) {
       if (token !== runToken) return;
-      failures.push(`${src.label} lookup failed: ${e}`);
+      failed++;
+      row.replaceChildren(
+        el("span", "mark warn", "!"),
+        el("span", "name", src.label),
+        el("span", "error", `lookup failed: ${e}`));
     }
     if (token !== runToken || ++settledLookups < datasets.length) return;
-    claimNote.remove();
-    if (failures.length) {
-      for (const msg of failures) claimSection.append(el("p", "error", msg));
+    clearInterval(tick);
+    for (const name of misses) {
+      pendRows.get(name)?.remove();
+      pendRows.delete(name);
     }
-    if (!claimed) {
-      if (!failures.length) {
-        claimSection.append(el("p", "note",
-          `No attribution found in the published indexes (${datasets.map((d) => d.label).join(", ")}).`));
-      }
+    if (!claimed && !failed) {
       claimCard.remove();
-    } else if (extras.size) {
+      claimSection.append(el("p", "note",
+        `No attribution found in the published indexes (${datasets.map((d) => d.label).join(", ")}).`));
+    } else if (misses.length) {
+      claimSection.append(el("p", "note", `no record in ${misses.join(", ")}`));
+    }
+    if (claimed && extras.size) {
       claimSection.append(el("p", "note",
         `same bytes, co-witnessed: ${[...extras].join("  ")}`));
     }
