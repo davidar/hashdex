@@ -18,6 +18,7 @@ pub mod media;
 pub mod parquet_index;
 pub mod range_store;
 pub mod registry;
+pub mod rpm_files;
 pub mod tarballs;
 
 #[cfg(feature = "cli")]

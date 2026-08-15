@@ -50,6 +50,9 @@ tools/release_tarballs.py         # harvest debian/homebrew/guix artifact
 tools/install_media.py            # harvest distro ISO/image checksum docs
                                   #   (32 witnesses, full history; then
                                   #   tools/media_parquet.py → parquet)
+tools/rpm_files.py                # harvest per-file digests + pkg checksums
+                                  #   from RPM repo header ranges (then
+                                  #   tools/rpm_parquet.py → parquet)
 hdx filters fetch     # install CIRCL bloom (~1 GB) into the cache dir
 ```
 

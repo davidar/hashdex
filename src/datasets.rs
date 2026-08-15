@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, Once, OnceLock};
 // registry — the single source of truth the web page also enumerates.
 // This module owns only the local transport: pulled copies on disk.
 pub use crate::registry::{
-    is_dataset, lookup_in, spec, Spec, CENSUS, DEBS, FATCAT, MEDIA, SPECS, TARBALLS,
+    is_dataset, lookup_in, spec, Spec, CENSUS, DEBS, FATCAT, MEDIA, RPM_FILES, SPECS, TARBALLS,
 };
 
 pub fn datasets_dir() -> PathBuf {

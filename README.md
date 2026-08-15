@@ -177,6 +177,18 @@ Some sources are exact witness indexes rather than filter-only:
   `hdx index pull debs` (~100 MB) goes offline. This is what lets
   `hdx recipe` of a Debian install DVD attach fetchable claim URLs to
   93% of the image's bytes, offline — a verified, generalized jigdo.
+- **RPM files** — the fedora bloom's big brother: `tools/rpm_files.py`
+  keeps the header-range trick but records the full witness rows —
+  every installed file's sha256 with its path, package, and the rpm's
+  own checksum (so both `/usr/bin/bash` *and* `bash-….rpm` resolve),
+  published as page-indexed parquet
+  ([rpm-files](https://huggingface.co/datasets/david-ar/rpm-files)).
+  Claim URLs point at the rpm in the repo. Scan answers become
+  "Fedora 44 ships these bytes as /usr/bin/bash in
+  bash-5.3.9-3.fc44.x86_64.rpm" instead of a bare filter tag.
+  `hdx filters fetch rpm-files` routes scans to it; `hdx index pull
+  rpm-files` (~1 GB) goes offline. New repos (EPEL, CentOS Stream,
+  openSUSE, …) are one harvester list entry each.
 - **Install media** — the images themselves. Every distro publishes
   checksum documents beside its releases (SHA256SUMS and friends) and
   nobody aggregates them, so `tools/install_media.py` does: 32

@@ -486,6 +486,53 @@ fn install_media_dataset(env: &TestEnv, rows: &[MediaRow]) {
     std::fs::write(root.join("revision"), "test-fixture").unwrap();
 }
 
+/// A fixture rpm-files dataset: one sha256-keyed table mixing file
+/// rows (path + pkgid present) and package rows (both null).
+/// Row: (digest, witness, name, evr, path, pkgid, location).
+type RpmRow<'a> = (
+    &'a str,
+    &'a str,
+    &'a str,
+    &'a str,
+    Option<&'a str>,
+    Option<&'a str>,
+    &'a str,
+);
+
+fn install_rpm_files_dataset(env: &TestEnv, rows: &[RpmRow]) {
+    let root = env.root.join("cache/hashdex/datasets/rpm-files");
+    let mut rows: Vec<&RpmRow> = rows.iter().collect();
+    rows.sort_by_key(|r| r.0);
+    let opt = |vals: Vec<Option<&str>>| {
+        Col::opt_str(vals.into_iter().map(|v| v.map(str::to_string)).collect())
+    };
+    write_parquet(
+        &root.join("data/rpm-sha256.parquet"),
+        "message rpm {
+            required binary digest (UTF8);
+            optional binary witness (UTF8);
+            optional binary name (UTF8);
+            optional binary evr (UTF8);
+            optional binary arch (UTF8);
+            optional binary path (UTF8);
+            optional binary pkgid (UTF8);
+            optional binary location (UTF8);
+        }",
+        vec![
+            Col::req_str(rows.iter().map(|r| r.0.to_string()).collect()),
+            opt(rows.iter().map(|r| Some(r.1)).collect()),
+            opt(rows.iter().map(|r| Some(r.2)).collect()),
+            opt(rows.iter().map(|r| Some(r.3)).collect()),
+            opt(rows.iter().map(|_| Some("x86_64")).collect()),
+            opt(rows.iter().map(|r| r.4).collect()),
+            opt(rows.iter().map(|r| r.5).collect()),
+            opt(rows.iter().map(|r| Some(r.6)).collect()),
+        ],
+    );
+    // Written last, same as a real pull: this marks the copy complete.
+    std::fs::write(root.join("revision"), "test-fixture").unwrap();
+}
+
 enum Col {
     Str(Vec<Option<String>>, bool),
     I64(Vec<Option<i64>>),
@@ -614,6 +661,61 @@ fn install_media_resolves_by_every_key_scheme() {
         "{text}"
     );
     assert!(text.contains("releases.ubuntu.com"), "{text}");
+}
+
+#[test]
+fn rpm_files_resolves_file_and_package_rows() {
+    let env = TestEnv::new("rpmfiles");
+    let file256 = "aa".repeat(32);
+    let pkg256 = "bb".repeat(32);
+    let rpm_url = "https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Everything/x86_64/os/Packages/b/bash-5.3.9-3.fc44.x86_64.rpm";
+    install_rpm_files_dataset(
+        &env,
+        &[
+            // a file the rpm ships (two packages legitimately carrying
+            // the same content stack as separate witness rows)
+            (
+                &file256,
+                "fedora-44",
+                "bash",
+                "5.3.9-3.fc44",
+                Some("/usr/bin/bash"),
+                Some(&pkg256),
+                rpm_url,
+            ),
+            // the rpm artifact itself, keyed by its pkgid
+            (
+                &pkg256,
+                "fedora-44",
+                "bash",
+                "5.3.9-3.fc44",
+                None,
+                None,
+                rpm_url,
+            ),
+        ],
+    );
+
+    let out = env.hdx(&["--offline", &file256]);
+    assert!(out.status.success());
+    let text = stdout(&out);
+    assert!(
+        text.contains(
+            "Fedora 44 ships these bytes as /usr/bin/bash in bash-5.3.9-3.fc44.x86_64.rpm"
+        ),
+        "no file statement:\n{text}"
+    );
+    assert!(text.contains(rpm_url), "no claim URL:\n{text}");
+
+    let out = env.hdx(&["--offline", &pkg256]);
+    assert!(out.status.success());
+    let text = stdout(&out);
+    assert!(
+        text.contains(
+            "Fedora 44 packages these bytes as bash-5.3.9-3.fc44.x86_64.rpm (bash 5.3.9-3.fc44)"
+        ),
+        "no package statement:\n{text}"
+    );
 }
 
 #[test]

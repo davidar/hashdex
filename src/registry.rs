@@ -98,7 +98,16 @@ pub static MEDIA: Spec = Spec {
     start_paths: crate::media::start_paths,
 };
 
-pub static SPECS: &[&Spec] = &[&FATCAT, &TARBALLS, &CENSUS, &DEBS, &MEDIA];
+pub static RPM_FILES: Spec = Spec {
+    name: "rpm-files",
+    repo: "david-ar/rpm-files",
+    approx_size: "~1 GB",
+    suffix: 8 << 20,
+    supports: crate::rpm_files::supports,
+    start_paths: crate::rpm_files::start_paths,
+};
+
+pub static SPECS: &[&Spec] = &[&FATCAT, &TARBALLS, &CENSUS, &DEBS, &MEDIA, &RPM_FILES];
 
 pub fn spec(name: &str) -> Option<&'static Spec> {
     SPECS.iter().find(|s| s.name == name).copied()
@@ -124,6 +133,7 @@ where
         "ia-census" => crate::census::lookup_with(open, coord),
         "debs" => crate::debs::lookup_with(open, coord),
         "install-media" => crate::media::lookup_with(open, coord),
+        "rpm-files" => crate::rpm_files::lookup_with(open, coord),
         _ => Ok(Vec::new()),
     }
 }
@@ -252,6 +262,14 @@ pub static BLOOMS: &[BloomEntry] = &[
         urls: &["https://huggingface.co/datasets/david-ar/install-media/resolve/main/install-media.sha256.bloom"],
         size: "887 KiB",
         source: "distro install-media checksum documents (32 witnesses)",
+        huge: false,
+    },
+    BloomEntry {
+        name: "rpm-files",
+        scheme: "sha256",
+        urls: &["https://huggingface.co/datasets/david-ar/rpm-files/resolve/main/rpm-files.sha256.bloom"],
+        size: "~16 MiB",
+        source: "RPM repo metadata: per-file digests + package checksums",
         huge: false,
     },
     BloomEntry {
