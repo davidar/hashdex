@@ -2694,3 +2694,103 @@ fn recipe_jigdo_projection_round_trips() {
         "spliced image differs from the original tar"
     );
 }
+
+/// erofs images in every on-disk shape mkfs.erofs 1.9.2 produces from
+/// one source tree, walked to byte-verified member digests. Fixtures
+/// (tests/data/erofs/*.erofs.gz) were built in a fedora:44 container:
+///
+///   mkfs.erofs -b4096                                  flat.erofs tree
+///   mkfs.erofs -b4096 -zlzma -C65536 -Eall-fragments,dedupe lzma.erofs tree
+///   mkfs.erofs -b4096 -zlz4                            lz4.erofs  tree
+///   mkfs.erofs -b4096 -zlzma -Eztailpacking            ztail.erofs tree
+///
+/// covering flat/inline layouts, MicroLZMA all-fragments with a packed
+/// inode + big pclusters + compacted-2B indexes (the Fedora live-media
+/// shape), LZ4 with 0-padding, and ztailpacking. The tree holds a
+/// symlink (must not become a member), a hardlink (two members, same
+/// bytes), and a nested tar (must descend). Expected digests are
+/// sha256sum of the source tree, recorded when the fixtures were made.
+#[test]
+fn scan_descends_erofs_images() {
+    let truth: &[(&str, &str)] = &[
+        (
+            "book.txt",
+            "f6351f5ead9a700e34275480b3856ea738122a7c57bdeb744a631251c069587a",
+        ),
+        (
+            "data/rand.bin",
+            "7854633f4266aa19ce3d7b3c3ea0d58f0a4ebceb3f5618374d6eba63e4d9e702",
+        ),
+        (
+            "data/zeros.bin",
+            "c35020473aed1b4642cd726cad727b63fff2824ad68cedd7ffb73c7cbd890479",
+        ),
+        (
+            "hello.txt",
+            "bb41e76f3d49ab7c6cc614444cb221c27268be91164796372d307a44ad041f81",
+        ),
+        (
+            "sub/deep/nested.tar",
+            "8ed41d38b9fa75982df65a194ac8a02a54c20fd9f3ae5a3d01531c443c142410",
+        ),
+        (
+            "sub/hardbook.txt",
+            "f6351f5ead9a700e34275480b3856ea738122a7c57bdeb744a631251c069587a",
+        ),
+    ];
+    let env = TestEnv::new("erofs");
+    for img in ["flat", "lzma", "lz4", "ztail"] {
+        let gz = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/data/erofs/{img}.erofs.gz")),
+        )
+        .unwrap();
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&gz[..]), &mut raw).unwrap();
+        let path = env.write(&format!("{img}.erofs"), &raw);
+        let out = env.hdx(&["--offline", "scan", "--json", path.to_str().unwrap()]);
+        assert!(out.status.success(), "{img}: stderr: {}", stderr(&out));
+        let mut got: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut container_kind = String::new();
+        let mut nested_tar_children = 0;
+        for line in stdout(&out).lines() {
+            let Ok(o) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let p = o["path"].as_str().unwrap_or_default();
+            match p.split_once('!') {
+                None if p.ends_with(".erofs") => {
+                    container_kind = o["kind"].as_str().unwrap_or_default().to_string();
+                    assert!(o["note"].is_null(), "{img}: container note: {}", o["note"]);
+                }
+                Some((_, rel)) if o["depth"] == 1 => {
+                    let sha = o["coords"]
+                        .as_array()
+                        .and_then(|c| {
+                            c.iter()
+                                .filter_map(|v| v.as_str())
+                                .find_map(|s| s.strip_prefix("sha256:"))
+                        })
+                        .unwrap_or_default()
+                        .to_string();
+                    got.insert(rel.to_string(), sha);
+                }
+                Some((_, rel)) if rel.starts_with("sub/deep/nested.tar!") => {
+                    nested_tar_children += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(container_kind, "erofs", "{img}: container kind");
+        for (rel, want) in truth {
+            assert_eq!(
+                got.get(*rel).map(String::as_str),
+                Some(*want),
+                "{img}: digest of {rel}"
+            );
+        }
+        // Exactly the six regular files — the symlink never becomes a
+        // member — and the tar inside descended.
+        assert_eq!(got.len(), truth.len(), "{img}: member set {:?}", got.keys());
+        assert_eq!(nested_tar_children, 2, "{img}: nested tar members");
+    }
+}

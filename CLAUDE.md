@@ -24,7 +24,8 @@ hdx scan <paths>      # scan against filters + attribute what it can
                       #   census; --online consents to third-party APIs).
                       #   A named container FILE gets the hashoscope:
                       #   full recursive descent (tar/zip/deb/rpm/cpio/
-                      #   squashfs/iso — 7z detected, not descended).
+                      #   squashfs/erofs/iso — 7z detected, not
+                      #   descended).
                       #   Unknown containers under dir roots descend
                       #   too (demand-driven; default = in-place
                       #   formats only, --deep adds compressed

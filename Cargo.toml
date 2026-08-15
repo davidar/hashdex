@@ -41,6 +41,10 @@ cli = [
     "dep:bzip2",
     "dep:tempfile",
     "dep:liblzma",
+    # erofs needs raw MicroLZMA (liblzma-sys binds it; same build as
+    # liblzma above) and lz4 block decompression.
+    "dep:liblzma-sys",
+    "dep:lz4_flex",
     "dep:backhand",
 ]
 
@@ -71,6 +75,8 @@ zstd = { version = "0.13.3", optional = true }
 bzip2 = { version = "0.6.1", optional = true }
 tempfile = { version = "3.27.0", optional = true }
 liblzma = { version = "0.4.8", optional = true }
+liblzma-sys = { version = "0.4.8", optional = true }
+lz4_flex = { version = "0.12", default-features = false, features = ["std", "safe-decode"], optional = true }
 backhand = { version = "0.25.1", default-features = false, features = ["gzip", "zstd", "xz"], optional = true }
 
 [dev-dependencies]

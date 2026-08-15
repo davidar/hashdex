@@ -21,8 +21,9 @@ pub(crate) const MAX_DEPTH: usize = 16;
 /// Beyond this many members the descent stops (reported honestly).
 pub(crate) const MAX_MEMBERS: usize = 1_000_000;
 /// Bytes sniffed to decide whether a member is itself a container
-/// (512 = one tar block, enough for every magic we look at).
-const HEAD: usize = 512;
+/// (2048 covers every magic we look at head-on: one tar block would
+/// do for most, but erofs puts its superblock at byte 1024).
+const HEAD: usize = 2048;
 /// A squashfs reader's fragment cache grows without bound (every
 /// decompressed fragment block is kept forever), so after this many
 /// bytes of fragment-backed files the reader is rebuilt — dropping
@@ -65,6 +66,7 @@ pub(crate) enum Kind {
     Rpm,
     Cpio,
     SquashFs,
+    Erofs,
     SevenZ,
     Iso,
     Plain,
@@ -86,6 +88,7 @@ impl Kind {
             Kind::Rpm,
             Kind::Cpio,
             Kind::SquashFs,
+            Kind::Erofs,
             Kind::SevenZ,
             Kind::Iso,
         ] {
@@ -112,6 +115,7 @@ impl Kind {
             Kind::Rpm => "rpm",
             Kind::Cpio => "cpio",
             Kind::SquashFs => "squashfs",
+            Kind::Erofs => "erofs",
             Kind::SevenZ => "7z",
             Kind::Iso => "iso9660",
             Kind::Plain => "file",
@@ -142,6 +146,11 @@ fn sniff(head: &[u8], name: &str) -> Kind {
         Kind::SquashFs
     } else if head.starts_with(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]) {
         Kind::SevenZ
+    } else if head.len() >= 1028 && head[1024..1028] == [0xe2, 0xe1, 0xf5, 0xe0] {
+        // erofs superblock magic at byte 1024 (HEAD covers it; checked
+        // after every offset-0 magic — the first KiB is a free-form
+        // boot area, but a real offset-0 magic wins).
+        Kind::Erofs
     } else if name.to_ascii_lowercase().ends_with(".iso") {
         // iso9660's magic sits at byte 32769 — out of head range, so
         // for streams the extension stands in (seekable members get
@@ -235,9 +244,9 @@ pub enum Descent {
     None,
     /// Enter only containers readable in place — no spooling, no
     /// decompression of the container stream itself: tar, zip, ar,
-    /// cpio, squashfs, iso. A `.tar.gz` stays closed (the wrapper
-    /// would need decompressing); an rpm too (its payload is always
-    /// behind compression). Scan's default.
+    /// cpio, squashfs, erofs, iso. A `.tar.gz` stays closed (the
+    /// wrapper would need decompressing); an rpm too (its payload is
+    /// always behind compression). Scan's default.
     Cheap,
     /// Enter everything peek's walk understands, compressed wrappers
     /// included (scan --deep, and every explicitly named container).
@@ -252,7 +261,13 @@ impl Descent {
             Descent::Full => true,
             Descent::Cheap => matches!(
                 kind,
-                Kind::Tar | Kind::Zip | Kind::Ar | Kind::Cpio | Kind::SquashFs | Kind::Iso
+                Kind::Tar
+                    | Kind::Zip
+                    | Kind::Ar
+                    | Kind::Cpio
+                    | Kind::SquashFs
+                    | Kind::Erofs
+                    | Kind::Iso
             ),
         }
     }
@@ -517,8 +532,8 @@ impl Walk<'_, '_> {
         // Seek-needing containers fed by a stream have to spool; the
         // spool then descends exactly like a ranged member, so their
         // children can be views over the spool.
-        let spools =
-            matches!(kind, Kind::SquashFs | Kind::Iso) || (kind == Kind::Zip && ctx.conservative);
+        let spools = matches!(kind, Kind::SquashFs | Kind::Erofs | Kind::Iso)
+            || (kind == Kind::Zip && ctx.conservative);
         if !too_deep && enter && spools {
             let mut src = std::io::Cursor::new(head).chain(r);
             let view = match spool_stream(&mut src, |b| feed.push(pool, b)) {
@@ -739,7 +754,9 @@ impl Walk<'_, '_> {
                 note = walk_note;
                 drain(&mut *tee);
             }
-            Kind::SquashFs | Kind::Iso => unreachable!("handled by the spool path above"),
+            Kind::SquashFs | Kind::Erofs | Kind::Iso => {
+                unreachable!("handled by the spool path above")
+            }
         }
 
         Ok((children, note))
@@ -970,6 +987,17 @@ impl Walk<'_, '_> {
                 self.squashfs_ranged(view, path, depth, own, &mut children, ctx),
                 "squashfs parse failed",
             )?,
+            Kind::Erofs => {
+                let mut enote = None;
+                let r = self.erofs_ranged(view, path, depth, own, &mut children, &mut enote, ctx);
+                match swallow(r, "erofs parse failed")? {
+                    Some(err) => Some(match enote {
+                        Some(n) => format!("{err}; {n}"),
+                        None => err,
+                    }),
+                    None => enote,
+                }
+            }
             Kind::Iso => swallow(
                 self.iso_ranged(view, path, depth, own, &mut children, ctx),
                 "iso9660 parse failed",
@@ -1487,6 +1515,158 @@ impl Walk<'_, '_> {
                 return Ok(());
             }
         }
+    }
+
+    // ---------------------------------------------------------- erofs
+
+    /// erofs, via the hand-rolled reader in `crate::erofs`. Flat
+    /// (uncompressed) files become ranged children — views of the
+    /// image, so recipes can splice them. Compressed files stream
+    /// through per-file decompression; their member slots are
+    /// allocated in directory order (slot order = sibling order) but
+    /// run sorted by data position, so files sharing a packed-inode
+    /// pcluster (`-Eall-fragments` images) decode it once. Per-file
+    /// failures and skips become container notes, never silent drops.
+    #[allow(clippy::too_many_arguments)]
+    fn erofs_ranged(
+        &self,
+        view: &View,
+        path: &str,
+        depth: usize,
+        own: usize,
+        children: &mut usize,
+        note_out: &mut Option<String>,
+        ctx: &mut Ctx,
+    ) -> Result<()> {
+        let fs = crate::erofs::Erofs::open(view.clone())?;
+        let (files, mut notes) = fs.files()?;
+
+        struct Item {
+            meta: crate::peek_pool::MetaClose,
+            feed: Feed,
+            path: String,
+            leaf: String,
+            size: u64,
+            plan: crate::erofs::ZPlan,
+            order: (u8, u64),
+        }
+        let mut pending: Vec<Option<Item>> = Vec::new();
+        let run = || -> Result<()> {
+            for f in files {
+                let child_path = format!("{path}!{}", f.path);
+                match f.plan {
+                    crate::erofs::Plan::Ranged(exts) => {
+                        *children += 1;
+                        let sub = view.slice(&exts);
+                        self.process_ranged(sub, child_path, &f.leaf, depth + 1, Some(own), ctx)?;
+                    }
+                    crate::erofs::Plan::Streamed(zp) => {
+                        if self.capped(ctx) {
+                            break;
+                        }
+                        *children += 1;
+                        let (meta, feed) = self.pool.member(
+                            child_path.clone(),
+                            depth + 1,
+                            Some(own),
+                            Some(f.size),
+                            None,
+                            None,
+                        );
+                        pending.push(Some(Item {
+                            meta,
+                            feed,
+                            path: child_path,
+                            leaf: f.leaf,
+                            size: f.size,
+                            plan: zp,
+                            order: f.order,
+                        }));
+                    }
+                }
+            }
+            let mut order: Vec<usize> = (0..pending.len()).collect();
+            order.sort_by_key(|&i| pending[i].as_ref().expect("untaken").order);
+            for i in order {
+                let item = pending[i].take().expect("item taken once");
+                let slot = item.meta.slot();
+                let mut wctx = Ctx {
+                    conservative: ctx.conservative,
+                    slots: vec![slot],
+                    count: ctx.count.clone(),
+                    descent: ctx.descent,
+                    base_depth: ctx.base_depth,
+                };
+                let mut reader = fs.zreader(&item.plan);
+                let r = self.run_member(
+                    &mut reader,
+                    item.meta,
+                    item.feed,
+                    item.path.clone(),
+                    &item.leaf,
+                    depth + 1,
+                    &mut wctx,
+                );
+                let r = match r {
+                    // A compressed erofs member is re-derivable on its
+                    // own — a misbehaved zip inside it costs one file
+                    // redone, not the whole image.
+                    Err(e) if is_retry(&e) && !ctx.conservative => {
+                        eprintln!("note: {e}; re-reading {} with spooling", item.path);
+                        self.dead.lock().unwrap().append(&mut wctx.slots);
+                        wctx.conservative = true;
+                        let (meta, feed) = self.pool.member(
+                            item.path.clone(),
+                            depth + 1,
+                            Some(own),
+                            Some(item.size),
+                            Some(slot),
+                            None,
+                        );
+                        wctx.slots.push(meta.slot());
+                        let mut again = fs.zreader(&item.plan);
+                        self.run_member(
+                            &mut again,
+                            meta,
+                            feed,
+                            item.path.clone(),
+                            &item.leaf,
+                            depth + 1,
+                            &mut wctx,
+                        )
+                    }
+                    r => r,
+                };
+                ctx.slots.append(&mut wctx.slots);
+                if let Err(e) = r {
+                    // A genuine decode failure costs a container note;
+                    // the member sealed either way (squashfs precedent:
+                    // one bad file must not abort the image walk).
+                    notes.push(format!("{}: {e:#}", item.path));
+                }
+            }
+            Ok(())
+        };
+        let res = run();
+        // Items never run (an error abandoned the walk): close their
+        // handles so the pool can drain, and drop them from the table.
+        for cell in &mut pending {
+            if let Some(item) = cell.take() {
+                *children -= 1;
+                self.dead.lock().unwrap().push(item.meta.slot());
+                item.feed.close(self.pool);
+                item.meta.close(self.pool, Kind::Plain.label(), 0, None);
+            }
+        }
+        if !notes.is_empty() {
+            let shown = notes.iter().take(4).cloned().collect::<Vec<_>>().join("; ");
+            *note_out = Some(if notes.len() > 4 {
+                format!("{shown}; … and {} more member notes", notes.len() - 4)
+            } else {
+                shown
+            });
+        }
+        res
     }
 
     // ------------------------------------------------------------ iso
