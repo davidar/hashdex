@@ -89,7 +89,16 @@ pub static DEBS: Spec = Spec {
     start_paths: crate::debs::start_paths,
 };
 
-pub static SPECS: &[&Spec] = &[&FATCAT, &TARBALLS, &CENSUS, &DEBS];
+pub static MEDIA: Spec = Spec {
+    name: "install-media",
+    repo: "david-ar/install-media",
+    approx_size: "~40 MB",
+    suffix: 1 << 20,
+    supports: crate::media::supports,
+    start_paths: crate::media::start_paths,
+};
+
+pub static SPECS: &[&Spec] = &[&FATCAT, &TARBALLS, &CENSUS, &DEBS, &MEDIA];
 
 pub fn spec(name: &str) -> Option<&'static Spec> {
     SPECS.iter().find(|s| s.name == name).copied()
@@ -114,6 +123,7 @@ where
         "tarballs" => crate::tarballs::lookup_with(open, coord),
         "ia-census" => crate::census::lookup_with(open, coord),
         "debs" => crate::debs::lookup_with(open, coord),
+        "install-media" => crate::media::lookup_with(open, coord),
         _ => Ok(Vec::new()),
     }
 }

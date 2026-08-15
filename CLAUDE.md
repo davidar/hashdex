@@ -46,6 +46,9 @@ hdx index pull tarballs           # local copy of a published dataset
                                   #   is remote range reads by default)
 tools/release_tarballs.py         # harvest debian/homebrew/guix artifact
                                   #   hashes (dump → published parquet)
+tools/install_media.py            # harvest distro ISO/image checksum docs
+                                  #   (32 witnesses, full history; then
+                                  #   tools/media_parquet.py → parquet)
 hdx filters fetch     # install CIRCL bloom (~1 GB) into the cache dir
 ```
 

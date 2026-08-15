@@ -144,7 +144,7 @@ Filter hits are probabilistic (default p = 10⁻⁴) and per-source, so a
 scan line tells you *which* index knows the file. Confirm anything
 important with `hdx <hash>`.
 
-One source is an exact witness index rather than filter-only:
+Some sources are exact witness indexes rather than filter-only:
 
 - **Release tarballs** — every content-level source above indexes what
   is *inside* an archive, never the archive itself (Software Heritage
@@ -166,8 +166,10 @@ One source is an exact witness index rather than filter-only:
 - **Binary packages (.deb)** — the same idea for the packages install
   media and mirrors actually ship: `tools/deb_packages.py` harvests
   the apt `Packages` indexes of Debian (trixie + sid + security,
-  udeb sub-indexes included), Ubuntu (noble, jammy), and Kali into
-  ~524k witness rows with pool-path claim URLs, published as
+  udeb sub-indexes included), every Ubuntu release ever (supported
+  suites on archive.ubuntu.com, all EOL codenames back to warty via
+  old-releases — claim URLs stay live for dead releases), and Kali
+  into ~2.9M witness rows with pool-path claim URLs, published as
   page-indexed parquet
   ([deb-packages](https://huggingface.co/datasets/david-ar/deb-packages)).
   Ubuntu rows carry md5+sha1+sha256+sha512 — 4-hash single-witness
@@ -175,6 +177,22 @@ One source is an exact witness index rather than filter-only:
   `hdx index pull debs` (~100 MB) goes offline. This is what lets
   `hdx recipe` of a Debian install DVD attach fetchable claim URLs to
   93% of the image's bytes, offline — a verified, generalized jigdo.
+- **Install media** — the images themselves. Every distro publishes
+  checksum documents beside its releases (SHA256SUMS and friends) and
+  nobody aggregates them, so `tools/install_media.py` does: 32
+  witnesses — Ubuntu (+ every cdimage flavor), the full Debian
+  cdimage archive, every Fedora release back to Fedora Core 1, Arch,
+  Alma/Rocky/CentOS Stream, Mint, Kali, openSUSE, Alpine, the BSDs,
+  Void, Qubes, Raspberry Pi OS, EndeavourOS, OpenWrt, Proxmox, Zorin
+  — ~383k rows, full history wherever the tree enumerates it. The
+  claim URL is the checksum document itself. Modern rows are
+  sha256/sha512; pre-2007 media (Warty's MD5SUMS, Fedora Core's
+  SHA1SUM) resolve through the weak "consistent with" tier, and
+  Qubes' `.DIGESTS` documents co-state all four schemes in one
+  witness row. Drop an ISO on `hdx` and it answers "Fedora releases
+  these bytes as Fedora-Workstation-Live-44-1.7.x86_64.iso" with the
+  CHECKSUM URL — offline with `hdx index pull install-media`
+  (~25 MB).
 
 ## Build
 

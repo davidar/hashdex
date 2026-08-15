@@ -419,6 +419,73 @@ fn install_fatcat_dataset(env: &TestEnv, rows: &[(&str, &str, &str)]) {
     std::fs::write(root.join("revision"), "test-fixture").unwrap();
 }
 
+/// A fixture install-media dataset: one table per key scheme, each
+/// row co-stating whatever digests its (single) source document did.
+/// Row: (witness, sha256, sha512, sha1, md5, filename, loc).
+type MediaRow<'a> = (
+    &'a str,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+    &'a str,
+    &'a str,
+);
+
+fn media_key<'a>(r: &MediaRow<'a>, scheme: &str) -> Option<&'a str> {
+    match scheme {
+        "sha256" => r.1,
+        "sha512" => r.2,
+        "sha1" => r.3,
+        _ => r.4,
+    }
+}
+
+fn install_media_dataset(env: &TestEnv, rows: &[MediaRow]) {
+    let root = env.root.join("cache/hashdex/datasets/install-media");
+    let key_of = media_key;
+    for scheme in ["sha256", "sha512", "sha1", "md5"] {
+        let mut keyed: Vec<&MediaRow> = rows
+            .iter()
+            .filter(|r| key_of(r, scheme).is_some())
+            .collect();
+        if keyed.is_empty() {
+            continue;
+        }
+        keyed.sort_by_key(|r| key_of(r, scheme).unwrap());
+        let opt = |vals: Vec<Option<&str>>| {
+            Col::opt_str(vals.into_iter().map(|v| v.map(str::to_string)).collect())
+        };
+        write_parquet(
+            &root.join(format!("data/media-{scheme}.parquet")),
+            "message media {
+                optional binary witness (UTF8);
+                optional binary sha256 (UTF8);
+                optional binary sha512 (UTF8);
+                optional binary sha1 (UTF8);
+                optional binary md5 (UTF8);
+                optional binary name (UTF8);
+                optional binary version (UTF8);
+                optional binary filename (UTF8);
+                optional binary loc (UTF8);
+            }",
+            vec![
+                opt(keyed.iter().map(|r| Some(r.0)).collect()),
+                opt(keyed.iter().map(|r| r.1).collect()),
+                opt(keyed.iter().map(|r| r.2).collect()),
+                opt(keyed.iter().map(|r| r.3).collect()),
+                opt(keyed.iter().map(|r| r.4).collect()),
+                opt(keyed.iter().map(|_| None).collect()),
+                opt(keyed.iter().map(|_| None).collect()),
+                opt(keyed.iter().map(|r| Some(r.5)).collect()),
+                opt(keyed.iter().map(|r| Some(r.6)).collect()),
+            ],
+        );
+    }
+    // Written last, same as a real pull: this marks the copy complete.
+    std::fs::write(root.join("revision"), "test-fixture").unwrap();
+}
+
 enum Col {
     Str(Vec<Option<String>>, bool),
     I64(Vec<Option<i64>>),
@@ -477,6 +544,76 @@ fn write_parquet(path: &Path, schema: &str, cols: Vec<Col>) {
     }
     rg.close().unwrap();
     writer.close().unwrap();
+}
+
+#[test]
+fn install_media_resolves_by_every_key_scheme() {
+    let env = TestEnv::new("media");
+    let (a256, a512, a1, amd5) = (
+        "aa".repeat(32),
+        "ab".repeat(64),
+        "ac".repeat(20),
+        "ad".repeat(16),
+    );
+    let b256 = "bb".repeat(32);
+    install_media_dataset(
+        &env,
+        &[
+            // one document co-stating four schemes (Qubes .DIGESTS)
+            (
+                "qubes",
+                Some(a256.as_str()),
+                Some(a512.as_str()),
+                Some(a1.as_str()),
+                Some(amd5.as_str()),
+                "Qubes-R4.3.1-x86_64.iso",
+                "https://ftp.qubes-os.org/iso/Qubes-R4.3.1-x86_64.iso.DIGESTS",
+            ),
+            // a plain sha256-only statement
+            (
+                "ubuntu",
+                Some(b256.as_str()),
+                None,
+                None,
+                None,
+                "ubuntu-26.04-desktop-amd64.iso",
+                "https://releases.ubuntu.com/26.04/SHA256SUMS",
+            ),
+        ],
+    );
+
+    // every scheme the row co-stated is a working lookup key, and the
+    // answer carries the claim URL plus the co-witnessed coordinates
+    for hash in [
+        a256.clone(),
+        format!("sha512:{a512}"),
+        format!("sha1:{a1}"),
+        format!("md5:{amd5}"),
+    ] {
+        let out = env.hdx(&["--offline", &hash]);
+        assert!(out.status.success(), "offline miss for {hash}");
+        let text = stdout(&out);
+        assert!(
+            text.contains("Qubes OS releases these bytes as Qubes-R4.3.1-x86_64.iso"),
+            "no statement for {hash}:\n{text}"
+        );
+        assert!(
+            text.contains("ftp.qubes-os.org"),
+            "no claim URL for {hash}:\n{text}"
+        );
+        assert!(
+            text.contains(&a256),
+            "sha256 crosswalk missing for {hash}:\n{text}"
+        );
+    }
+
+    let out = env.hdx(&["--offline", &b256]);
+    let text = stdout(&out);
+    assert!(
+        text.contains("Ubuntu releases these bytes as ubuntu-26.04-desktop-amd64.iso"),
+        "{text}"
+    );
+    assert!(text.contains("releases.ubuntu.com"), "{text}");
 }
 
 #[test]

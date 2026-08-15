@@ -1369,6 +1369,7 @@ fn backend_for_filter(name: &str) -> Option<&'static str> {
         "tarballs" => Some("tarballs"),
         "ia-census" => Some("ia-census"),
         "debs" => Some("debs"),
+        "install-media" => Some("install-media"),
         "circl" => Some(crate::backends::circl::NAME),
         "depsdev" => Some(crate::backends::depsdev::NAME),
         "rekor" => Some(crate::backends::rekor::NAME),

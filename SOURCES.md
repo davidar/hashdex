@@ -254,11 +254,26 @@ document URL is the claim URL by construction). Verified endpoints:
   **Zorin**: purdue mirror `zorin-iso/<ver>/SHA256SUMS.txt`.
   **CentOS Stream**: `mirror.stream.centos.org/<N>-stream/BaseOS/
   <arch>/iso/*.SHA256SUM` sidecars.
-- Sidecar-per-file tail (deferred): openSUSE `.sha256` sidecars,
-  NixOS channels, Tails, KDE neon, haiku/ghostbsd/solus/openindiana;
-  SourceForge-hosted checksums (redirect chains); sha512-only
-  witnesses (EndeavourOS, Manjaro, Gentoo `.DIGESTS`, Mageia);
-  md5/sha1-only (Slackware, NetBSD, Trisquel) → weak tier.
+- Harvested 2026-08-15 (32 witnesses, ~383k rows, all schemes):
+  the majors above plus ubuntu cdimage flavor trees, the full
+  debian cdimage archive (~150 point releases + -live), fedora
+  archives + Fedora Core (SHA1SUM era) + secondary arches, openSUSE
+  Leap history + Tumbleweed `.sha256` sidecars, Alpine release
+  sidecars, **Qubes `.DIGESTS`** (one document co-stating
+  md5+sha1+sha256+sha512 — genuine 4-hash single-witness rows),
+  Raspberry Pi OS dated image trees, NetBSD per-release SHA512
+  (🪤 use origin `ftp.netbsd.org` — `cdn.netbsd.org`'s Fastly edge
+  emits chunked framing that breaks python HTTP stacks and flakes
+  curl), EndeavourOS `.sha512sum` sidecars (mirror tree), OpenWrt
+  `targets/<t>/<sub>/sha256sums` all releases (🪤 those documents
+  also list `packages/*.ipk` — package tier, filtered to top-level
+  images).
+- Still deferred: haiku (`cdn.haiku-os.org` unreachable 2026-08-15),
+  Manjaro (CDN, no crawlable checksum tree), Gentoo (🪤 `.DIGESTS`
+  mixes BLAKE2B and SHA512 at the same 128-hex width — needs a
+  section-aware parser), Mageia, NixOS channels, Tails, KDE neon,
+  ghostbsd/solus/openindiana, SourceForge-hosted checksums (redirect
+  chains), md5/sha1-only Slackware/Trisquel.
 - Related finds: 203 MSDN Windows-ISO sha1s on the ArchiveTeam wiki
   (`Microsoft` page); **Redump DATs** (`redump.org/downloads/`, 60
   systems, crc32+md5+sha1 per disc image, no sha256, no artifact
