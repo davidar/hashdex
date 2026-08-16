@@ -54,6 +54,17 @@ enum Seg {
         at: u64,
         root_off: u64,
     },
+    /// Bytes stored verbatim in the container that ARE a member's
+    /// bytes — an uncompressed erofs pcluster. The member's node lives
+    /// in the sources table: it has no extents of its own, so it can't
+    /// be a `Child`.
+    Tabled {
+        idx: usize,
+        from: u64,
+        len: u64,
+        at: u64,
+        root_off: u64,
+    },
     /// One stored pcluster of an erofs image, rebuilt by re-encoding
     /// the member bytes it holds; `pc` indexes `Plan::pclusters`.
     PCluster {
@@ -76,13 +87,19 @@ enum Seg {
 impl Seg {
     fn at(&self) -> u64 {
         match self {
-            Seg::Child { at, .. } | Seg::PCluster { at, .. } | Seg::Gap { at, .. } => *at,
+            Seg::Child { at, .. }
+            | Seg::Tabled { at, .. }
+            | Seg::PCluster { at, .. }
+            | Seg::Gap { at, .. } => *at,
         }
     }
 
     fn len(&self) -> u64 {
         match self {
-            Seg::Child { len, .. } | Seg::PCluster { len, .. } | Seg::Gap { len, .. } => *len,
+            Seg::Child { len, .. }
+            | Seg::Tabled { len, .. }
+            | Seg::PCluster { len, .. }
+            | Seg::Gap { len, .. } => *len,
         }
     }
 }
@@ -406,6 +423,7 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
                         fetchable += len;
                     }
                 }
+                Seg::Tabled { len, .. } => fetchable += len,
                 // A pcluster's stored bytes are neither: they are
                 // accounted for through the node's own inputs, in
                 // packed space, below.
@@ -525,7 +543,7 @@ fn pcluster_note(st: &PcStats) -> String {
     let mut why: Vec<String> = Vec::new();
     for (n, what) in [
         (st.uncovered, "no fetchable members"),
-        (st.other_alg, "not MicroLZMA"),
+        (st.not_verbatim, "stored, but not verbatim"),
         (st.mismatch, "re-encoded differently"),
         (st.margin, "input margin too small"),
     ] {
@@ -535,10 +553,13 @@ fn pcluster_note(st: &PcStats) -> String {
     }
     let mut note = format!(
         "\nerofs: {}/{} pcluster{} rebuilt byte-exact",
-        st.verified,
+        st.verified + st.verbatim,
         st.total,
         s(st.total)
     );
+    if st.verbatim > 0 {
+        note.push_str(&format!(" ({} stored uncompressed, spliced)", st.verbatim));
+    }
     if !why.is_empty() {
         note.push_str(&format!(" ({} — literal)", why.join(", ")));
     }
@@ -891,9 +912,26 @@ impl LiteralSpool {
 }
 
 /// What one pass over a packed stream produced: the pcluster nodes
-/// that came back byte-exact (by pcluster index), and the members
-/// whose packed bytes did not hash to their digest.
-type Swept = (Vec<(usize, PClusterNode)>, std::collections::HashSet<usize>);
+/// that came back byte-exact (by pcluster index), the verbatim
+/// splices, and the members whose packed bytes did not hash to their
+/// digest.
+type Swept = (
+    Vec<(usize, PClusterNode)>,
+    Vec<Seg>,
+    std::collections::HashSet<usize>,
+);
+
+/// What the sweep should do with a pcluster.
+#[derive(Clone, Copy, PartialEq)]
+enum Elig {
+    /// Nothing fetchable is packed in it: its bytes stay literal.
+    No,
+    /// Compressed: re-encode it and compare, then emit a node.
+    Encode,
+    /// Stored uncompressed: if the stored bytes really are the member
+    /// bytes, splice them straight in — no encoder, no node.
+    Verbatim,
+}
 
 /// A member whose bytes ARE a span of the packed stream.
 #[derive(Clone)]
@@ -919,8 +957,12 @@ struct PcStats {
     /// No fetchable member covers enough of the span for a node to
     /// shrink the residue.
     uncovered: usize,
-    /// Not MicroLZMA (plain, interlaced, or another algorithm).
-    other_alg: usize,
+    /// Stored uncompressed and spliced straight in — no encoder, no
+    /// node, just member bytes at their place in the image.
+    verbatim: usize,
+    /// Not compressed, but not a verbatim copy either (rotated in
+    /// place, or an algorithm with no encoder here).
+    not_verbatim: usize,
     /// Re-encoded to different bytes: a compressor this hdx can't
     /// reproduce. These stay literal, like an unreproducible gzip.
     mismatch: usize,
@@ -937,7 +979,8 @@ impl PcStats {
         self.total += o.total;
         self.verified += o.verified;
         self.uncovered += o.uncovered;
-        self.other_alg += o.other_alg;
+        self.verbatim += o.verbatim;
+        self.not_verbatim += o.not_verbatim;
         self.mismatch += o.mismatch;
         self.margin += o.margin;
         self.unverified_members += o.unverified_members;
@@ -1023,8 +1066,7 @@ impl Planner<'_> {
             });
         }
         if covers.is_empty() {
-            stats.uncovered = pcs.iter().filter(|p| p.lzma).count();
-            stats.other_alg = stats.total - stats.uncovered;
+            stats.uncovered = pcs.len();
             return Ok(stats);
         }
         // Dedupe (and hardlinks) put two members on the same bytes:
@@ -1036,20 +1078,27 @@ impl Planner<'_> {
         // trades `plen` stored bytes for whatever of its input span no
         // member covers.
         let union = merge_spans(&covers);
-        let mut eligible = vec![false; pcs.len()];
+        let mut eligible = vec![Elig::No; pcs.len()];
         for (k, pc) in pcs.iter().enumerate() {
-            if !pc.lzma {
-                stats.other_alg += 1;
+            let covered = overlap(&union, pc.la, pc.llen);
+            if covered == 0 {
+                stats.uncovered += 1;
                 continue;
             }
-            let covered = overlap(&union, pc.la, pc.llen);
-            if covered > 0 && pc.llen - covered < pc.plen {
-                eligible[k] = true;
+            if pc.lzma {
+                // A node earns its place only by shrinking the residue.
+                if pc.llen - covered < pc.plen {
+                    eligible[k] = Elig::Encode;
+                } else {
+                    stats.uncovered += 1;
+                }
             } else {
-                stats.uncovered += 1;
+                // Stored uncompressed: no node needed at all, if the
+                // bytes really are verbatim (checked in the sweep).
+                eligible[k] = Elig::Verbatim;
             }
         }
-        if !eligible.iter().any(|&e| e) {
+        if eligible.iter().all(|e| *e == Elig::No) {
             return Ok(stats);
         }
         // Covers touching an eligible pcluster are the ones worth
@@ -1059,11 +1108,11 @@ impl Planner<'_> {
             .filter(|c| {
                 pcs.iter()
                     .zip(&eligible)
-                    .any(|(pc, &e)| e && c.pstart < pc.la + pc.llen && pc.la < c.end())
+                    .any(|(pc, e)| *e != Elig::No && c.pstart < pc.la + pc.llen && pc.la < c.end())
             })
             .cloned()
             .collect();
-        let mut need = eligible.clone();
+        let mut need: Vec<bool> = eligible.iter().map(|e| *e != Elig::No).collect();
         for (k, pc) in pcs.iter().enumerate() {
             if need[k] {
                 continue;
@@ -1077,7 +1126,7 @@ impl Planner<'_> {
             Some(s) => s,
             None => LiteralSpool::new()?,
         };
-        let (nodes, failed) = self.sweep_pclusters(
+        let (nodes, mut segs, failed) = self.sweep_pclusters(
             &fs, &view, &pcs, &eligible, &need, &used, &cfg, &spool, &mut stats,
         )?;
         plan.literals = Some(spool);
@@ -1097,13 +1146,21 @@ impl Planner<'_> {
                 kept.push((k, node));
             }
         }
-        if kept.is_empty() {
+        segs.retain(|s| match s {
+            Seg::Tabled { idx, .. } => !failed.contains(idx),
+            _ => true,
+        });
+        if kept.is_empty() && segs.is_empty() {
             return Ok(stats);
+        }
+        for s in &segs {
+            if let Seg::Tabled { idx, .. } = s {
+                plan.tabled.insert(*idx);
+            }
         }
 
         // Nodes take their place in the image's splice; the members
         // they slice move into the sources table.
-        let mut segs: Vec<Seg> = Vec::new();
         for (k, node) in kept {
             for input in &node.inputs {
                 if let PcInput::Member { idx, .. } = input {
@@ -1140,8 +1197,9 @@ impl Planner<'_> {
 
     /// One pass over the packed stream: decode what's needed, verify
     /// that each covering member's bytes really are the packed bytes
-    /// claimed for it, and hand every eligible pcluster to the encoder
-    /// pool. Returns the nodes that came back byte-exact, and the
+    /// claimed for it, hand every compressed pcluster to the encoder
+    /// pool, and splice the uncompressed ones straight in. Returns the
+    /// nodes that came back byte-exact, the verbatim splices, and the
     /// members whose digests didn't check out.
     #[allow(clippy::too_many_arguments)]
     fn sweep_pclusters(
@@ -1149,7 +1207,7 @@ impl Planner<'_> {
         fs: &crate::erofs::Erofs,
         view: &View,
         pcs: &[crate::erofs::PCluster],
-        eligible: &[bool],
+        eligible: &[Elig],
         need: &[bool],
         used: &[Cover],
         cfg: &crate::erofs::LzmaCfg,
@@ -1169,7 +1227,10 @@ impl Planner<'_> {
         let failed: Mutex<std::collections::HashSet<usize>> = Mutex::new(Default::default());
         let preset = Mutex::new(None::<u32>);
         let done = AtomicUsize::new(0);
-        let want = eligible.iter().filter(|&&e| e).count();
+        let want = eligible.iter().filter(|e| **e == Elig::Encode).count();
+        let mut segs: Vec<Seg> = Vec::new();
+        let mut verbatim = 0usize;
+        let mut not_verbatim = 0usize;
 
         let mut result: Result<()> = Ok(());
         std::thread::scope(|scope| {
@@ -1259,22 +1320,38 @@ impl Planner<'_> {
                         false
                     });
 
-                    if eligible[k] {
-                        let mut input = bytes;
-                        if k + 1 < pcs.len() {
-                            let next = fs.decode_pcluster(&pcs[k + 1])?;
-                            let take = next.len().min(ENCODE_MARGIN);
-                            input.extend_from_slice(&next[..take]);
-                            cur = Some(next);
+                    match eligible[k] {
+                        Elig::No => {}
+                        Elig::Encode => {
+                            let mut input = bytes;
+                            if k + 1 < pcs.len() {
+                                let next = fs.decode_pcluster(&pcs[k + 1])?;
+                                let take = next.len().min(ENCODE_MARGIN);
+                                input.extend_from_slice(&next[..take]);
+                                cur = Some(next);
+                            }
+                            let stored = read_stored(view, pc)?;
+                            if tx.send(Job { k, input, stored }).is_err() {
+                                break;
+                            }
                         }
-                        let mut stored = vec![0u8; pc.plen as usize];
-                        ensure!(
-                            view.read_full_at(&mut stored, pc.pa)? == stored.len(),
-                            "truncated pcluster at {}",
-                            pc.pa
-                        );
-                        if tx.send(Job { k, input, stored }).is_err() {
-                            break;
+                        Elig::Verbatim => {
+                            // "Uncompressed" is a claim about the bytes,
+                            // so it gets checked like any other: the
+                            // stored bytes must BE the logical ones.
+                            let stored = read_stored(view, pc)?;
+                            if stored.len() >= bytes.len() && stored[..bytes.len()] == bytes[..] {
+                                let n = segs.len();
+                                splice_verbatim(pc, bytes.len() as u64, used, &mut segs);
+                                if segs.len() > n {
+                                    verbatim += 1;
+                                }
+                            } else {
+                                // Stored some other way after all —
+                                // rotated in place, or an algorithm
+                                // this reader decodes but can't emit.
+                                not_verbatim += 1;
+                            }
                         }
                     }
                 }
@@ -1292,11 +1369,56 @@ impl Planner<'_> {
         result?;
         let (ok, mismatch, margin) = counts.into_inner().unwrap();
         stats.verified = ok;
+        stats.verbatim = verbatim;
+        stats.not_verbatim = not_verbatim;
         stats.mismatch += mismatch;
         stats.margin += margin;
         let failed = failed.into_inner().unwrap();
         stats.unverified_members += failed.len();
-        Ok((out.into_inner().unwrap(), failed))
+        Ok((out.into_inner().unwrap(), segs, failed))
+    }
+}
+
+/// The bytes a pcluster occupies in the image.
+fn read_stored(view: &View, pc: &crate::erofs::PCluster) -> Result<Vec<u8>> {
+    let mut stored = vec![0u8; pc.plen as usize];
+    ensure!(
+        view.read_full_at(&mut stored, pc.pa)? == stored.len(),
+        "truncated pcluster at {}",
+        pc.pa
+    );
+    Ok(stored)
+}
+
+/// Place the members packed into an uncompressed pcluster directly in
+/// the image's splice: its stored bytes ARE their bytes (just checked),
+/// so no builder is involved at all. Runs shorter than an inline
+/// literal aren't worth a slice, and anything uncovered simply stays a
+/// gap for the normal literal machinery.
+fn splice_verbatim(pc: &crate::erofs::PCluster, llen: u64, covers: &[Cover], segs: &mut Vec<Seg>) {
+    let end = pc.la + llen;
+    let mut pos = pc.la;
+    for cv in covers {
+        if cv.end() <= pos {
+            continue;
+        }
+        if cv.pstart >= end {
+            break;
+        }
+        let (lo, hi) = (cv.pstart.max(pos), cv.end().min(end));
+        if lo >= hi {
+            continue;
+        }
+        if hi - lo > INLINE_MAX {
+            segs.push(Seg::Tabled {
+                idx: cv.idx,
+                from: lo - cv.pstart,
+                len: hi - lo,
+                at: 0, // assigned when merged into the image's build
+                root_off: pc.pa + (lo - pc.la),
+            });
+        }
+        pos = hi;
     }
 }
 
@@ -1480,11 +1602,14 @@ fn splice_in(i: usize, plan: &mut Plan, extra: Vec<Seg>, _view: &View) -> Result
         // Segments arrive in the image's own space: a pcluster's `pa`
         // is an offset into the image, which maps to this build's
         // logical space through its runs.
-        let Seg::PCluster {
-            at, root_off, len, ..
-        } = &mut s
-        else {
-            continue;
+        let (at, root_off, len) = match &mut s {
+            Seg::PCluster {
+                at, root_off, len, ..
+            }
+            | Seg::Tabled {
+                at, root_off, len, ..
+            } => (at, root_off, len),
+            _ => continue,
         };
         let Some(&(rlog, roff, _)) = build
             .runs
@@ -1842,6 +1967,13 @@ fn verify_build(i: usize, plan: &mut Plan, vs: &mut VerifyState) -> Result<()> {
     let mut buf = vec![0u8; 1 << 20];
     for seg in &mut segs {
         match seg {
+            Seg::Tabled { len, root_off, .. } => {
+                // The bytes are the container's own; that they are also
+                // the member's was proven at planning time, against the
+                // member's digest.
+                hash_root_range(&view, *root_off, *len, &mut buf, |b| h.update(b))
+                    .with_context(|| format!("verbatim range at {root_off}"))?;
+            }
             Seg::Child {
                 idx, root_off, len, ..
             } => {
@@ -2139,6 +2271,14 @@ fn node_json(
                             node
                         } else {
                             json!({ "slice": { "of": node, "from": from, "len": len } })
+                        }
+                    }
+                    Seg::Tabled { idx, from, len, .. } => {
+                        let source = node_of[idx];
+                        if *from == 0 && *len == members[*idx].size {
+                            json!({ "source": source })
+                        } else {
+                            json!({ "slice": { "source": source, "from": from, "len": len } })
                         }
                     }
                     Seg::PCluster { pc, .. } => {

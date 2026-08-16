@@ -178,6 +178,22 @@ pub(crate) struct PCluster {
     partial: bool,
 }
 
+impl PCluster {
+    /// How this pcluster is stored. Only the referee needs the name;
+    /// the planner cares whether it is MicroLZMA or verbatim.
+    #[cfg(test)]
+    pub(crate) fn alg_name(&self) -> &'static str {
+        match self.alg {
+            Alg::Shifted => "plain",
+            Alg::Interlaced { .. } => "interlaced",
+            Alg::Lz4 => "lz4",
+            Alg::Lzma => "lzma",
+            Alg::Deflate => "deflate",
+            Alg::Zstd => "zstd",
+        }
+    }
+}
+
 /// What mkfs recorded about the image's MicroLZMA compressor. The
 /// dictionary size is read, never assumed: it is an encoder input, and
 /// a wrong one produces different bytes.
@@ -1589,6 +1605,157 @@ mod tests {
             candidate.resize(stored.len(), 0);
             assert_eq!(candidate, stored, "pcluster at {} differs", pc.pa);
             assert_eq!(consumed, pc.llen, "pcluster at {} span", pc.pa);
+        }
+    }
+
+    /// REFEREE, on a real image (ignored by default — it needs one):
+    ///
+    ///   HDX_EROFS_IMAGE=/path/to/squashfs.img cargo test --release \
+    ///     --lib erofs_referee -- --ignored --nocapture
+    ///
+    /// Re-encodes every MicroLZMA pcluster of the packed inode exactly
+    /// as `plan_erofs` would — same preset, same dictionary from the
+    /// image, same ladder of input lengths — and reports how many come
+    /// back byte-identical. That rate is what recipes of a real live
+    /// image stand on. `HDX_EROFS_LIMIT` bounds the sweep.
+    #[test]
+    #[ignore]
+    fn erofs_referee_reencodes_a_real_image() {
+        let Ok(path) = std::env::var("HDX_EROFS_IMAGE") else {
+            eprintln!("HDX_EROFS_IMAGE unset — nothing to referee");
+            return;
+        };
+        let fs = Erofs::open(View::of_file(std::path::Path::new(&path)).unwrap()).unwrap();
+        let raw = View::of_file(std::path::Path::new(&path)).unwrap();
+        let cfg = fs.lzma_cfg().unwrap().expect("image states no lzma config");
+        let (pcs, size) = fs.packed_pclusters().unwrap();
+        let limit = std::env::var("HDX_EROFS_LIMIT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(usize::MAX);
+        let n = pcs.len().min(limit);
+        println!(
+            "{path}: {} pclusters, {size} bytes packed, dict_size {} format {}",
+            pcs.len(),
+            cfg.dict_size,
+            cfg.format
+        );
+        let mut by_alg: HashMap<&str, (usize, u64, u64)> = HashMap::new();
+        for pc in &pcs {
+            let e = by_alg.entry(pc.alg_name()).or_default();
+            e.0 += 1;
+            e.1 += pc.plen;
+            e.2 += pc.llen;
+        }
+        let mut algs: Vec<_> = by_alg.into_iter().collect();
+        algs.sort_by_key(|(_, v)| std::cmp::Reverse(v.1));
+        for (alg, (n, stored, logical)) in algs {
+            println!("  {alg}: {n} pclusters, {stored} stored, {logical} logical");
+        }
+        let start = std::time::Instant::now();
+        // (fed-length bucket that reproduced) → count; `None` = none did.
+        let tally: Mutex<HashMap<Option<usize>, usize>> = Mutex::new(HashMap::new());
+        let examples: Mutex<Vec<(u64, usize)>> = Mutex::new(Vec::new());
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>, Vec<u8>)>(16);
+        let rx = Mutex::new(rx);
+        let threads = std::thread::available_parallelism()
+            .map(|t| t.get())
+            .unwrap_or(4);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| loop {
+                    let Ok((k, input, stored)) = rx.lock().unwrap().recv() else {
+                        return;
+                    };
+                    let pc = &pcs[k];
+                    let pad = pcluster_padding(&stored);
+                    let cap = stored.len() - pad;
+                    let mut hit = None;
+                    for (bucket, fed) in [
+                        pc.llen as usize,
+                        pc.llen as usize + (1 << 12),
+                        pc.llen as usize + (1 << 16),
+                        pc.llen as usize + (1 << 20),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(b, f)| (b, f.min(input.len())))
+                    {
+                        let (out, _) = microlzma_encode(&input[..fed], cap, 6, cfg.dict_size)
+                            .expect("encoder");
+                        let mut cand = vec![0u8; pad];
+                        cand.extend_from_slice(&out);
+                        cand.resize(stored.len(), 0);
+                        if cand == stored {
+                            hit = Some(bucket);
+                            break;
+                        }
+                    }
+                    if hit.is_none() {
+                        let mut ex = examples.lock().unwrap();
+                        if ex.len() < 5 {
+                            ex.push((pc.pa, pc.plen as usize));
+                        }
+                    }
+                    *tally.lock().unwrap().entry(hit).or_default() += 1;
+                });
+            }
+            let mut cur: Option<Vec<u8>> = None;
+            for k in 0..n {
+                let pc = &pcs[k];
+                let bytes = match cur.take() {
+                    Some(b) => b,
+                    None => fs.decode_pcluster(pc).unwrap(),
+                };
+                if !pc.lzma {
+                    continue;
+                }
+                let mut input = bytes;
+                if k + 1 < pcs.len() {
+                    let next = fs.decode_pcluster(&pcs[k + 1]).unwrap();
+                    let take = next.len().min(1 << 20);
+                    input.extend_from_slice(&next[..take]);
+                    cur = Some(next);
+                }
+                let mut stored = vec![0u8; pc.plen as usize];
+                raw.read_full_at(&mut stored, pc.pa).unwrap();
+                tx.send((k, input, stored)).unwrap();
+            }
+            drop(tx);
+        });
+        let tally = tally.into_inner().unwrap();
+        let ok: usize = tally
+            .iter()
+            .filter(|(k, _)| k.is_some())
+            .map(|(_, v)| v)
+            .sum();
+        let total: usize = tally.values().sum();
+        println!(
+            "re-encoded {ok}/{total} byte-exact in {:.1?} (peak RSS {})",
+            start.elapsed(),
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap_or_default()
+                .lines()
+                .find(|l| l.starts_with("VmHWM"))
+                .unwrap_or("VmHWM: ?")
+                .trim()
+        );
+        for (bucket, label) in [
+            (0, "exact span"),
+            (1, "+4 KiB"),
+            (2, "+64 KiB"),
+            (3, "+1 MiB"),
+        ] {
+            if let Some(c) = tally.get(&Some(bucket)) {
+                println!("  reproduced with {label}: {c}");
+            }
+        }
+        if let Some(c) = tally.get(&None) {
+            println!("  no input length reproduced: {c}");
+            println!(
+                "  examples (pa, plen): {:?}",
+                examples.into_inner().unwrap()
+            );
         }
     }
 

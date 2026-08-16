@@ -3084,11 +3084,20 @@ fn frag_tree() -> Vec<(&'static str, Vec<u8>)> {
             .as_bytes(),
         );
     }
+    // Incompressible: mkfs stores its pclusters raw, which a recipe
+    // splices rather than re-encodes.
+    let mut noise = Vec::with_capacity(16_000);
+    let mut x: u64 = 3;
+    while noise.len() < 16_000 {
+        x = (x.wrapping_mul(1103515245).wrapping_add(12345)) % (1 << 31);
+        noise.push(((x >> 16) & 0xff) as u8);
+    }
     let dup = prose(7, 8000);
     let mut tree: Vec<(&'static str, Vec<u8>)> = vec![
         ("book.txt", book),
         ("dup/a.bin", dup.clone()),
         ("dup/b.bin", dup),
+        ("noise.bin", noise),
         ("span.bin", prose(1, 100_000)),
         ("tiny.txt", b"tiny fixture file\n".to_vec()),
     ];
@@ -3134,11 +3143,12 @@ fn erofs_fixture(env: &TestEnv, name: &str) -> PathBuf {
 ///   mkfs.erofs -b4096 -zlzma -C8192 \
 ///              -Eall-fragments,fragdedupe,dedupe frag.erofs tree
 ///
-/// which yields 3 stored pclusters over a 134,013-byte packed stream:
+/// which yields 5 stored pclusters over a 150,013-byte packed stream:
 /// several files share one pcluster, `span.bin` and the deduplicated
-/// `dup/{a,b}.bin` pair straddle pcluster boundaries, and `tiny.txt`
-/// (18 bytes) sits below the identity floor, so it can only be
-/// literal.
+/// `dup/{a,b}.bin` pair straddle pcluster boundaries, `noise.bin` is
+/// incompressible so mkfs stores one pcluster raw (spliced, not
+/// re-encoded), and `tiny.txt` (18 bytes) sits below the identity
+/// floor, so it can only be literal.
 #[test]
 fn erofs_recipe_rebuilds_pclusters_from_rpms() {
     let env = TestEnv::new("recipe-erofs");
@@ -3176,7 +3186,7 @@ fn erofs_recipe_rebuilds_pclusters_from_rpms() {
     assert!(out.status.success(), "mint failed: {}", stderr(&out));
     let text = stdout(&out);
     assert!(
-        text.contains("erofs: 3/3 pclusters rebuilt byte-exact"),
+        text.contains("erofs: 5/5 pclusters rebuilt byte-exact"),
         "summary: {text}"
     );
     assert!(text.contains("verified byte-exact"), "summary: {text}");
@@ -3191,7 +3201,11 @@ fn erofs_recipe_rebuilds_pclusters_from_rpms() {
         .iter()
         .filter(|i| i["build"]["builder"] == "microlzma@0")
         .collect();
-    assert_eq!(nodes.len(), 3, "one node per pcluster: {inputs:?}");
+    assert_eq!(
+        nodes.len(),
+        4,
+        "one node per compressed pcluster: {inputs:?}"
+    );
     let params = &nodes[0]["build"]["params"];
     assert_eq!(params["preset"], 6);
     assert!(
@@ -3214,21 +3228,48 @@ fn erofs_recipe_rebuilds_pclusters_from_rpms() {
         .position(|s| s["extract"]["path"] == "/opt/frag/span.bin")
         .expect("span.bin has an extract node in the sources table");
     assert_eq!(sources[span_idx]["extract"]["archive"]["source"], 0);
-    let slices: Vec<&serde_json::Value> = nodes
+    let mut slices: Vec<(u64, u64)> = nodes
         .iter()
         .flat_map(|n| n["build"]["inputs"].as_array().unwrap())
         .filter(|i| i["slice"]["source"] == span_idx || i["source"] == span_idx)
+        .map(|i| {
+            (
+                i["slice"]["from"].as_u64().unwrap_or(0),
+                i["slice"]["len"].as_u64().unwrap_or(100_000),
+            )
+        })
         .collect();
-    assert_eq!(
-        slices.len(),
-        2,
-        "span.bin straddles two pclusters: {slices:?}"
+    assert!(
+        slices.len() > 1,
+        "span.bin straddles pcluster boundaries: {slices:?}"
+    );
+    slices.sort();
+    let mut at = 0;
+    for (from, len) in &slices {
+        assert_eq!(*from, at, "span.bin's slices tile it exactly: {slices:?}");
+        at += len;
+    }
+    assert_eq!(at, 100_000, "span.bin's slices tile it exactly: {slices:?}");
+
+    // noise.bin is incompressible, so mkfs stored its pcluster raw:
+    // those bytes are spliced straight out of the sources table, with
+    // no builder in between.
+    let noise_idx = sources
+        .iter()
+        .position(|s| s["extract"]["path"] == "/opt/frag/noise.bin")
+        .expect("noise.bin has an extract node");
+    assert!(
+        inputs
+            .iter()
+            .any(|i| i["slice"]["source"] == noise_idx || i["source"] == noise_idx),
+        "a verbatim pcluster splices noise.bin directly: {inputs:?}"
     );
 
     // tiny.txt is below the identity floor: its bytes stay literal,
     // and so do the image's own metadata blocks.
     let cov = &doc["coverage"];
-    assert_eq!(cov["fetchable_bytes"].as_u64().unwrap(), 133_995);
+    // Every packed byte but tiny.txt's 18 (150,013 - 18).
+    assert_eq!(cov["fetchable_bytes"].as_u64().unwrap(), 149_995);
     assert!(
         (4_096..4_200).contains(&cov["residue_bytes"].as_u64().unwrap()),
         "residue is the superblock, inodes and tiny.txt: {cov}"
