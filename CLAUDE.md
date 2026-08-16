@@ -42,7 +42,10 @@ hdx recipe FILE       # reconstruction manifest: verified splice of
                       #   + microlzma@0 nodes for erofs pclusters
                       #   (re-encoded and byte-compared at mint; the
                       #   packed inode's files become their inputs,
-                      #   uncompressed pclusters splice directly)
+                      #   uncompressed pclusters splice directly —
+                      #   including the packed TAIL of a file too big
+                      #   to pack whole, spliced as a range of that
+                      #   file once the file reads back to its digest)
                       #   + zstd@0 nodes (level ladder, framed the way
                       #   the CLI frames it — the compressed half of a
                       #   boot image; a member a recipe can rebuild is

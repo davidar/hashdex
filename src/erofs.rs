@@ -148,8 +148,11 @@ impl Plan {
     /// file's bytes live, when they live there contiguously — the
     /// `-Eall-fragments` shape (Fedora live media). Files with
     /// pclusters of their own, or with only a packed tail, return
-    /// None: recipes can only attribute a fragment span to a member
-    /// when the member IS that span.
+    /// None; their packed spans come back from [`Plan::packed_extents`]
+    /// instead, and a recipe attributes those to a RANGE of the member
+    /// — which it may only do once the whole file has been read back
+    /// and hashed, because the packed bytes alone prove nothing about
+    /// a file the sweep never sees whole.
     pub(crate) fn packed_whole(&self) -> Option<u64> {
         let Plan::Streamed(zp) = self else {
             return None;
@@ -173,6 +176,29 @@ impl Plan {
             Plan::Streamed(zp) => Some(zp),
             Plan::Ranged(_) => None,
         }
+    }
+
+    /// The spans of this file that live in the packed inode: the
+    /// `llen` bytes at `la` of the file are the packed stream's bytes
+    /// at `off`. A file mkfs packed whole has one span covering it;
+    /// a file too big to pack keeps pclusters of its own and packs
+    /// only what is left over — its tail, which is packed bytes of a
+    /// member exactly like anyone else's.
+    pub(crate) fn packed_extents(&self) -> Vec<PackedExt> {
+        let Plan::Streamed(zp) = self else {
+            return Vec::new();
+        };
+        zp.exts
+            .iter()
+            .filter_map(|e| match &e.src {
+                ZSrc::Packed { off } => Some(PackedExt {
+                    la: e.la,
+                    llen: e.llen,
+                    off: *off,
+                }),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The file's OWN stored pclusters, `la` in its own logical space
@@ -202,6 +228,14 @@ impl Plan {
             })
             .collect()
     }
+}
+
+/// One span of a file that lives in the packed inode: the `llen`
+/// bytes at `la` of the FILE are the packed stream's bytes at `off`.
+pub(crate) struct PackedExt {
+    pub(crate) la: u64,
+    pub(crate) llen: u64,
+    pub(crate) off: u64,
 }
 
 /// One stored pcluster of the packed inode: `plen` bytes at image
@@ -1810,6 +1844,81 @@ mod tests {
                 "  examples (pa, plen): {:?}",
                 examples.into_inner().unwrap()
             );
+        }
+    }
+
+    /// REFEREE (ignored): the packed bytes of files that are NOT
+    /// wholly packed — a file with pclusters of its own can still have
+    /// its tail in the packed inode. Those tails are what the packed
+    /// sweep splices once the file has been read back whole; this
+    /// counts them, and how many of their files keep no pcluster of
+    /// their own (the ones pass two would otherwise never read).
+    /// Writes `path\tla\tllen\toff` per tail extent to `HDX_TAILS_OUT`
+    /// for joining against a recipe's witnessed members.
+    ///
+    ///   HDX_EROFS_IMAGE=… HDX_TAILS_OUT=/tmp/tails.tsv \
+    ///     cargo test --release --lib packed_tails -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn packed_tails_of_a_real_image() {
+        let Ok(path) = std::env::var("HDX_EROFS_IMAGE") else {
+            eprintln!("HDX_EROFS_IMAGE unset");
+            return;
+        };
+        let fs = Erofs::open(View::of_file(std::path::Path::new(&path)).unwrap()).unwrap();
+        let (files, _) = fs.files().unwrap();
+        let mut out = String::new();
+        let (mut n, mut bytes) = (0usize, 0u64);
+        let (mut whole_n, mut whole_b) = (0usize, 0u64);
+        let mut tails_only = 0usize;
+        for f in &files {
+            if f.plan.packed_whole().is_some() {
+                whole_n += 1;
+                whole_b += f.size;
+                continue;
+            }
+            let exts = f.plan.packed_extents();
+            if !exts.is_empty() && f.plan.own_pclusters().is_empty() {
+                tails_only += 1;
+            }
+            for e in &exts {
+                n += 1;
+                bytes += e.llen;
+                out.push_str(&format!("{}\t{}\t{}\t{}\n", f.path, e.la, e.llen, e.off));
+            }
+        }
+        println!(
+            "{whole_n} files wholly packed ({whole_b} bytes); \
+             {n} packed TAIL extents on partly-packed files ({bytes} bytes), \
+             {tails_only} of those files keep no pcluster of their own"
+        );
+        if let Ok(dest) = std::env::var("HDX_TAILS_OUT") {
+            std::fs::write(dest, out).unwrap();
+        }
+        // The whole-packed spans (today's covers) and the packed
+        // pcluster table, so the arithmetic can be redone outside.
+        if let Ok(dest) = std::env::var("HDX_WHOLE_OUT") {
+            let mut w = String::new();
+            for f in &files {
+                if let Some(off) = f.plan.packed_whole() {
+                    w.push_str(&format!("{}\t{off}\t{}\n", f.path, f.size));
+                }
+            }
+            std::fs::write(dest, w).unwrap();
+        }
+        if let Ok(dest) = std::env::var("HDX_PCS_OUT") {
+            let (pcs, _) = fs.packed_pclusters().unwrap();
+            let mut p = String::new();
+            for pc in &pcs {
+                p.push_str(&format!(
+                    "{}\t{}\t{}\t{}\n",
+                    pc.la,
+                    pc.llen,
+                    pc.plen,
+                    u8::from(pc.lzma)
+                ));
+            }
+            std::fs::write(dest, p).unwrap();
         }
     }
 

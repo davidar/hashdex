@@ -618,6 +618,7 @@ fn pcluster_note(st: &PcStats) -> String {
     for (n, what) in [
         (st.uncovered, "no fetchable members"),
         (st.not_verbatim, "stored, but not verbatim"),
+        (st.thin, "covered too thinly to slice"),
         (st.mismatch, "re-encoded differently"),
         (st.margin, "input margin too small"),
     ] {
@@ -1321,9 +1322,20 @@ impl LiteralSpool {
     }
 }
 
-/// What planning one own-pcluster file produced: its nodes with the
-/// image offsets they occupy, its verbatim splices, and a tally.
-type PlannedFile = (Vec<(PClusterNode, u64)>, Vec<Seg>, PcStats);
+/// What planning one partly-packed file produced.
+struct PlannedFile {
+    idx: usize,
+    /// Its pcluster nodes, with the image offsets they occupy.
+    nodes: Vec<(PClusterNode, u64)>,
+    /// Its verbatim splices.
+    segs: Vec<Seg>,
+    stats: PcStats,
+    /// Whether the member's digest came back from the read-back —
+    /// which proves not just the nodes above but the file's packed
+    /// TAIL, since the reader that produced those bytes is the same
+    /// mapping the packed pass then splices.
+    proved: bool,
+}
 
 /// What one pass over a packed stream produced: the pcluster nodes
 /// that came back byte-exact (by pcluster index), the verbatim
@@ -1347,12 +1359,22 @@ enum Elig {
     Verbatim,
 }
 
-/// A member whose bytes ARE a span of the packed stream.
+/// A span of the packed stream that IS a range of a member: `len`
+/// bytes from `from` of member `idx` sit at `pstart`. A file mkfs
+/// packed whole covers itself from 0; a file too big to pack covers
+/// only its tail, from wherever its own pclusters left off.
 #[derive(Clone)]
 struct Cover {
     idx: usize,
+    from: u64,
     pstart: u64,
     len: u64,
+    /// Whether the claim is already proven. The sweep can prove a
+    /// whole-file cover on its own — the packed bytes hash to the
+    /// member's digest as they stream past — but a tail is a range of
+    /// a file the sweep never sees whole, so it arrives proven by the
+    /// read-back in [`Planner::plan_own_pclusters`] or not at all.
+    proved: bool,
 }
 
 impl Cover {
@@ -1373,6 +1395,17 @@ struct ImgCtx<'a> {
     by_path: HashMap<&'a str, usize>,
     cfg: crate::erofs::LzmaCfg,
     preset: Mutex<Option<u32>>,
+}
+
+/// What the two erofs passes accumulate over one image: the splice
+/// segments they produced, the tally, and every member they minted a
+/// source for — kept whole so the sources nothing ended up slicing
+/// come back out once BOTH passes have had their say.
+#[derive(Default)]
+struct Passes {
+    segs: Vec<Seg>,
+    stats: PcStats,
+    planned: Vec<usize>,
 }
 
 /// The packed sweep's marching orders: what to do with each pcluster,
@@ -1412,6 +1445,12 @@ struct PcStats {
     /// planner can express (a short rotated span, or an algorithm with
     /// no encoder here).
     not_verbatim: usize,
+    /// Stored uncompressed and its bytes ARE the members' — but no
+    /// run of them is long enough to be worth a slice, so the whole
+    /// pcluster stays literal anyway. (Covering a span thinly is what
+    /// packed tails made common: a member's last bytes can end a few
+    /// dozen into a pcluster that is otherwise nobody's.)
+    thin: usize,
     /// Re-encoded to different bytes: a compressor this hdx can't
     /// reproduce. These stay literal, like an unreproducible gzip.
     mismatch: usize,
@@ -1431,6 +1470,7 @@ impl PcStats {
         self.verbatim += o.verbatim;
         self.rotated += o.rotated;
         self.not_verbatim += o.not_verbatim;
+        self.thin += o.thin;
         self.mismatch += o.mismatch;
         self.margin += o.margin;
         self.unverified_members += o.unverified_members;
@@ -1463,13 +1503,13 @@ impl Planner<'_> {
     /// proof, not a hypothesis — or, when stored uncompressed, direct
     /// splices of the member's own bytes.
     fn plan_erofs(&mut self, i: usize, plan: &mut Plan) -> Result<PcStats> {
-        let mut stats = PcStats::default();
+        let mut acc = Passes::default();
         let view = self
             .member_view(i)
             .context("erofs member has no readable space")?;
         let fs = crate::erofs::Erofs::open(view.clone())?;
         let Some(cfg) = fs.lzma_cfg()? else {
-            return Ok(stats); // no MicroLZMA configured: nothing to rebuild
+            return Ok(acc.stats); // no MicroLZMA configured: nothing to rebuild
         };
         // Format 0 is plain LZMA1, the only shape erofs defines and the
         // only one `microlzma_encode` models.
@@ -1494,31 +1534,45 @@ impl Planner<'_> {
             cfg,
             preset: Mutex::new(None),
         };
-        let mut segs: Vec<Seg> = Vec::new();
-        self.plan_packed_inode(i, plan, &ctx, &mut segs, &mut stats)?;
-        self.plan_own_pclusters(i, plan, &ctx, &mut segs, &mut stats)?;
-        if segs.is_empty() {
-            return Ok(stats);
+        // The file pass runs first: it reads every partly-packed file
+        // back and requires its digest, and that read-back is what
+        // lets the packed pass treat a file's TAIL as bytes of that
+        // member (the packed stream alone says nothing about a file it
+        // holds only the end of).
+        let proved = self.plan_own_pclusters(i, plan, &ctx, &mut acc)?;
+        self.plan_packed_inode(i, plan, &ctx, &proved, &mut acc)?;
+        // Sources either pass minted for members nothing ended up
+        // slicing keep nothing: an extract would state an archive
+        // nothing fetches from, a build would count bytes nothing
+        // references. Both passes are in, so this is the whole verdict
+        // — a member the file pass didn't use may still be sliced by
+        // its tail.
+        drop_unused_sources(plan, &tabled_of(&acc.segs, &plan.pclusters), &acc.planned);
+        if acc.segs.is_empty() {
+            return Ok(acc.stats);
         }
         plan.tabled = plan
             .tabled
-            .union(&tabled_of(&segs, &plan.pclusters))
+            .union(&tabled_of(&acc.segs, &plan.pclusters))
             .copied()
             .collect();
-        splice_in(i, plan, segs)?;
-        Ok(stats)
+        splice_in(i, plan, acc.segs)?;
+        Ok(acc.stats)
     }
 
-    /// Pass one: the packed inode, whose pclusters hold many members
-    /// each.
+    /// Pass two: the packed inode, whose pclusters hold many members
+    /// each — whole files mkfs packed as fragments, and the tails of
+    /// files too big to pack, which `proved` names (the file pass read
+    /// those back and their digests came out).
     fn plan_packed_inode(
         &mut self,
         i: usize,
         plan: &mut Plan,
         ctx: &ImgCtx,
-        out: &mut Vec<Seg>,
-        stats: &mut PcStats,
+        proved: &std::collections::HashSet<usize>,
+        acc: &mut Passes,
     ) -> Result<()> {
+        let (stats, planned) = (&mut acc.stats, &mut acc.planned);
         let (pcs, _) = ctx.fs.packed_pclusters()?;
         stats.total += pcs.len();
         if pcs.is_empty() {
@@ -1526,9 +1580,11 @@ impl Planner<'_> {
         }
         let mut covers: Vec<Cover> = Vec::new();
         for f in &ctx.files {
-            let Some(off) = f.plan.packed_whole() else {
-                continue; // own pclusters, or only a packed tail
-            };
+            let exts = f.plan.packed_extents();
+            if exts.is_empty() {
+                continue;
+            }
+            let whole = f.plan.packed_whole().is_some();
             let path = format!("{}!{}", self.members[i].path, f.path);
             let Some(&c) = ctx.by_path.get(path.as_str()) else {
                 continue;
@@ -1537,20 +1593,36 @@ impl Planner<'_> {
             if m.size != f.size || m.size < IDENTITY_MIN_BYTES || m.digests.is_none() {
                 continue;
             }
-            // A node for these bytes, or they may as well be literal:
-            // a claim URL that fetches them directly, a witness that
-            // states them inside an archive (rung D), or a verified
-            // build of the member's own (rung G — a boot image the
-            // image ships is rebuilt, then sliced).
-            if !self.direct_claimed(c) && !self.plan_extract(c, plan) && !self.plan_source(c, plan)
-            {
+            if whole {
+                // A node for these bytes, or they may as well be
+                // literal: a claim URL that fetches them directly, a
+                // witness that states them inside an archive (rung D),
+                // or a verified build of the member's own (rung G — a
+                // boot image the image ships is rebuilt, then sliced).
+                if !self.direct_claimed(c)
+                    && !self.plan_extract(c, plan)
+                    && !self.plan_source(c, plan)
+                {
+                    continue;
+                }
+                planned.push(c);
+            } else if !proved.contains(&c) {
+                // A tail whose file the pass before either found
+                // nothing fetchable for, or could not read back to its
+                // digest. Either way nothing here may claim it — and
+                // where it IS proven, that pass minted its source
+                // already, so nothing is planned twice.
                 continue;
             }
-            covers.push(Cover {
-                idx: c,
-                pstart: off,
-                len: m.size,
-            });
+            for e in exts {
+                covers.push(Cover {
+                    idx: c,
+                    from: e.la,
+                    pstart: e.off,
+                    len: e.llen,
+                    proved: !whole,
+                });
+            }
         }
         if covers.is_empty() {
             stats.uncovered += pcs.len();
@@ -1604,9 +1676,12 @@ impl Planner<'_> {
             if need[k] {
                 continue;
             }
+            // Only a cover the sweep has to hash makes a pcluster
+            // decode for verification's sake; a tail was proven by the
+            // read-back, so nothing here needs its bytes.
             need[k] = used
                 .iter()
-                .any(|c| c.pstart < pc.la + pc.llen && pc.la < c.end());
+                .any(|c| !c.proved && c.pstart < pc.la + pc.llen && pc.la < c.end());
         }
         let set = SweepSet {
             eligible,
@@ -1656,33 +1731,35 @@ impl Planner<'_> {
             });
             plan.pclusters.push(node);
         }
-        // Sources minted for members no surviving node slices keep
-        // nothing: an extract would state an archive nothing fetches
-        // from, a build would count bytes nothing references.
-        let keep = tabled_of(&segs, &plan.pclusters);
-        let planned: Vec<usize> = covers.iter().map(|c| c.idx).collect();
-        drop_unused_sources(plan, &keep, &planned);
-        out.append(&mut segs);
+        acc.segs.append(&mut segs);
         Ok(())
     }
 
-    /// Pass two: files mkfs gave pclusters of their own — on the
-    /// Fedora live image, the 375 biggest files, half its stored
-    /// bytes. Each is self-contained (one member's bytes, in order),
-    /// so files plan independently and in parallel: read the member
-    /// back through the reader, require its digest, and re-encode or
-    /// splice each of its pclusters.
+    /// Pass one: files mkfs did NOT pack whole — on the Fedora live
+    /// image, the 375 biggest, half its stored bytes. Each is
+    /// self-contained (one member's bytes, in order), so files plan
+    /// independently and in parallel: read the member back through the
+    /// reader, require its digest, and re-encode or splice each of its
+    /// pclusters. Returns the members whose digest came back, which is
+    /// what earns their packed tails a slice in the pass after.
     fn plan_own_pclusters(
         &mut self,
         i: usize,
         plan: &mut Plan,
         ctx: &ImgCtx,
-        out: &mut Vec<Seg>,
-        stats: &mut PcStats,
-    ) -> Result<()> {
+        acc: &mut Passes,
+    ) -> Result<std::collections::HashSet<usize>> {
+        let (stats, planned) = (&mut acc.stats, &mut acc.planned);
         let mut todo: Vec<(usize, &crate::erofs::FileItem)> = Vec::new();
         for f in &ctx.files {
-            if f.plan.packed_whole().is_some() || f.plan.own_pclusters().is_empty() {
+            // A file packed whole belongs to the packed pass, which
+            // proves it against its own digest as it streams past.
+            // Everything else that keeps bytes in a pcluster or a
+            // packed tail is read back here, because for those two the
+            // whole-file digest is the only proof there is.
+            if f.plan.packed_whole().is_some()
+                || (f.plan.own_pclusters().is_empty() && f.plan.packed_extents().is_empty())
+            {
                 continue;
             }
             let path = format!("{}!{}", self.members[i].path, f.path);
@@ -1699,14 +1776,15 @@ impl Planner<'_> {
             }
             todo.push((c, f));
         }
+        planned.extend(todo.iter().map(|(c, _)| *c));
         // Everything a file with no fetchable evidence stores is
         // literal, and says so in the tally rather than vanishing.
         let all: usize = ctx.files.iter().map(|f| f.plan.own_pclusters().len()).sum();
-        let planned: usize = todo.iter().map(|(_, f)| f.plan.own_pclusters().len()).sum();
+        let attempted: usize = todo.iter().map(|(_, f)| f.plan.own_pclusters().len()).sum();
         stats.total += all;
-        stats.uncovered += all - planned;
+        stats.uncovered += all - attempted;
         if todo.is_empty() {
-            return Ok(());
+            return Ok(Default::default());
         }
         let next = AtomicUsize::new(0);
         let done = AtomicUsize::new(0);
@@ -1733,15 +1811,20 @@ impl Planner<'_> {
         if let Some(e) = failed.into_inner().unwrap() {
             return Err(e);
         }
-        for (nodes, mut segs, st) in out_all.into_inner().unwrap() {
+        let mut proved: std::collections::HashSet<usize> = Default::default();
+        for mut f in out_all.into_inner().unwrap() {
+            let st = f.stats;
             stats.verified += st.verified;
             stats.verbatim += st.verbatim;
             stats.mismatch += st.mismatch;
             stats.margin += st.margin;
             stats.not_verbatim += st.not_verbatim;
             stats.unverified_members += st.unverified_members;
-            for (node, pa) in nodes {
-                out.push(Seg::PCluster {
+            if f.proved {
+                proved.insert(f.idx);
+            }
+            for (node, pa) in f.nodes {
+                acc.segs.push(Seg::PCluster {
                     pc: plan.pclusters.len(),
                     at: 0,
                     len: node.size,
@@ -1749,14 +1832,9 @@ impl Planner<'_> {
                 });
                 plan.pclusters.push(node);
             }
-            out.append(&mut segs);
+            acc.segs.append(&mut f.segs);
         }
-        // Members whose own pclusters produced nothing keep no node
-        // unless something else references them.
-        let keep = tabled_of(out, &plan.pclusters);
-        let planned: Vec<usize> = todo.iter().map(|(c, _)| *c).collect();
-        drop_unused_sources(plan, &keep, &planned);
-        Ok(())
+        Ok(proved)
     }
 
     /// One pass over the packed stream: decode what's needed, verify
@@ -1793,6 +1871,7 @@ impl Planner<'_> {
         let mut verbatim = 0usize;
         let mut rotated = 0usize;
         let mut not_verbatim = 0usize;
+        let mut thin = 0usize;
 
         let mut result: Result<()> = Ok(());
         std::thread::scope(|scope| {
@@ -1837,7 +1916,10 @@ impl Planner<'_> {
             result = (|| -> Result<()> {
                 // Members hash as their bytes stream past; a cover
                 // whose start was never decoded can't be checked at
-                // all, so it never becomes a slice.
+                // all, so it never becomes a slice. A cover that
+                // arrived proven (a file's tail, read back whole by
+                // the pass before) is not hashed here at all: the
+                // packed stream holds only the end of it.
                 let mut cursor = 0usize;
                 let mut active: Vec<(usize, u64, sha2::Sha256)> = Vec::new();
                 let mut cur: Option<Vec<u8>> = None;
@@ -1853,14 +1935,17 @@ impl Planner<'_> {
                     };
                     let end = pc.la + bytes.len() as u64;
                     while cursor < used.len() && used[cursor].pstart < end {
-                        let cv = &used[cursor];
+                        let (ci, cv) = (cursor, &used[cursor]);
+                        cursor += 1;
+                        if cv.proved {
+                            continue;
+                        }
                         if cv.pstart < pc.la {
                             // Its first bytes were never decoded.
                             failed.lock().unwrap().insert(cv.idx);
                         } else {
-                            active.push((cursor, cv.pstart, sha2::Sha256::new()));
+                            active.push((ci, cv.pstart, sha2::Sha256::new()));
                         }
-                        cursor += 1;
                     }
                     active.retain_mut(|(ci, pos, h)| {
                         let cv = &used[*ci];
@@ -1919,6 +2004,11 @@ impl Planner<'_> {
                                 splice_verbatim(pc, bytes.len() as u64, used, &mut segs);
                                 if segs.len() > n {
                                     verbatim += 1;
+                                } else {
+                                    // Covered, but by runs too short to
+                                    // be worth a slice: literal, and it
+                                    // says so rather than vanishing.
+                                    thin += 1;
                                 }
                             } else if splice_rotated(pc, &bytes, &stored, used, &mut segs) {
                                 rotated += 1;
@@ -1933,7 +2023,7 @@ impl Planner<'_> {
                     }
                 }
                 // Covers past the last decoded pcluster never verified.
-                for cv in used.iter().skip(cursor) {
+                for cv in used.iter().skip(cursor).filter(|c| !c.proved) {
                     failed.lock().unwrap().insert(cv.idx);
                 }
                 for (ci, _, _) in &active {
@@ -1945,10 +2035,12 @@ impl Planner<'_> {
         });
         result?;
         let (ok, mismatch, margin) = counts.into_inner().unwrap();
-        stats.verified = ok;
-        stats.verbatim = verbatim;
-        stats.rotated = rotated;
-        stats.not_verbatim = not_verbatim;
+        // Tallies accumulate: the file pass has already run.
+        stats.verified += ok;
+        stats.verbatim += verbatim;
+        stats.rotated += rotated;
+        stats.not_verbatim += not_verbatim;
+        stats.thin += thin;
         stats.mismatch += mismatch;
         stats.margin += margin;
         let failed = failed.into_inner().unwrap();
@@ -1957,12 +2049,14 @@ impl Planner<'_> {
     }
 }
 
-/// Plan one file that keeps pclusters of its own. Its bytes are read
-/// back through the reader and hashed as they pass: nothing is emitted
+/// Plan one file mkfs did not pack whole. Its bytes are read back
+/// through the reader and hashed as they pass: nothing is emitted
 /// unless the member's digest comes back, because every node here
-/// claims that these image bytes ARE that member's. Returns the nodes
-/// with the image offsets they occupy, the verbatim splices, and a
-/// tally.
+/// claims that these image bytes ARE that member's. That same digest
+/// is the proof the packed pass needs for the file's tail — the
+/// reader read it through the packed inode to get here, so a file
+/// with no pclusters of its own still comes through for the digest
+/// alone.
 fn plan_own_file(
     ctx: &ImgCtx,
     f: &crate::erofs::FileItem,
@@ -1970,16 +2064,25 @@ fn plan_own_file(
     member: &Member,
 ) -> Result<PlannedFile> {
     let mut stats = PcStats::default();
+    let refused = |stats| PlannedFile {
+        idx,
+        nodes: Vec::new(),
+        segs: Vec::new(),
+        stats,
+        proved: false,
+    };
     let pcs = f.plan.own_pclusters();
     let Some(zp) = f.plan.zplan() else {
-        return Ok((Vec::new(), Vec::new(), stats));
+        return Ok(refused(stats));
     };
     // The whole member is the cover: these pclusters hold its bytes
     // and nobody else's.
     let covers = [Cover {
         idx,
+        from: 0,
         pstart: 0,
         len: member.size,
+        proved: true,
     }];
     // The spool is only reachable when a node's input span isn't
     // covered, which can't happen with a whole-member cover.
@@ -2002,8 +2105,9 @@ fn plan_own_file(
             stats.verified = 0;
             stats.verbatim = 0;
             stats.rotated = 0;
+            stats.thin = 0;
             stats.unverified_members += 1;
-            return Ok((Vec::new(), Vec::new(), stats));
+            return Ok(refused(stats));
         }
         let lo = (pc.la - at) as usize;
         if lo >= window.len() {
@@ -2037,6 +2141,8 @@ fn plan_own_file(
                 splice_verbatim(pc, logical as u64, &covers, &mut segs);
                 if segs.len() > n {
                     stats.verbatim += 1;
+                } else {
+                    stats.thin += 1;
                 }
             } else if splice_rotated(pc, &window[lo..lo + logical], &stored, &covers, &mut segs) {
                 stats.rotated += 1;
@@ -2063,10 +2169,17 @@ fn plan_own_file(
         stats.verified = 0;
         stats.verbatim = 0;
         stats.rotated = 0;
+        stats.thin = 0;
         stats.unverified_members += 1;
-        return Ok((Vec::new(), Vec::new(), stats));
+        return Ok(refused(stats));
     }
-    Ok((nodes, segs, stats))
+    Ok(PlannedFile {
+        idx,
+        nodes,
+        segs,
+        stats,
+        proved: true,
+    })
 }
 
 /// Read forward until the window covers [at, want), hashing what
@@ -2132,7 +2245,7 @@ fn splice_span(covers: &[Cover], lstart: u64, len: u64, root_at: u64, segs: &mut
         if hi - lo > INLINE_MAX {
             segs.push(Seg::Tabled {
                 idx: cv.idx,
-                from: lo - cv.pstart,
+                from: cv.from + (lo - cv.pstart),
                 len: hi - lo,
                 at: 0, // assigned when merged into the image's build
                 root_off: root_at + (lo - lstart),
@@ -2312,7 +2425,7 @@ fn plan_pcluster(
         }
         inputs.push(PcInput::Member {
             idx: cv.idx,
-            from: lo - cv.pstart,
+            from: cv.from + (lo - cv.pstart),
             len: hi - lo,
         });
         pos = hi;

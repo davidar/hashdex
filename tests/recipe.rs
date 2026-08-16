@@ -1375,6 +1375,164 @@ fn erofs_recipe_rebuilds_a_file_s_own_pclusters() {
     );
 }
 
+/// A file too big to pack keeps pclusters of its own AND a tail in
+/// the packed inode, and that tail is bytes of a member like any
+/// other: the packed sweep splices it from the RANGE of the file it
+/// belongs to. The proof is the file pass's read-back — the same
+/// reader walks the packed extent to produce the digest, so a digest
+/// that comes back proves where the tail's bytes belong.
+///
+/// The fixture (tests/data/erofs/tail.erofs.gz) is `frag_tree()` built
+/// in the fedora:44 container with tail packing but NOT whole-file
+/// packing:
+///
+///   mkfs.erofs -b4096 -zlzma -C8192 -Efragments tail.erofs tree
+///
+/// which packs 9 small files whole and leaves two partly packed:
+/// `span.bin` keeps pclusters to 52,203 and packs the 47,797 bytes
+/// past it, and incompressible `noise.bin` packs its last 7,808. Both
+/// tails together are more than half the packed stream.
+#[test]
+fn erofs_recipe_splices_a_file_s_packed_tail() {
+    let env = TestEnv::new("recipe-erofs-tail");
+    let image = erofs_fixture(&env, "tail");
+    let tree = frag_tree();
+    let rpm_files: Vec<(String, Vec<u8>)> = tree
+        .iter()
+        .map(|(p, b)| (format!("opt/frag/{p}"), b.clone()))
+        .collect();
+    let rpm = fake_rpm(
+        &rpm_files
+            .iter()
+            .map(|(p, b)| (p.as_str(), &b[..]))
+            .collect::<Vec<_>>(),
+    );
+    let pkgid = sha256_hex(&rpm);
+    let rpm_url = "https://dl.example.org/pool/f/frag-1.0-1.fc44.x86_64.rpm";
+    let digests: Vec<String> = tree.iter().map(|(_, b)| sha256_hex(b)).collect();
+    let paths: Vec<String> = tree.iter().map(|(p, _)| format!("/opt/frag/{p}")).collect();
+    let rows: Vec<(&str, &str, usize)> = digests
+        .iter()
+        .zip(&paths)
+        .map(|(d, p)| (d.as_str(), p.as_str(), 0))
+        .collect();
+    install_rpm_files_dataset(
+        &env,
+        &[(&pkgid, "fedora-44", "frag", "1.0-1.fc44", rpm_url)],
+        &rows,
+    );
+
+    let out = env.hdx(&["--offline", "recipe", image.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+
+    // Every pcluster is either rebuilt or accounted for by a named
+    // reason. Covering a span thinly is what packed tails made common
+    // — a member's last bytes can end a few dozen into a pcluster that
+    // is otherwise nobody's — and that case used to be counted
+    // nowhere, so this arithmetic silently didn't close. (It closes
+    // only when no member was dropped, which the note would say.)
+    let note = stdout(&out);
+    let line = note
+        .lines()
+        .find(|l| l.starts_with("erofs: "))
+        .unwrap_or_else(|| panic!("no erofs note: {note}"));
+    assert!(!line.contains("dropped"), "note: {line}");
+    let (rebuilt, total) = line["erofs: ".len()..]
+        .split_once(' ')
+        .and_then(|(n, _)| n.split_once('/'))
+        .map(|(a, b)| (a.parse::<u64>().unwrap(), b.parse::<u64>().unwrap()))
+        .unwrap();
+    let literal: u64 = [
+        "no fetchable members",
+        "stored, but not verbatim",
+        "covered too thinly to slice",
+        "re-encoded differently",
+        "input margin too small",
+    ]
+    .iter()
+    .filter_map(|why| {
+        let at = line.find(why)?;
+        line[..at]
+            .rsplit(&[' ', '('][..])
+            .nth(1)?
+            .parse::<u64>()
+            .ok()
+    })
+    .sum();
+    assert_eq!(rebuilt + literal, total, "unaccounted pclusters: {line}");
+
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("tail.erofs.recipe.json")).unwrap(),
+    )
+    .unwrap();
+
+    // The source that stands for span.bin, and every slice of it any
+    // pcluster node takes.
+    let sources = doc["sources"].as_array().unwrap();
+    let span = sources
+        .iter()
+        .position(|s| s["extract"]["path"].as_str() == Some("/opt/frag/span.bin"))
+        .expect("span.bin has an extract node") as u64;
+    let mut slices: Vec<(u64, u64)> = Vec::new();
+    for node in doc["root"]["build"]["inputs"].as_array().unwrap() {
+        if node["build"]["builder"] != "microlzma@0" {
+            continue;
+        }
+        for input in node["build"]["inputs"].as_array().unwrap() {
+            let sl = &input["slice"];
+            if sl["source"].as_u64() == Some(span) {
+                slices.push((sl["from"].as_u64().unwrap(), sl["len"].as_u64().unwrap()));
+            } else if input["source"].as_u64() == Some(span) {
+                slices.push((0, 100_000));
+            }
+        }
+    }
+    assert!(
+        slices.iter().any(|&(from, _)| from >= 52_203),
+        "the packed tail is sliced from where the file's own pclusters stop: {slices:?}"
+    );
+    // Both halves of the file are reached — its own pclusters and its
+    // tail — so nearly all of it is fetchable.
+    assert!(
+        slices.iter().any(|&(from, _)| from < 52_203),
+        "its own pclusters slice the file too: {slices:?}"
+    );
+    // Both halves of both partly-packed files are reached, so nearly
+    // all of the ~158 KB tree is fetchable: 149,995 bytes against
+    // 90,589 when only whole-packed files could cover a pcluster, and
+    // a residue of 4,114 against 20,027.
+    assert!(
+        doc["coverage"]["fetchable_bytes"].as_u64().unwrap() > 145_000,
+        "coverage: {}",
+        doc["coverage"]
+    );
+    assert!(
+        doc["coverage"]["residue_bytes"].as_u64().unwrap() < 10_000,
+        "coverage: {}",
+        doc["coverage"]
+    );
+
+    // And the rpm alone rebuilds the image, tail slices included.
+    let blobs = env.work().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join("frag.rpm"), &rpm).unwrap();
+    let rebuilt = env.work().join("rebuilt.erofs");
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        env.work().join("tail.erofs.recipe.json").to_str().unwrap(),
+        blobs.to_str().unwrap(),
+        "--output",
+        rebuilt.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    assert_eq!(
+        std::fs::read(&rebuilt).unwrap(),
+        std::fs::read(&image).unwrap(),
+        "rebuilt image differs"
+    );
+}
+
 /// Rung G: an image's pclusters may hold bytes of a member nothing
 /// fetches — a boot image the filesystem ships, which this recipe
 /// knows how to REBUILD (early cpio literal, zstd@0 over a splice of
