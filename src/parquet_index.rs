@@ -180,6 +180,27 @@ pub enum ColValues {
     I64(Vec<Option<i64>>),
 }
 
+/// Which records of a row group a column read wants: a contiguous run
+/// (a key's matching rows), or scattered positions (foreign-key refs
+/// into another table). Scattered reads walk the column ONCE, skipping
+/// between the records they want — the alternative, a fresh reader per
+/// record, costs milliseconds when a digest is shipped by twenty
+/// packages.
+#[derive(Clone, Copy)]
+pub enum Rows<'a> {
+    Span { first: usize, take: usize },
+    At(&'a [usize]),
+}
+
+impl Rows<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Rows::Span { take, .. } => *take,
+            Rows::At(p) => p.len(),
+        }
+    }
+}
+
 /// Read `take` records of one column starting at record `skip`,
 /// page-skipping everything before it.
 pub fn read_column<R: ChunkReader + 'static>(
@@ -190,6 +211,19 @@ pub fn read_column<R: ChunkReader + 'static>(
     skip: usize,
     take: usize,
 ) -> Result<ColValues> {
+    read_records(reader, meta, rgi, col, Rows::Span { first: skip, take })
+}
+
+/// One column of one row group, at whichever records were asked for.
+/// Positions must be ascending; a repeated position repeats its value
+/// rather than stepping the reader on.
+pub fn read_records<R: ChunkReader + 'static>(
+    reader: &Arc<R>,
+    meta: &ParquetMetaData,
+    rgi: usize,
+    col: usize,
+    rows: Rows<'_>,
+) -> Result<ColValues> {
     use parquet::basic::Type;
     let rg = meta.row_group(rgi);
     let locations = page_locations(meta, rgi, col);
@@ -197,29 +231,58 @@ pub fn read_column<R: ChunkReader + 'static>(
     macro_rules! read {
         ($t:ty, $conv:expr) => {{
             let mut r = typed_reader::<R, $t>(reader, rg, col, locations.clone())?;
-            if skip > 0 {
-                r.skip_records(skip)?;
-            }
             let mut vals = Vec::new();
             let mut defs: Vec<i16> = Vec::new();
-            let mut out = Vec::with_capacity(take);
-            while out.len() < take {
-                vals.clear();
-                defs.clear();
-                let (records, _, _) =
-                    r.read_records(take - out.len(), Some(&mut defs), None, &mut vals)?;
-                if records == 0 {
-                    break;
-                }
-                defs.resize(records, max_def); // required cols fill no def levels
-                let mut vi = 0;
-                for &d in defs.iter().take(records) {
-                    if d == max_def {
-                        out.push(Some($conv(&vals[vi])));
-                        vi += 1;
-                    } else {
-                        out.push(None);
+            let mut out = Vec::with_capacity(rows.len());
+            let mut runs: Vec<(usize, usize)> = Vec::new(); // (skip, take)
+            match rows {
+                Rows::Span { first, take } => runs.push((first, take)),
+                Rows::At(positions) => {
+                    let mut prev: Option<usize> = None;
+                    for &p in positions {
+                        match prev {
+                            Some(q) if q == p => runs.push((0, 0)), // repeat
+                            _ => {
+                                let skip = p - prev.map_or(0, |q| q + 1);
+                                runs.push((skip, 1));
+                                prev = Some(p);
+                            }
+                        }
                     }
+                }
+            }
+            for (skip, take) in runs {
+                if take == 0 {
+                    // A repeated position re-states the last value.
+                    out.push(out.last().cloned().flatten());
+                    continue;
+                }
+                if skip > 0 {
+                    r.skip_records(skip)?;
+                }
+                let mut got = 0usize;
+                while got < take {
+                    vals.clear();
+                    defs.clear();
+                    let (records, _, _) =
+                        r.read_records(take - got, Some(&mut defs), None, &mut vals)?;
+                    if records == 0 {
+                        break;
+                    }
+                    defs.resize(records, max_def); // required cols fill no def levels
+                    let mut vi = 0;
+                    for &d in defs.iter().take(records) {
+                        if d == max_def {
+                            out.push(Some($conv(&vals[vi])));
+                            vi += 1;
+                        } else {
+                            out.push(None);
+                        }
+                    }
+                    got += records;
+                }
+                if got < take {
+                    break;
                 }
             }
             out
@@ -245,8 +308,7 @@ fn read_one_column<R: ChunkReader + 'static>(
     meta: &ParquetMetaData,
     rgi: usize,
     name: &str,
-    first: usize,
-    take: usize,
+    rows: Rows<'_>,
 ) -> Result<ColValues> {
     let cidx = column_index(meta, name)?;
     if meta.offset_index().is_none() {
@@ -256,7 +318,7 @@ fn read_one_column<R: ChunkReader + 'static>(
             let _ = reader.get_bytes(start, len as usize)?;
         }
     }
-    read_column(reader, meta, rgi, cidx, first, take)
+    read_records(reader, meta, rgi, cidx, rows)
 }
 
 /// One thread per column: each is a chain of ranged reads, so the wall
@@ -267,13 +329,12 @@ fn read_columns<'a, R: ChunkReader + 'static>(
     meta: &ParquetMetaData,
     rgi: usize,
     cols: &[&'a str],
-    first: usize,
-    take: usize,
+    rows: Rows<'_>,
 ) -> Vec<(&'a str, Result<ColValues>)> {
     std::thread::scope(|s| {
         let handles: Vec<_> = cols
             .iter()
-            .map(|name| s.spawn(move || read_one_column(reader, meta, rgi, name, first, take)))
+            .map(|name| s.spawn(move || read_one_column(reader, meta, rgi, name, rows)))
             .collect();
         cols.iter()
             .zip(handles)
@@ -290,55 +351,67 @@ fn read_columns<'a, R: ChunkReader + 'static>(
     meta: &ParquetMetaData,
     rgi: usize,
     cols: &[&'a str],
-    first: usize,
-    take: usize,
+    rows: Rows<'_>,
 ) -> Vec<(&'a str, Result<ColValues>)> {
     cols.iter()
-        .map(|name| (*name, read_one_column(reader, meta, rgi, name, first, take)))
+        .map(|name| (*name, read_one_column(reader, meta, rgi, name, rows)))
         .collect()
 }
 
 /// Read whole rows by absolute row index — the file's row order used
 /// as a foreign key from another table (a normalized dataset's ref
-/// column). Each index resolves through the row-group row counts,
-/// then page-skips to the record; the result keeps `indices` order.
+/// column). Indices are grouped by row group and read in one pass per
+/// column, whatever order they arrive in; the result keeps `indices`
+/// order.
 pub fn rows_at<R: ChunkReader + 'static>(
     reader: &Arc<R>,
     meta: &ParquetMetaData,
     cols: &[&str],
     indices: &[u64],
 ) -> Result<Vec<Value>> {
-    let mut out = Vec::with_capacity(indices.len());
-    for &idx in indices {
-        let (mut rgi, mut rg_start) = (0usize, 0u64);
-        loop {
-            anyhow::ensure!(
-                rgi < meta.num_row_groups(),
-                "row index {idx} past end of file"
-            );
-            let n = meta.row_group(rgi).num_rows() as u64;
-            if idx < rg_start + n {
-                break;
-            }
-            rg_start += n;
-            rgi += 1;
-        }
-        let first = (idx - rg_start) as usize;
-        let mut obj = serde_json::Map::new();
-        for (name, vals) in read_columns(reader, meta, rgi, cols, first, 1) {
-            let v = match vals? {
-                ColValues::Str(v) => v
-                    .first()
-                    .and_then(|o| o.as_ref())
-                    .map_or(Value::Null, |s| json!(s)),
-                ColValues::I32(v) => v.first().and_then(|o| *o).map_or(Value::Null, |n| json!(n)),
-                ColValues::I64(v) => v.first().and_then(|o| *o).map_or(Value::Null, |n| json!(n)),
-            };
-            obj.insert(name.to_string(), v);
-        }
-        out.push(Value::Object(obj));
+    // Row-group starts, once: locating an index is then a binary
+    // search, not a walk per index.
+    let mut starts: Vec<u64> = Vec::with_capacity(meta.num_row_groups());
+    let mut acc = 0u64;
+    for rg in meta.row_groups() {
+        starts.push(acc);
+        acc += rg.num_rows() as u64;
     }
-    Ok(out)
+    let mut per_group: std::collections::BTreeMap<usize, Vec<(usize, usize)>> = Default::default();
+    for (slot, &idx) in indices.iter().enumerate() {
+        anyhow::ensure!(idx < acc, "row index {idx} past end of file");
+        let rgi = starts.partition_point(|s| *s <= idx) - 1;
+        per_group
+            .entry(rgi)
+            .or_default()
+            .push(((idx - starts[rgi]) as usize, slot));
+    }
+
+    let mut objs: Vec<serde_json::Map<String, Value>> = vec![serde_json::Map::new(); indices.len()];
+    for (rgi, mut wanted) in per_group {
+        // Ascending: one forward pass over the column serves them all.
+        wanted.sort_unstable();
+        let positions: Vec<usize> = wanted.iter().map(|(within, _)| *within).collect();
+        for (name, vals) in read_columns(reader, meta, rgi, cols, Rows::At(&positions)) {
+            let vals = vals?;
+            for (i, (_, slot)) in wanted.iter().enumerate() {
+                let v = match &vals {
+                    ColValues::Str(v) => v
+                        .get(i)
+                        .and_then(|o| o.as_ref())
+                        .map_or(Value::Null, |s| json!(s)),
+                    ColValues::I32(v) => {
+                        v.get(i).and_then(|o| *o).map_or(Value::Null, |n| json!(n))
+                    }
+                    ColValues::I64(v) => {
+                        v.get(i).and_then(|o| *o).map_or(Value::Null, |n| json!(n))
+                    }
+                };
+                objs[*slot].insert(name.to_string(), v);
+            }
+        }
+    }
+    Ok(objs.into_iter().map(Value::Object).collect())
 }
 
 /// Point lookup in a parquet file sorted by `key_col`: rows (as JSON
@@ -365,7 +438,7 @@ pub fn find_rows<R: ChunkReader + 'static>(
             continue;
         }
         let mut objs: Vec<serde_json::Map<String, Value>> = vec![serde_json::Map::new(); take];
-        for (name, vals) in read_columns(reader, meta, rgi, cols, first, take) {
+        for (name, vals) in read_columns(reader, meta, rgi, cols, Rows::Span { first, take }) {
             let vals = vals?;
             for (i, obj) in objs.iter_mut().enumerate() {
                 let v = match &vals {

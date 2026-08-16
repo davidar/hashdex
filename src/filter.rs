@@ -206,6 +206,21 @@ pub fn fold(src: &Path, dst: &Path) -> Result<FoldStats> {
     })
 }
 
+/// How a digest is spelled as a bloom key. CIRCL keys its hashlookup
+/// filter on UPPERCASE hex and the weak-digest filters built alongside
+/// it follow suit; the sha256 filters key lowercase. Both conventions
+/// are load-bearing — a filter probed with the wrong case answers "not
+/// present" for everything it holds — so they are stated once, here,
+/// and every prober goes through this.
+pub fn bloom_key(scheme: Scheme, digest: &[u8]) -> Option<String> {
+    match scheme {
+        Scheme::Sha1 | Scheme::Md5 => Some(crate::scan_cmd::hex_upper(digest)),
+        Scheme::Sha256 => Some(crate::scan_cmd::hex_lower(digest)),
+        // No filter keys the other schemes; a caller must not guess.
+        _ => None,
+    }
+}
+
 /// A named membership filter bound to the scheme it keys on.
 pub struct NamedFilter {
     pub name: String,

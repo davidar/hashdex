@@ -154,7 +154,9 @@ impl Cache {
     /// Every cached finding that co-observed this digest — reachable via
     /// any of its coordinates, not just the one originally queried.
     pub fn findings_for(&self, coord: &Coord) -> Vec<Finding> {
-        let Ok(mut stmt) = self.conn.prepare(
+        // Cached: resolution asks this per member per seed, and
+        // re-planning the join half a million times is pure overhead.
+        let Ok(mut stmt) = self.conn.prepare_cached(
             "SELECT DISTINCT o.finding FROM observation_coords oc
              JOIN observations o
                ON o.backend = oc.backend AND o.coordinate = oc.coordinate

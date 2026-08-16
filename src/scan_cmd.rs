@@ -1326,8 +1326,13 @@ pub(crate) fn local_verdicts(
         scheme: Scheme::Sha1,
         digest: sha1_digest.to_vec(),
     };
+    let gates = crate::datasets::Gates::installed();
     let local = |c: &crate::coord::Coord| -> Vec<crate::finding::Finding> {
-        datasets.iter().flat_map(|d| d.lookup(c)).collect()
+        datasets
+            .iter()
+            .filter(|d| gates.admits(d.spec.name, c))
+            .flat_map(|d| d.lookup(c))
+            .collect()
     };
     let ev = crate::walk::walk(&[sha256.clone(), sha1], &local, cache);
     let mut identified = Vec::new();

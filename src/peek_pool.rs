@@ -12,7 +12,7 @@
 use crate::coord::{Coord, Scheme};
 use crate::filter::NamedFilter;
 use crate::peek_source::View;
-use crate::scan_cmd::{hex_lower, hex_upper, Ticker, EXPENSIVE_FILTER_BYTES, IDENTITY_MIN_BYTES};
+use crate::scan_cmd::{Ticker, EXPENSIVE_FILTER_BYTES, IDENTITY_MIN_BYTES};
 use sha2::Digest as _;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -478,8 +478,8 @@ impl<'f> Pool<'f> {
         sha256: &[u8; 32],
         probe_all: bool,
     ) -> (Vec<String>, bool) {
-        let sha1_hex = hex_upper(sha1);
-        let sha256_hex = hex_lower(sha256);
+        let sha1_key = crate::filter::bloom_key(Scheme::Sha1, sha1);
+        let sha256_key = crate::filter::bloom_key(Scheme::Sha256, sha256);
         let mut matched: Vec<String> = Vec::new();
         let mut skipped_big = false;
         for f in &self.probe_order {
@@ -487,12 +487,13 @@ impl<'f> Pool<'f> {
                 skipped_big = true;
                 continue;
             }
-            let key: &[u8] = match f.scheme {
-                Scheme::Sha1 => sha1_hex.as_bytes(),
-                Scheme::Sha256 => sha256_hex.as_bytes(),
-                _ => continue,
+            let key = match f.scheme {
+                Scheme::Sha1 => sha1_key.as_deref(),
+                Scheme::Sha256 => sha256_key.as_deref(),
+                _ => None,
             };
-            if f.bloom.check(key) {
+            let Some(key) = key else { continue };
+            if f.bloom.check(key.as_bytes()) {
                 matched.push(f.name.clone());
             }
         }

@@ -163,6 +163,60 @@ pub fn open_all() -> &'static [LocalDataset] {
     ALL.get_or_init(|| SPECS.iter().filter_map(|s| LocalDataset::open(s)).collect())
 }
 
+/// A dataset's own membership filter, standing in front of its parquet.
+///
+/// A point lookup costs a page decode — cheap once, and the whole
+/// resolve phase when half a million members each ask every dataset
+/// about two digests. The bloom published alongside a dataset holds
+/// every key that dataset can answer for, so a bloom miss is an
+/// absence proof and the read can be skipped outright. This is the
+/// probe rule scan already applies to the network (a filter hit is the
+/// demand that justifies a request), pointed at the local read.
+///
+/// Only the schemes a filter is published for are gated; a dataset
+/// serving a scheme no installed filter covers keeps reading its
+/// parquet, so absence stays proved by the data either way.
+pub struct Gates {
+    blooms: Vec<(String, crate::coord::Scheme, crate::filter::Bloom)>,
+}
+
+impl Gates {
+    /// Filters that belong to a dataset. Filters of every other source
+    /// (circl, swh, …) are not a statement about any dataset's rows
+    /// and are dropped here.
+    pub fn new(filters: Vec<crate::filter::NamedFilter>) -> Gates {
+        Gates {
+            blooms: filters
+                .into_iter()
+                .filter(|f| spec(&f.name).is_some())
+                .map(|f| (f.name, f.scheme, f.bloom))
+                .collect(),
+        }
+    }
+
+    /// The installed filters, opened once per process.
+    pub fn installed() -> &'static Gates {
+        static GATES: OnceLock<Gates> = OnceLock::new();
+        GATES.get_or_init(|| Gates::new(crate::filter::load_all().unwrap_or_default()))
+    }
+
+    /// Whether `dataset` could hold a row keyed by this coordinate.
+    /// True whenever no filter can say otherwise.
+    pub fn admits(&self, dataset: &str, coord: &Coord) -> bool {
+        let Some((_, _, bloom)) = self
+            .blooms
+            .iter()
+            .find(|(n, s, _)| n == dataset && *s == coord.scheme)
+        else {
+            return true;
+        };
+        match crate::filter::bloom_key(coord.scheme, &coord.digest) {
+            Some(key) => bloom.check(key.as_bytes()),
+            None => true,
+        }
+    }
+}
+
 /// Whether this dataset has a complete local copy (then its network
 /// backend is redundant: the walk reads the same rows from disk).
 pub fn is_local(name: &str) -> bool {
@@ -191,5 +245,144 @@ mod tests {
         cursor.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, b"789");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    use crate::coord::Scheme;
+
+    fn bloom_over(keys: &[String], dir: &std::path::Path, name: &str) -> crate::filter::Bloom {
+        // Padded: a bloom over a handful of keys answers yes to
+        // everything, which would make the negative case meaningless.
+        let mut b = crate::filter::BloomBuilder::new(1000, 0.0001).unwrap();
+        for k in keys {
+            b.add(k.as_bytes());
+        }
+        for i in 0..500 {
+            b.add(format!("PAD{i:04}").as_bytes());
+        }
+        let path = dir.join(name);
+        b.write(&path).unwrap();
+        crate::filter::Bloom::open(&path).unwrap()
+    }
+
+    /// A dataset's own filter answers for its rows: present digests are
+    /// admitted, absent ones are skipped, and anything the filters
+    /// don't cover — another dataset, another scheme — is admitted so
+    /// absence stays proved by the parquet.
+    #[test]
+    fn gates_skip_only_what_a_filter_denies() {
+        let dir = std::env::temp_dir().join(format!("hdx-gates-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = Coord {
+            scheme: Scheme::Sha256,
+            digest: vec![0x11; 32],
+        };
+        let absent = Coord {
+            scheme: Scheme::Sha256,
+            digest: vec![0x22; 32],
+        };
+        let key = crate::filter::bloom_key(present.scheme, &present.digest).unwrap();
+        let gates = Gates::new(vec![
+            crate::filter::NamedFilter {
+                name: "tarballs".into(),
+                scheme: Scheme::Sha256,
+                bloom: bloom_over(&[key], &dir, "tarballs.sha256.bloom"),
+                bytes: 0,
+            },
+            // Not a dataset: never a statement about dataset rows.
+            crate::filter::NamedFilter {
+                name: "circl".into(),
+                scheme: Scheme::Sha256,
+                bloom: bloom_over(&[], &dir, "circl.sha256.bloom"),
+                bytes: 0,
+            },
+        ]);
+        assert!(gates.admits("tarballs", &present));
+        assert!(!gates.admits("tarballs", &absent), "filter denied it");
+        // No filter for this dataset, or this scheme, or this source:
+        // read the parquet and let the data answer.
+        assert!(gates.admits("debs", &absent));
+        assert!(gates.admits(
+            "tarballs",
+            &Coord {
+                scheme: Scheme::Md5,
+                digest: vec![0x22; 16]
+            }
+        ));
+        assert!(gates.admits("circl", &absent));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The referee for the gate's premise: every key a pulled dataset
+    /// holds must be admitted by the filter published with it, or the
+    /// gate would skip a read that had an answer. Needs local copies —
+    /// run it after `hdx index pull`.
+    #[test]
+    #[ignore]
+    fn gates_admit_every_local_row() {
+        let gates = Gates::installed();
+        let mut checked = 0usize;
+        for d in open_all() {
+            for (name, scheme, _) in gates.blooms.iter().filter(|(n, _, _)| n == d.spec.name) {
+                let width = match scheme {
+                    Scheme::Sha256 => 64,
+                    Scheme::Sha1 => 40,
+                    Scheme::Md5 => 32,
+                    _ => continue,
+                };
+                let dir = datasets_dir().join(name);
+                for entry in walkdir::WalkDir::new(&dir).into_iter().flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
+                        continue;
+                    }
+                    let file = std::fs::File::open(path).unwrap();
+                    let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+                    let reader = Arc::new(MmapReader(Arc::new(mmap)));
+                    let Ok(meta) = ParquetMetaDataReader::new()
+                        .with_page_index_policy(PageIndexPolicy::Optional)
+                        .parse_and_finish(reader.as_ref())
+                    else {
+                        continue;
+                    };
+                    let meta = Arc::new(meta);
+                    if meta.num_row_groups() == 0 {
+                        continue;
+                    }
+                    for col in ["digest", "sha256", "sha1", "md5", "pkgid"] {
+                        let Ok(cidx) = crate::parquet_index::column_index(&meta, col) else {
+                            continue;
+                        };
+                        let vals =
+                            crate::parquet_index::read_column(&reader, &meta, 0, cidx, 0, 50)
+                                .unwrap();
+                        let crate::parquet_index::ColValues::Str(vals) = vals else {
+                            continue;
+                        };
+                        for hex in vals.into_iter().flatten() {
+                            // A column of another scheme's digests
+                            // proves nothing about this filter.
+                            if hex.len() != width {
+                                continue;
+                            }
+                            let digest: Vec<u8> = (0..hex.len() / 2)
+                                .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+                                .collect();
+                            let coord = Coord {
+                                scheme: *scheme,
+                                digest,
+                            };
+                            assert!(
+                                gates.admits(name, &coord),
+                                "{name} filter denies {hex}, a key in {}",
+                                path.display()
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("gates_admit_every_local_row: {checked} keys admitted");
+        assert!(checked > 0, "no local dataset keys were checked");
     }
 }

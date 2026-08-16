@@ -172,6 +172,27 @@ pub fn pkg_finding(pkg: &Pkg, scheme: Scheme, hex: &str) -> Finding {
     }
 }
 
+/// Package rows already resolved, by their row index in
+/// `packages.parquet`.
+///
+/// Packages recur relentlessly: a live image's 119,736 files come from
+/// a few thousand rpms, and every file row points at one. Reading a
+/// package row means seven scattered column reads, so each index is
+/// paid for once per process. Row indices address the copy this
+/// process reads, and a process reads one copy of a dataset (local if
+/// pulled, remote otherwise), so the index is a stable key.
+///
+/// Capped: a scan wide enough to touch a large fraction of 3.77M
+/// packages stops adding rather than growing without bound — a full
+/// memo would be hundreds of MB, and the cap costs only re-reads.
+const PKG_MEMO_MAX: usize = 100_000;
+
+fn pkg_memo() -> &'static std::sync::Mutex<std::collections::HashMap<u64, Arc<Value>>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, Arc<Value>>>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
 fn json_pkg(v: &Value) -> Pkg<'_> {
     let s = |k: &str| v[k].as_str().unwrap_or("");
     Pkg {
@@ -183,6 +204,55 @@ fn json_pkg(v: &Value) -> Pkg<'_> {
         arch: s("arch"),
         location: s("location"),
     }
+}
+
+/// Package rows by index, memoized: only the ones this process has
+/// never seen are read, and they are read in one grouped pass.
+fn packages_at<R, F>(open: &F, refs: &[u64]) -> Result<Vec<Arc<Value>>>
+where
+    R: ChunkReader + 'static,
+    F: Fn(&str) -> Result<(Arc<R>, Arc<ParquetMetaData>)>,
+{
+    let missing: Vec<u64> = {
+        let memo = pkg_memo().lock().expect("package memo");
+        refs.iter()
+            .filter(|r| !memo.contains_key(r))
+            .copied()
+            .collect()
+    };
+    if !missing.is_empty() {
+        let (preader, pmeta) = open("data/packages.parquet")?;
+        let fetched = rows_at(&preader, &pmeta, PKG_COLS, &missing)?;
+        let mut memo = pkg_memo().lock().expect("package memo");
+        if memo.len() < PKG_MEMO_MAX {
+            for (idx, row) in missing.iter().zip(fetched.iter()) {
+                memo.insert(*idx, Arc::new(row.clone()));
+            }
+        }
+        // Serve this call from what was just read, so a full memo
+        // still answers correctly.
+        let mut out = Vec::with_capacity(refs.len());
+        for r in refs {
+            let v = match memo.get(r) {
+                Some(v) => Arc::clone(v),
+                None => match missing.iter().position(|m| m == r) {
+                    Some(i) => Arc::new(fetched[i].clone()),
+                    None => Arc::new(Value::Null),
+                },
+            };
+            out.push(v);
+        }
+        return Ok(out);
+    }
+    let memo = pkg_memo().lock().expect("package memo");
+    Ok(refs
+        .iter()
+        .map(|r| {
+            memo.get(r)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Value::Null))
+        })
+        .collect())
 }
 
 /// The whole lookup, generic over how a repo-relative path becomes a
@@ -211,8 +281,7 @@ where
                 .into_iter()
                 .collect();
             refs.truncate(MAX_ROWS);
-            let (preader, pmeta) = open("data/packages.parquet")?;
-            let pkgs = rows_at(&preader, &pmeta, PKG_COLS, &refs)?;
+            let pkgs = packages_at(&open, &refs)?;
             for row in &rows {
                 let (Some(path), Some(pref)) = (row["path"].as_str(), row["pkg"].as_u64()) else {
                     continue;
