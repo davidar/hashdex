@@ -165,6 +165,45 @@ impl Plan {
     }
 }
 
+impl Plan {
+    /// The extent map behind a compressed file, for reading its bytes
+    /// back ([`Erofs::zreader`]).
+    pub(crate) fn zplan(&self) -> Option<&ZPlan> {
+        match self {
+            Plan::Streamed(zp) => Some(zp),
+            Plan::Ranged(_) => None,
+        }
+    }
+
+    /// The file's OWN stored pclusters, `la` in its own logical space
+    /// — what mkfs writes for files it did not pack into fragments.
+    pub(crate) fn own_pclusters(&self) -> Vec<PCluster> {
+        let Plan::Streamed(zp) = self else {
+            return Vec::new();
+        };
+        zp.exts
+            .iter()
+            .filter_map(|e| match &e.src {
+                ZSrc::Raw {
+                    pa,
+                    plen,
+                    alg,
+                    partial,
+                } => Some(PCluster {
+                    la: e.la,
+                    llen: e.llen,
+                    pa: *pa,
+                    plen: *plen,
+                    lzma: matches!(alg, Alg::Lzma),
+                    alg: *alg,
+                    partial: *partial,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 /// One stored pcluster of the packed inode: `plen` bytes at image
 /// offset `pa` decode to the `llen` bytes at `la` of the packed
 /// stream. `lzma` marks the ones a `microlzma@0` node can rebuild.
@@ -1757,6 +1796,59 @@ mod tests {
                 examples.into_inner().unwrap()
             );
         }
+    }
+
+    /// REFEREE (ignored): where a real image actually keeps its bytes
+    /// — fragments in the packed inode, pclusters of a file's own, or
+    /// plain ranges. What a recipe can reach follows from this split.
+    ///
+    ///   HDX_EROFS_IMAGE=… cargo test --release --lib erofs_inventory \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn erofs_inventory_of_a_real_image() {
+        let Ok(path) = std::env::var("HDX_EROFS_IMAGE") else {
+            eprintln!("HDX_EROFS_IMAGE unset — nothing to inventory");
+            return;
+        };
+        let fs = Erofs::open(View::of_file(std::path::Path::new(&path)).unwrap()).unwrap();
+        let (files, notes) = fs.files().unwrap();
+        let (mut packed, mut own, mut ranged) = ((0usize, 0u64), (0usize, 0u64), (0usize, 0u64));
+        let mut own_stored: HashMap<&str, (usize, u64, u64)> = HashMap::new();
+        for f in &files {
+            if f.plan.packed_whole().is_some() {
+                packed.0 += 1;
+                packed.1 += f.size;
+                continue;
+            }
+            let pcs = f.plan.own_pclusters();
+            if pcs.is_empty() {
+                ranged.0 += 1;
+                ranged.1 += f.size;
+                continue;
+            }
+            own.0 += 1;
+            own.1 += f.size;
+            for pc in &pcs {
+                let e = own_stored.entry(pc.alg_name()).or_default();
+                e.0 += 1;
+                e.1 += pc.plen;
+                e.2 += pc.llen;
+            }
+        }
+        println!("{} files, {} notes", files.len(), notes.len());
+        println!(
+            "  packed into fragments: {} files, {} bytes",
+            packed.0, packed.1
+        );
+        println!("  own pclusters:         {} files, {} bytes", own.0, own.1);
+        for (alg, (n, stored, logical)) in own_stored {
+            println!("    {alg}: {n} pclusters, {stored} stored, {logical} logical");
+        }
+        println!(
+            "  plain ranges:          {} files, {} bytes",
+            ranged.0, ranged.1
+        );
     }
 
     /// The interlaced transform matches erofs-utils' rotation copy.

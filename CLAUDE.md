@@ -39,6 +39,10 @@ hdx recipe FILE       # reconstruction manifest: verified splice of
                       #   archive, extract PATH, expect digest" —
                       #   attested by rpm-files FILEDIGESTS edges,
                       #   archives stated once in a sources table)
+                      #   + microlzma@0 nodes for erofs pclusters
+                      #   (re-encoded and byte-compared at mint; the
+                      #   packed inode's files become their inputs,
+                      #   uncompressed pclusters splice directly)
                       #   + literal residue → FILE.recipe.json;
                       #   `hdx recipe check RECIPE
                       #   DIR` rebuilds from local blobs, never
