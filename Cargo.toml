@@ -95,6 +95,9 @@ flate2 = "1"
 parquet = { version = "59.1.0", default-features = false }
 tar = "0.4.46"
 zip = "8.6.0"
+# Boot-image fixtures are framed the way a piped `zstd -15` frames
+# them; the bundled libzstd keeps that independent of the host's CLI.
+zstd = { version = "0.13.3", features = ["zstdmt"] }
 
 [profile.release]
 lto = true

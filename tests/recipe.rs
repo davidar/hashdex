@@ -710,7 +710,7 @@ fn recipe_boot_image_mints_a_zstd_node() {
     install_fatcat_dataset(&env, &rows);
     let early = newc_cpio(&[("kernel/x86/microcode/GenuineIntel.bin", &ucode)]);
     let body = newc_cpio(&[("usr/lib/one.bin", &one), ("usr/lib/two.bin", &two)]);
-    let img = initramfs_shape(&early, &system_zstd(&["-15"], &body));
+    let img = initramfs_shape(&early, &piped_zstd(15, None, &body));
     let path = env.write("initramfs.img", &img);
 
     let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
@@ -777,7 +777,7 @@ fn recipe_unreproducible_zstd_stays_literal() {
     install_fatcat_dataset(&env, &[(&row.0, &row.1, &row.2)]);
     let early = newc_cpio(&[("kernel/x86/microcode/GenuineIntel.bin", &one)]);
     let body = newc_cpio(&[("usr/lib/one.bin", &one)]);
-    let img = initramfs_shape(&early, &system_zstd(&["-15", "--long=27"], &body));
+    let img = initramfs_shape(&early, &piped_zstd(15, Some(27), &body));
     let path = env.write("initramfs.img", &img);
 
     let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
@@ -1373,6 +1373,141 @@ fn erofs_recipe_rebuilds_a_file_s_own_pclusters() {
         std::fs::read(&image).unwrap(),
         "rebuilt image differs"
     );
+}
+
+/// Rung G: an image's pclusters may hold bytes of a member nothing
+/// fetches — a boot image the filesystem ships, which this recipe
+/// knows how to REBUILD (early cpio literal, zstd@0 over a splice of
+/// the modules dracut copied from packages). The build joins the
+/// sources table beside the extract nodes, and the pclusters slice its
+/// output: MicroLZMA ones over the compressible microcode archive,
+/// verbatim ones over the incompressible frame.
+///
+/// The fixture (tests/data/erofs/boot.erofs.gz) was built in the
+/// fedora:44 container over `boot_tree()`:
+///
+///   mkfs.erofs -b4096 -zlzma -C8192 boot.erofs tree
+#[test]
+fn erofs_recipe_rebuilds_a_boot_image_it_ships() {
+    let env = TestEnv::new("recipe-erofs-boot");
+    let image = erofs_fixture(&env, "boot");
+    // Only the modules INSIDE the boot image are witnessed; the image
+    // itself, the microcode archive and os-release are not.
+    let modules = boot_modules();
+    let rpm = fake_rpm(
+        &modules
+            .iter()
+            .map(|(p, b)| (*p, &b[..]))
+            .collect::<Vec<_>>(),
+    );
+    let pkgid = sha256_hex(&rpm);
+    let rpm_url = "https://dl.example.org/pool/k/kernel-modules-6.19-1.fc44.x86_64.rpm";
+    let digests: Vec<String> = modules.iter().map(|(_, b)| sha256_hex(b)).collect();
+    let paths: Vec<String> = modules.iter().map(|(p, _)| format!("/{p}")).collect();
+    let rows: Vec<(&str, &str, usize)> = digests
+        .iter()
+        .zip(&paths)
+        .map(|(d, p)| (d.as_str(), p.as_str(), 0))
+        .collect();
+    install_rpm_files_dataset(
+        &env,
+        &[(
+            &pkgid,
+            "fedora-44",
+            "kernel-modules",
+            "6.19-1.fc44",
+            rpm_url,
+        )],
+        &rows,
+    );
+
+    let out = env.hdx(&["--offline", "recipe", image.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("boot.erofs.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    let sources = doc["sources"].as_array().unwrap();
+    // The boot image is in the table as a build of its own — a zstd@0
+    // node over the splice that reaches the rpm.
+    let built = sources
+        .iter()
+        .find(|s| s["build"]["name"] == "boot/initramfs.img")
+        .expect("the boot image is a source in its own right");
+    let frame = built["build"]["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["build"]["builder"] == "zstd@0")
+        .expect("a zstd@0 node for the image's compressed segment");
+    assert_eq!(frame["build"]["params"]["level"], 15);
+    let inner = frame["build"]["inputs"][0]["build"]["inputs"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        inner.iter().filter(|i| i["extract"].is_object()).count(),
+        2,
+        "both modules come out of the rpm: {inner:?}"
+    );
+
+    // The image's own splice slices that build — both ways a pcluster
+    // can hold a member's bytes.
+    let inputs = doc["root"]["build"]["inputs"].as_array().unwrap();
+    let sliced = |v: &serde_json::Value| -> bool {
+        v["slice"]["source"]
+            .as_u64()
+            .or(v["source"].as_u64())
+            .is_some_and(|s| sources[s as usize]["build"]["name"] == "boot/initramfs.img")
+    };
+    let verbatim = inputs.iter().filter(|i| sliced(i)).count();
+    let nodes: Vec<&serde_json::Value> = inputs
+        .iter()
+        .filter(|i| i["build"]["builder"] == "microlzma@0")
+        .collect();
+    assert!(verbatim > 0, "stored pclusters splice the rebuilt image");
+    assert!(
+        nodes
+            .iter()
+            .any(|n| n["build"]["inputs"].as_array().unwrap().iter().any(sliced)),
+        "a MicroLZMA pcluster re-encodes the rebuilt image's bytes"
+    );
+
+    // And the one rpm rebuilds the whole filesystem: the modules are
+    // extracted, the boot image re-assembled and re-compressed, its
+    // pclusters re-encoded, the image spliced.
+    let blobs = env.work().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join("kernel-modules.rpm"), &rpm).unwrap();
+    let rebuilt = env.work().join("rebuilt.erofs");
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        env.work().join("boot.erofs.recipe.json").to_str().unwrap(),
+        blobs.to_str().unwrap(),
+        "--output",
+        rebuilt.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    assert_eq!(
+        std::fs::read(&rebuilt).unwrap(),
+        std::fs::read(&image).unwrap(),
+        "rebuilt image differs"
+    );
+}
+
+/// Writes a fixture tree for the container that builds the images.
+/// Ignored: run it when a tree changes, then rebuild the image (the
+/// mkfs invocations are on the tests above).
+///
+///   HDX_FIXTURE_DIR=/tmp/tree cargo test -- --ignored dump_fixture_tree
+#[test]
+#[ignore]
+fn dump_fixture_tree() {
+    let which = std::env::var("HDX_FIXTURE_TREE").unwrap_or_else(|_| "boot".into());
+    dump_tree(&match which.as_str() {
+        "frag" => frag_tree(),
+        _ => boot_tree(),
+    });
 }
 
 /// An image whose pclusters this hdx can't reproduce mints anyway —

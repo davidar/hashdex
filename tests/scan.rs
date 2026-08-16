@@ -1118,7 +1118,7 @@ fn scan_walks_past_a_cpio_trailer() {
     let two = noisy_payload(12_000, 7);
     let early = newc_cpio(&[("kernel/x86/microcode/GenuineIntel.bin", &ucode)]);
     let body = newc_cpio(&[("usr/lib/one.bin", &one), ("usr/lib/two.bin", &two)]);
-    let img = initramfs_shape(&early, &system_zstd(&["-15"], &body));
+    let img = initramfs_shape(&early, &piped_zstd(15, None, &body));
     let path = env.write("initramfs.img", &img);
 
     let names = |out: &Output| -> Vec<String> {

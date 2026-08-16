@@ -424,9 +424,19 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool, from_parts: bool) -> R
         members: &members,
         residue,
         done: 0,
+        seen: Default::default(),
         ticker: &ticker,
     };
     verify_node(root, &mut plan, &mut vs)?;
+    // Sources the table carries as builds of their own — a boot image
+    // an erofs ships, whose pclusters slice its rebuilt bytes — are
+    // not reachable from the root's splice, so they prove themselves
+    // here: same digest check, same residue capture.
+    for i in referenced_tabled(&plan) {
+        if plan.builds.contains_key(&i) || plan.compress.contains_key(&i) {
+            verify_node(i, &mut plan, &mut vs)?;
+        }
+    }
     let residue = vs.residue.finish()?;
     ticker.clear();
 
@@ -452,7 +462,13 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool, from_parts: bool) -> R
                         fetchable += len;
                     }
                 }
-                Seg::Tabled { len, .. } => fetchable += len,
+                // A member with a build of its own accounts for itself,
+                // through that build's refs and gaps.
+                Seg::Tabled { idx, len, .. } => {
+                    if is_leaf(idx) {
+                        fetchable += len;
+                    }
+                }
                 // A pcluster's stored bytes are neither: they are
                 // accounted for through the node's own inputs, in
                 // packed space, below.
@@ -464,7 +480,11 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool, from_parts: bool) -> R
     for node in &plan.pclusters {
         for input in &node.inputs {
             match input {
-                PcInput::Member { len, .. } => fetchable += len,
+                PcInput::Member { idx, len, .. } => {
+                    if is_leaf(idx) {
+                        fetchable += len;
+                    }
+                }
                 PcInput::Literal { len, .. } => residue_total += len,
             }
         }
@@ -476,7 +496,8 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool, from_parts: bool) -> R
     }
     let mut nextracts = 0usize;
     for (i, m) in members.iter().enumerate() {
-        if (referenced_as_leaf(&plan, i) || plan.tabled.contains(&i)) && m.size > 0 {
+        if (referenced_as_leaf(&plan, i) || (plan.tabled.contains(&i) && is_leaf(&i))) && m.size > 0
+        {
             if plan.extracts.contains_key(&i) {
                 nextracts += 1;
             } else {
@@ -723,6 +744,43 @@ impl Planner<'_> {
             .0
             .iter()
             .any(|f| f.archive.is_none() && f.claims.iter().any(|c| c.url.is_some()))
+    }
+
+    /// Plan member `i` as a source the erofs passes may slice: not a
+    /// leaf anything fetches, but a member this recipe knows how to
+    /// rebuild — a boot image inside a live filesystem, whose own
+    /// splice reaches the packages dracut copied from. The build joins
+    /// the sources table like an extract node, and `check`
+    /// materializes it before slicing.
+    fn plan_source(&mut self, i: usize, plan: &mut Plan) -> bool {
+        self.subtree_is_fetchable(i) && self.plan_node(i, plan)
+    }
+
+    /// Whether anything under `i` is fetchable at all: a claim URL or
+    /// an archive attestation, anywhere in its subtree. Planning a
+    /// member's own build costs compressor searches, so it is only
+    /// worth attempting where something in there can actually be
+    /// fetched — an image full of unwitnessed bytes stays literal
+    /// either way.
+    fn subtree_is_fetchable(&self, i: usize) -> bool {
+        let mut stack = vec![i];
+        while let Some(k) = stack.pop() {
+            if k != i && (self.direct_claimed(k) || self.extractable(k)) {
+                return true;
+            }
+            stack.extend(self.kids[k].iter().copied());
+        }
+        false
+    }
+
+    /// Whether a witness states these bytes inside a sha256-named
+    /// archive with a claim URL — what `plan_extract` acts on.
+    fn extractable(&self, i: usize) -> bool {
+        self.evidence[i].0.iter().any(|f| {
+            f.archive
+                .as_ref()
+                .is_some_and(|a| a.scheme == "sha256" && a.url.is_some())
+        })
     }
 
     /// Plan member `i` as an extract node: a witness states these
@@ -1230,9 +1288,12 @@ impl Planner<'_> {
                 continue;
             }
             // A node for these bytes, or they may as well be literal:
-            // a claim URL that fetches them directly, or a witness that
-            // states them inside an archive (rung D).
-            if !self.direct_claimed(c) && !self.plan_extract(c, plan) {
+            // a claim URL that fetches them directly, a witness that
+            // states them inside an archive (rung D), or a verified
+            // build of the member's own (rung G — a boot image the
+            // image ships is rebuilt, then sliced).
+            if !self.direct_claimed(c) && !self.plan_extract(c, plan) && !self.plan_source(c, plan)
+            {
                 continue;
             }
             covers.push(Cover {
@@ -1345,23 +1406,12 @@ impl Planner<'_> {
             });
             plan.pclusters.push(node);
         }
-        // Extract nodes minted for members no surviving node slices
-        // would state an archive nothing fetches from.
+        // Sources minted for members no surviving node slices keep
+        // nothing: an extract would state an archive nothing fetches
+        // from, a build would count bytes nothing references.
         let keep = tabled_of(&segs, &plan.pclusters);
-        let unused: Vec<usize> = plan
-            .extracts
-            .keys()
-            .copied()
-            .filter(|c| {
-                !keep.contains(c)
-                    && !plan.tabled.contains(c)
-                    && covers.iter().any(|cv| cv.idx == *c)
-                    && !referenced_as_leaf(plan, *c)
-            })
-            .collect();
-        for c in unused {
-            plan.extracts.remove(&c);
-        }
+        let planned: Vec<usize> = covers.iter().map(|c| c.idx).collect();
+        drop_unused_sources(plan, &keep, &planned);
         out.append(&mut segs);
         Ok(())
     }
@@ -1393,7 +1443,8 @@ impl Planner<'_> {
             if m.size != f.size || m.size < IDENTITY_MIN_BYTES || m.digests.is_none() {
                 continue;
             }
-            if !self.direct_claimed(c) && !self.plan_extract(c, plan) {
+            if !self.direct_claimed(c) && !self.plan_extract(c, plan) && !self.plan_source(c, plan)
+            {
                 continue;
             }
             todo.push((c, f));
@@ -1450,23 +1501,11 @@ impl Planner<'_> {
             }
             out.append(&mut segs);
         }
-        // Members whose own pclusters produced nothing keep no extract
-        // node unless something else references them.
+        // Members whose own pclusters produced nothing keep no node
+        // unless something else references them.
         let keep = tabled_of(out, &plan.pclusters);
-        let unused: Vec<usize> = plan
-            .extracts
-            .keys()
-            .copied()
-            .filter(|c| {
-                !keep.contains(c)
-                    && !plan.tabled.contains(c)
-                    && todo.iter().any(|(t, _)| t == c)
-                    && !referenced_as_leaf(plan, *c)
-            })
-            .collect();
-        for c in unused {
-            plan.extracts.remove(&c);
-        }
+        let planned: Vec<usize> = todo.iter().map(|(c, _)| *c).collect();
+        drop_unused_sources(plan, &keep, &planned);
         Ok(())
     }
 
@@ -2131,6 +2170,40 @@ fn tile_gaps(segs: Vec<Seg>, size: u64) -> Vec<Seg> {
 /// Discard a rejected subtree's plans (a parent refused the child on
 /// extent overlap or a failed compressor search after recursion had
 /// already planned it).
+/// Anything in the plan that points at member `i`: a splice segment,
+/// a compression node's child, or a pcluster node's input.
+fn referenced_by_plan(plan: &Plan, i: usize) -> bool {
+    plan.builds.values().any(|b| {
+        b.segs.iter().any(|s| match s {
+            Seg::Child { idx, .. } | Seg::Tabled { idx, .. } => *idx == i,
+            _ => false,
+        })
+    }) || plan.compress.values().any(|c| c.child == i)
+        || plan.pclusters.iter().any(|n| {
+            n.inputs
+                .iter()
+                .any(|inp| matches!(inp, PcInput::Member { idx, .. } if *idx == i))
+        })
+}
+
+/// Sources a sweep planned but ended up slicing none of: their nodes
+/// come back out of the plan, so nothing states an archive nothing
+/// fetches from — or counts bytes nothing references.
+fn drop_unused_sources(
+    plan: &mut Plan,
+    keep: &std::collections::BTreeSet<usize>,
+    planned: &[usize],
+) {
+    let unused: Vec<usize> = planned
+        .iter()
+        .copied()
+        .filter(|c| !keep.contains(c) && !plan.tabled.contains(c) && !referenced_by_plan(plan, *c))
+        .collect();
+    for c in unused {
+        remove_plan_subtree(plan, c);
+    }
+}
+
 fn remove_plan_subtree(plan: &mut Plan, i: usize) {
     plan.extracts.remove(&i);
     if let Some(c) = plan.compress.remove(&i) {
@@ -2426,6 +2499,9 @@ struct VerifyState<'a> {
     members: &'a [Member],
     residue: ResidueWriter,
     done: usize,
+    /// Builds already proven: a member can be both spliced and tabled,
+    /// and its literals belong in the residue once.
+    seen: std::collections::HashSet<usize>,
     ticker: &'a Ticker,
 }
 
@@ -2478,6 +2554,9 @@ fn verify_node(i: usize, plan: &mut Plan, vs: &mut VerifyState) -> Result<()> {
 /// through. Child builds recurse at their position, so residue order
 /// is document order.
 fn verify_build(i: usize, plan: &mut Plan, vs: &mut VerifyState) -> Result<()> {
+    if !vs.seen.insert(i) {
+        return Ok(());
+    }
     let build = plan.builds.get_mut(&i).expect("planned build");
     let mut segs = std::mem::take(&mut build.segs);
     let runs = build.runs.clone();

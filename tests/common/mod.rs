@@ -565,30 +565,90 @@ pub fn system_gzip(args: &[&str], input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Deterministic mixed-entropy payload: compressible runs with seeded
-/// noise, long enough that rsyncable window resets actually fire.
-/// Compress with the system zstd, STREAMED — a piped run states no
-/// content size and frames multi-threaded, which is exactly what
-/// dracut's `cpio | zstd` writes and what zstd@0 nodes reproduce.
-pub fn system_zstd(args: &[&str], input: &[u8]) -> Vec<u8> {
-    use std::io::{Read as _, Write as _};
-    let mut child = std::process::Command::new("zstd")
-        .args(args)
-        .args(["-q", "-T0", "-c"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("zstd on PATH (required by the zstd@0 tests)");
-    let mut stdin = child.stdin.take().unwrap();
-    let writer = std::thread::spawn({
-        let input = input.to_vec();
-        move || stdin.write_all(&input)
-    });
-    let mut out = Vec::new();
-    child.stdout.take().unwrap().read_to_end(&mut out).unwrap();
-    writer.join().unwrap().unwrap();
-    assert!(child.wait().unwrap().success());
-    out
+/// A frame framed the way `cpio | zstd -N` frames one: no content
+/// size (the input is a pipe), the XXH64 checksum the CLI turns on,
+/// and the multi-threaded encoder the CLI defaults to — whose bytes
+/// differ from the single-threaded one's. Verified byte-identical to
+/// the system CLI at the same libzstd version (2026-08-16); using the
+/// bundled encoder keeps the fixtures independent of the host's zstd.
+/// `window_log` is the escape hatch for frames no catalog run makes.
+pub fn piped_zstd(level: i32, window_log: Option<u32>, input: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut enc = zstd::stream::write::Encoder::new(Vec::new(), level).unwrap();
+    enc.include_checksum(true).unwrap();
+    enc.include_contentsize(false).unwrap();
+    enc.multithread(1).unwrap();
+    if let Some(w) = window_log {
+        enc.long_distance_matching(true).unwrap();
+        enc.window_log(w).unwrap();
+    }
+    enc.write_all(input).unwrap();
+    enc.finish().unwrap()
+}
+
+/// The files inside the fixture boot image: the only witnessed
+/// content of `boot_tree()`, and incompressible, so the image stores
+/// the frame holding them raw (spliced from the rebuilt member) while
+/// the compressible microcode archive ahead of it takes MicroLZMA
+/// pclusters.
+pub fn boot_modules() -> Vec<(&'static str, Vec<u8>)> {
+    fn noise(len: usize, seed: u64) -> Vec<u8> {
+        let (mut x, mut out) = (seed, Vec::with_capacity(len));
+        while out.len() < len {
+            x = (x.wrapping_mul(6364136223846793005)).wrapping_add(1442695040888963407);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+    vec![
+        ("usr/lib/modules/one.ko", noise(30_000, 6)),
+        ("usr/lib/modules/two.ko", noise(18_000, 7)),
+    ]
+}
+
+/// The tree behind tests/data/erofs/boot.erofs.gz: a filesystem that
+/// ships a boot image, which is the shape rung G is about — the
+/// image's pclusters hold bytes of a member that is itself rebuilt,
+/// not fetched. Payload names live under `usr/lib/` so one rpm
+/// witness can state them.
+pub fn boot_tree() -> Vec<(&'static str, Vec<u8>)> {
+    let ucode: Vec<u8> = "GenuineIntel microcode blob, machine-made at compose time\n"
+        .repeat(220)
+        .into_bytes();
+    let early = newc_cpio(&[("kernel/x86/microcode/GenuineIntel.bin", &ucode)]);
+    let modules = boot_modules();
+    let body = newc_cpio(
+        &modules
+            .iter()
+            .map(|(p, b)| (*p, &b[..]))
+            .collect::<Vec<_>>(),
+    );
+    vec![
+        (
+            "boot/initramfs.img",
+            initramfs_shape(&early, &piped_zstd(15, None, &body)),
+        ),
+        (
+            "etc/os-release",
+            "NAME=\"Fixture Linux\"\nVERSION=\"44\"\n"
+                .repeat(60)
+                .into_bytes(),
+        ),
+    ]
+}
+
+/// Write a fixture tree for the container that builds the image (see
+/// the fixture recipes on the erofs tests). Ignored by default —
+/// `HDX_FIXTURE_DIR=/tmp/tree cargo test -- --ignored dump_fixture_tree`.
+pub fn dump_tree(tree: &[(&'static str, Vec<u8>)]) {
+    let dir = PathBuf::from(std::env::var("HDX_FIXTURE_DIR").expect("HDX_FIXTURE_DIR"));
+    for (path, bytes) in tree {
+        let p = dir.join(path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, bytes).unwrap();
+    }
+    println!("wrote {} files under {}", tree.len(), dir.display());
 }
 
 /// A boot image the way dracut builds one: an uncompressed "early"
@@ -604,6 +664,8 @@ pub fn initramfs_shape(early: &[u8], frame: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Deterministic mixed-entropy payload: compressible runs with seeded
+/// noise, long enough that rsyncable window resets actually fire.
 pub fn noisy_payload(len: usize, mut seed: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
     while out.len() < len {
