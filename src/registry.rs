@@ -101,7 +101,7 @@ pub static MEDIA: Spec = Spec {
 pub static RPM_FILES: Spec = Spec {
     name: "rpm-files",
     repo: "david-ar/rpm-files",
-    approx_size: "~1 GB",
+    approx_size: "~11 GB",
     suffix: 8 << 20,
     supports: crate::rpm_files::supports,
     start_paths: crate::rpm_files::start_paths,

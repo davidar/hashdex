@@ -7,8 +7,36 @@
 use crate::datasets::{self, Spec};
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
-use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// One stream to the Hub's CDN saturates around 8 MB/s however fat the
+/// link is, so multi-GB datasets arrive as concurrent ranged chunks —
+/// the same trick `hf_transfer` plays. Chunks are big enough that the
+/// per-request round trip disappears, and few enough that the in-flight
+/// buffers stay bounded (one streaming chunk per job, not one whole
+/// chunk in memory).
+const CHUNK: u64 = 16 << 20;
+const JOBS: usize = 8;
+/// Below this a single stream is already the whole story.
+const PARALLEL_MIN: u64 = 32 << 20;
+/// A chunk is re-requested from scratch on a transport error; a whole
+/// pull is long enough that one dropped connection must not lose it.
+const TRIES: usize = 3;
+
+/// The Hub speaks HTTP/2, which multiplexes every concurrent range
+/// request onto ONE TCP connection — one congestion window, one
+/// stream's worth of throughput, precisely what the chunking is trying
+/// to escape (measured: 8 jobs over h2 moved 10 MB/s where 6 separate
+/// connections moved 24). Bulk transfers get their own HTTP/1.1 client
+/// so a job really is its own connection.
+fn bulk_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent(format!("hashdex-hdx/{}", env!("CARGO_PKG_VERSION")))
+        .http1_only()
+        .pool_max_idle_per_host(JOBS)
+        .build()?)
+}
 
 fn known_names() -> String {
     datasets::SPECS
@@ -140,8 +168,8 @@ pub async fn pull(client: &reqwest::Client, name: &str) -> Result<()> {
         use std::io::IsTerminal;
         std::io::stderr().is_terminal()
     };
-    let mut last_tick = std::time::Instant::now();
-    let mut done_bytes = 0u64;
+    let progress = Progress::new(tty, total);
+    let bulk = bulk_client()?;
     for RemoteFile { path, size, .. } in &files {
         let dest = dir.join(path);
         if let Some(parent) = dest.parent() {
@@ -149,43 +177,19 @@ pub async fn pull(client: &reqwest::Client, name: &str) -> Result<()> {
         }
         if dest.metadata().is_ok_and(|m| m.len() == *size) && *size > 0 {
             eprintln!("  {path} — already present");
-            done_bytes += size;
+            progress.skip(*size);
             continue;
         }
         let url = format!("{}/{revision}/{path}", spec.resolve_base());
-        let resp = maybe_auth(client.get(&url), &url)
-            .send()
-            .await?
-            .error_for_status()
-            .with_context(|| format!("download {path}"))?;
         let part = dest.with_extension("parquet.part");
-        let mut out = std::io::BufWriter::new(
-            std::fs::File::create(&part).with_context(|| format!("create {}", part.display()))?,
-        );
-        let mut stream = resp.bytes_stream();
-        let mut got = 0u64;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            out.write_all(&chunk)?;
-            got += chunk.len() as u64;
-            if tty && last_tick.elapsed().as_millis() >= 100 {
-                last_tick = std::time::Instant::now();
-                eprint!(
-                    "\r  {path} — {} / {} ({} of {} total)   ",
-                    human(got),
-                    human(*size),
-                    human(done_bytes + got),
-                    human(total)
-                );
-            }
-        }
-        out.flush()?;
-        drop(out);
+        let got = download(&bulk, &url, &part, *size, path, &progress)
+            .await
+            .with_context(|| format!("download {path}"))?;
         if *size > 0 && got != *size {
             bail!("{path}: got {got} bytes, expected {size}");
         }
         std::fs::rename(&part, &dest)?;
-        done_bytes += got;
+        progress.finish_file();
         if tty {
             eprint!("\r\x1b[2K");
         }
@@ -203,6 +207,262 @@ pub async fn pull(client: &reqwest::Client, name: &str) -> Result<()> {
         dir.display()
     );
     Ok(())
+}
+
+/// The one-line download display, shared by every chunk job in flight:
+/// jobs report the bytes they land, and whichever one crosses the next
+/// tick prints. Rates count moved bytes only — files already present
+/// are progress, but they are not throughput.
+struct Progress {
+    tty: bool,
+    total: u64,
+    done: AtomicU64,
+    moved: AtomicU64,
+    file_done: AtomicU64,
+    file_size: AtomicU64,
+    started: std::time::Instant,
+    last_tick_ms: AtomicU64,
+}
+
+impl Progress {
+    fn new(tty: bool, total: u64) -> Progress {
+        Progress {
+            tty,
+            total,
+            done: AtomicU64::new(0),
+            moved: AtomicU64::new(0),
+            file_done: AtomicU64::new(0),
+            file_size: AtomicU64::new(0),
+            started: std::time::Instant::now(),
+            last_tick_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// A file already on disk: counted toward the total, never toward
+    /// the rate.
+    fn skip(&self, size: u64) {
+        self.done.fetch_add(size, Ordering::Relaxed);
+    }
+
+    fn start_file(&self, size: u64) {
+        self.file_done.store(0, Ordering::Relaxed);
+        self.file_size.store(size, Ordering::Relaxed);
+    }
+
+    fn finish_file(&self) {
+        self.file_done.store(0, Ordering::Relaxed);
+    }
+
+    fn advance(&self, label: &str, n: u64) {
+        let file_done = self.file_done.fetch_add(n, Ordering::Relaxed) + n;
+        let done = self.done.fetch_add(n, Ordering::Relaxed) + n;
+        let moved = self.moved.fetch_add(n, Ordering::Relaxed) + n;
+        if !self.tty {
+            return;
+        }
+        // One printer at a time: the job that wins the tick swap owns
+        // the line until the next one is due.
+        let ms = self.started.elapsed().as_millis() as u64;
+        let last = self.last_tick_ms.load(Ordering::Relaxed);
+        if ms < last + 100
+            || self
+                .last_tick_ms
+                .compare_exchange(last, ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        let rate = if ms > 0 { moved * 1000 / ms } else { 0 };
+        eprint!(
+            "\r  {label} — {} / {} ({} of {} total, {}/s)   ",
+            human(file_done),
+            human(self.file_size.load(Ordering::Relaxed)),
+            human(done),
+            human(self.total),
+            human(rate),
+        );
+    }
+
+    /// Un-count a failed attempt's bytes before it is retried.
+    fn rewind(&self, n: u64) {
+        self.file_done.fetch_sub(n, Ordering::Relaxed);
+        self.done.fetch_sub(n, Ordering::Relaxed);
+        self.moved.fetch_sub(n, Ordering::Relaxed);
+    }
+}
+
+/// Write at an absolute offset, on a handle of this job's own: chunk
+/// jobs share the file, never a file cursor (Windows' positional write
+/// moves one, and two jobs sharing it would race).
+fn write_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let (mut buf, mut offset) = (buf, offset);
+        while !buf.is_empty() {
+            let n = file.seek_write(buf, offset)?;
+            buf = &buf[n..];
+            offset += n as u64;
+        }
+        Ok(())
+    }
+}
+
+/// One file into `part`. Big files arrive as `JOBS` concurrent ranged
+/// chunks — a single stream to the Hub's CDN plateaus around 8 MB/s,
+/// which turns a 10 GB dataset into an hour — and anything else (or a
+/// server that ignores Range) streams once, as before.
+async fn download(
+    client: &reqwest::Client,
+    url: &str,
+    part: &Path,
+    size: u64,
+    label: &str,
+    progress: &Progress,
+) -> Result<u64> {
+    progress.start_file(size);
+    if size < PARALLEL_MIN || !supports_ranges(client, url).await {
+        return stream_whole(client, url, part, label, progress).await;
+    }
+
+    // Preallocated, so every job writes straight to its own offset.
+    let file = std::fs::File::create(part).with_context(|| format!("create {}", part.display()))?;
+    file.set_len(size)?;
+    drop(file);
+
+    let ranges: Vec<(u64, u64)> = (0..size.div_ceil(CHUNK))
+        .map(|i| {
+            let start = i * CHUNK;
+            (start, CHUNK.min(size - start))
+        })
+        .collect();
+    let mut jobs = futures::stream::iter(
+        ranges
+            .into_iter()
+            .map(|(start, len)| chunk(client, url, part, start, len, label, progress)),
+    )
+    .buffer_unordered(JOBS);
+    let mut got = 0u64;
+    while let Some(n) = jobs.next().await {
+        got += n?;
+    }
+    Ok(got)
+}
+
+/// Whether the server answers a ranged request with partial content.
+/// One tiny request per file, which the parallel path pays back many
+/// times over — and when the answer is no, the caller streams instead
+/// of failing every chunk in turn.
+async fn supports_ranges(client: &reqwest::Client, url: &str) -> bool {
+    let resp = maybe_auth(client.get(url), url)
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .send()
+        .await;
+    matches!(resp, Ok(r) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT)
+}
+
+/// One chunk, retried from scratch on a transport error: a 10 GB pull
+/// is long enough that a single dropped connection must not lose it.
+async fn chunk(
+    client: &reqwest::Client,
+    url: &str,
+    part: &Path,
+    start: u64,
+    len: u64,
+    label: &str,
+    progress: &Progress,
+) -> Result<u64> {
+    let mut last = None;
+    for attempt in 1..=TRIES {
+        let mut wrote = 0u64;
+        match try_chunk(client, url, part, start, len, label, progress, &mut wrote).await {
+            Ok(()) => return Ok(wrote),
+            Err(e) => {
+                progress.rewind(wrote);
+                if attempt < TRIES {
+                    eprintln!("\r\x1b[2K  {label} — chunk at {start} failed ({e}), retrying");
+                }
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.expect("a failed chunk carries its error"))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_chunk(
+    client: &reqwest::Client,
+    url: &str,
+    part: &Path,
+    start: u64,
+    len: u64,
+    label: &str,
+    progress: &Progress,
+    wrote: &mut u64,
+) -> Result<()> {
+    let resp = maybe_auth(client.get(url), url)
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={start}-{}", start + len - 1),
+        )
+        .send()
+        .await?
+        .error_for_status()?;
+    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        bail!(
+            "ranged request answered {} — expected partial content",
+            resp.status()
+        );
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(part)
+        .with_context(|| format!("open {}", part.display()))?;
+    let mut stream = resp.bytes_stream();
+    while let Some(bytes) = stream.next().await {
+        let bytes = bytes?;
+        write_at(&file, &bytes, start + *wrote)?;
+        *wrote += bytes.len() as u64;
+        progress.advance(label, bytes.len() as u64);
+    }
+    if *wrote != len {
+        bail!("chunk at {start}: got {wrote} bytes, expected {len}");
+    }
+    Ok(())
+}
+
+/// The single-stream path: small files, and any server that won't serve
+/// ranges.
+async fn stream_whole(
+    client: &reqwest::Client,
+    url: &str,
+    part: &Path,
+    label: &str,
+    progress: &Progress,
+) -> Result<u64> {
+    use std::io::Write;
+    let resp = maybe_auth(client.get(url), url)
+        .send()
+        .await?
+        .error_for_status()?;
+    let mut out = std::io::BufWriter::new(
+        std::fs::File::create(part).with_context(|| format!("create {}", part.display()))?,
+    );
+    let mut stream = resp.bytes_stream();
+    let mut got = 0u64;
+    while let Some(bytes) = stream.next().await {
+        let bytes = bytes?;
+        out.write_all(&bytes)?;
+        got += bytes.len() as u64;
+        progress.advance(label, bytes.len() as u64);
+    }
+    out.flush()?;
+    Ok(got)
 }
 
 /// `hdx index verify [name]`: hash every file of a pulled dataset and
