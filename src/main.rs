@@ -121,6 +121,13 @@ enum Command {
         action: Option<RecipeAction>,
         /// Container file to mint a recipe for
         file: Option<PathBuf>,
+        /// Plan the container's interior even when the indexes name
+        /// the whole file. Default: a published container's recipe is
+        /// the one reference that fetches it. Reconstruction from
+        /// parts is what survives the published copy going away —
+        /// packages outlive the images built from them
+        #[arg(long)]
+        from_parts: bool,
     },
     /// Find local files by digest (from the index hdx scan maintains)
     Locate {
@@ -301,7 +308,14 @@ async fn main() -> Result<()> {
             };
             scan_cmd::scan(paths, &filters, &sopts, &client, &opts).await?;
         }
-        (Some(Command::Recipe { action, file }), _) => match (action, file) {
+        (
+            Some(Command::Recipe {
+                action,
+                file,
+                from_parts,
+            }),
+            _,
+        ) => match (action, file) {
             (
                 Some(RecipeAction::Check {
                     recipe,
@@ -315,7 +329,7 @@ async fn main() -> Result<()> {
             (Some(RecipeAction::Jigdo { recipe }), _) => {
                 recipe_cmd::emit_jigdo(recipe)?;
             }
-            (None, Some(f)) => recipe_cmd::mint(f, !cli.no_cache, cli.json)?,
+            (None, Some(f)) => recipe_cmd::mint(f, !cli.no_cache, cli.json, *from_parts)?,
             (None, None) => {
                 anyhow::bail!("hdx recipe: name a container file, or `hdx recipe check RECIPE DIR`")
             }

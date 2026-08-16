@@ -233,7 +233,15 @@ impl Intervals {
 
 // ---------------------------------------------------------------- mint
 
-pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
+/// Mint a reconstruction manifest for `path`.
+///
+/// `from_parts` decides what to do when the indexes name the container
+/// itself: by default that IS the recipe (one reference, fetch it),
+/// because a published artifact needs no reconstruction. Set it to
+/// plan the interior anyway — the plan that still works once the
+/// published copy is gone, since the packages an image was built from
+/// outlive the image.
+pub fn mint(path: &Path, use_cache: bool, json_out: bool, from_parts: bool) -> Result<()> {
     let md = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     ensure!(md.is_file(), "{}: not a file", path.display());
     ensure!(
@@ -319,7 +327,7 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
     // claims only: an archive-interior claim's URL fetches the
     // containing archive, so it earns an extract node, not a ref.)
     let root_claims = claims_json(&evidence[root].0);
-    if !root_claims.is_empty() {
+    if !root_claims.is_empty() && !from_parts {
         let doc = json!({
             "hdx_recipe": "0",
             "source": source_json(path, &members[root]),
@@ -355,7 +363,8 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
     // A whole-file extract attestation wins outright (100% fetchable);
     // otherwise plan the tree. Order matters: a plain root always
     // "plans" as an all-literal build, which must not shadow this.
-    let planned = planner.plan_extract(root, &mut plan) || planner.plan_node(root, &mut plan);
+    let planned = (!from_parts && planner.plan_extract(root, &mut plan))
+        || planner.plan_node(root, &mut plan);
     ticker.clear();
     ensure!(
         planned,

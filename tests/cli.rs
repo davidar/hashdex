@@ -2214,6 +2214,65 @@ fn recipe_splices_a_plain_tar() {
     assert!(se.contains("web.archive.org"), "claim URL missing: {se}");
 }
 
+/// A container the indexes name needs no reconstruction: its recipe is
+/// the one reference that fetches it. `--from-parts` asks for the plan
+/// anyway — the one that still works when the published copy is gone,
+/// since the parts an artifact was built from outlive it.
+#[test]
+fn recipe_from_parts_plans_a_published_container() {
+    let env = TestEnv::new("recipe-from-parts");
+    let big = vec![0x3Cu8; 5000];
+    let mid: Vec<u8> = (0u8..=255).cycle().take(600).collect();
+    let tarball = plain_tar(&[("a.bin", &big), ("b.bin", &mid)]);
+    // The container itself is witnessed, as well as its members.
+    let rows = [digest_row(&big), digest_row(&mid), digest_row(&tarball)];
+    let rows: Vec<(&str, &str, &str)> = rows
+        .iter()
+        .map(|r| (r.0.as_str(), r.1.as_str(), r.2.as_str()))
+        .collect();
+    install_fatcat_dataset(&env, &rows);
+    let tar_path = env.write("demo.tar", &tarball);
+
+    let out = env.hdx(&["--offline", "recipe", tar_path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("nothing to reconstruct"),
+        "a published container should resolve to one reference: {}",
+        stdout(&out)
+    );
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("demo.tar.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(doc["root"]["ref"].is_object(), "root should be a ref");
+
+    let out = env.hdx(&[
+        "--offline",
+        "recipe",
+        "--from-parts",
+        tar_path.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("verified byte-exact"),
+        "summary: {}",
+        stdout(&out)
+    );
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("demo.tar.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    let build = &doc["root"]["build"];
+    assert_eq!(build["builder"], "splice@0");
+    let refs: Vec<&str> = build["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["ref"]["name"].as_str())
+        .collect();
+    assert_eq!(refs, vec!["a.bin", "b.bin"]);
+}
+
 /// Members witnessed as archive-interior bytes (rpm-files FILEDIGESTS
 /// rows) become extract nodes — "fetch this archive, extract this
 /// path, expect this digest" — with the archive stated once in the
