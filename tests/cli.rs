@@ -3053,6 +3053,281 @@ fn recipe_jigdo_projection_round_trips() {
     );
 }
 
+/// The tree inside `frag.erofs` (the rung-E fixture), regenerated
+/// byte-for-byte. Its content is pseudo-TEXT, not random bytes:
+/// mkfs.erofs stores incompressible data plain, and this fixture has
+/// to produce real MicroLZMA pclusters.
+fn frag_tree() -> Vec<(&'static str, Vec<u8>)> {
+    // The generator the fixture was built with (see the doc comment on
+    // erofs_recipe_rebuilds_pclusters_from_rpms): an LCG picking words.
+    fn prose(seed: u64, n: usize) -> Vec<u8> {
+        const WORDS: [&str; 16] = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
+        ];
+        let (mut x, mut out) = (seed, Vec::new());
+        while out.len() < n {
+            x = (x.wrapping_mul(1103515245).wrapping_add(12345)) % (1 << 31);
+            out.extend_from_slice(WORDS[((x >> 16) & 15) as usize].as_bytes());
+            out.push(if (x >> 20) & 7 == 0 { b'\n' } else { b' ' });
+        }
+        out.truncate(n);
+        out
+    }
+    let mut book = Vec::new();
+    for i in 0..500 {
+        book.extend_from_slice(
+            format!(
+                "the quick brown fox jumps over the lazy dog {:04}\n",
+                i % 977
+            )
+            .as_bytes(),
+        );
+    }
+    let dup = prose(7, 8000);
+    let mut tree: Vec<(&'static str, Vec<u8>)> = vec![
+        ("book.txt", book),
+        ("dup/a.bin", dup.clone()),
+        ("dup/b.bin", dup),
+        ("span.bin", prose(1, 100_000)),
+        ("tiny.txt", b"tiny fixture file\n".to_vec()),
+    ];
+    for (i, path) in [
+        "small/s1.txt",
+        "small/s2.txt",
+        "small/s3.txt",
+        "small/s4.txt",
+        "small/s5.txt",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        tree.push((
+            path,
+            format!("small file {}\n", i + 1).repeat(23).into_bytes(),
+        ));
+    }
+    tree
+}
+
+fn erofs_fixture(env: &TestEnv, name: &str) -> PathBuf {
+    let gz = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/data/erofs/{name}.erofs.gz")),
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&gz[..]), &mut raw).unwrap();
+    env.write(&format!("{name}.erofs"), &raw)
+}
+
+/// Rung E: an all-fragments erofs image is a splice of its own stored
+/// pclusters, and each pcluster is a MicroLZMA run over the files
+/// packed into it — files an rpm witness places inside a published
+/// package. Nothing in that chain is taken on faith: mint re-encodes
+/// every pcluster and compares bytes, and `check` rebuilds the image
+/// from the rpm alone.
+///
+/// The fixture (tests/data/erofs/frag.erofs.gz) was built in the
+/// fedora:44 container (erofs-utils 1.9.2) over the tree `frag_tree()`
+/// regenerates:
+///
+///   mkfs.erofs -b4096 -zlzma -C8192 \
+///              -Eall-fragments,fragdedupe,dedupe frag.erofs tree
+///
+/// which yields 3 stored pclusters over a 134,013-byte packed stream:
+/// several files share one pcluster, `span.bin` and the deduplicated
+/// `dup/{a,b}.bin` pair straddle pcluster boundaries, and `tiny.txt`
+/// (18 bytes) sits below the identity floor, so it can only be
+/// literal.
+#[test]
+fn erofs_recipe_rebuilds_pclusters_from_rpms() {
+    let env = TestEnv::new("recipe-erofs");
+    let image = erofs_fixture(&env, "frag");
+    let tree = frag_tree();
+
+    // One rpm ships the whole tree; the witness states a digest per
+    // path, which is what earns each member an extract node.
+    let rpm_files: Vec<(String, Vec<u8>)> = tree
+        .iter()
+        .map(|(p, b)| (format!("opt/frag/{p}"), b.clone()))
+        .collect();
+    let rpm = fake_rpm(
+        &rpm_files
+            .iter()
+            .map(|(p, b)| (p.as_str(), &b[..]))
+            .collect::<Vec<_>>(),
+    );
+    let pkgid = sha256_hex(&rpm);
+    let rpm_url = "https://dl.example.org/pool/f/frag-1.0-1.fc44.x86_64.rpm";
+    let digests: Vec<String> = tree.iter().map(|(_, b)| sha256_hex(b)).collect();
+    let paths: Vec<String> = tree.iter().map(|(p, _)| format!("/opt/frag/{p}")).collect();
+    let rows: Vec<(&str, &str, usize)> = digests
+        .iter()
+        .zip(&paths)
+        .map(|(d, p)| (d.as_str(), p.as_str(), 0))
+        .collect();
+    install_rpm_files_dataset(
+        &env,
+        &[(&pkgid, "fedora-44", "frag", "1.0-1.fc44", rpm_url)],
+        &rows,
+    );
+
+    let out = env.hdx(&["--offline", "recipe", image.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("erofs: 3/3 pclusters rebuilt byte-exact"),
+        "summary: {text}"
+    );
+    assert!(text.contains("verified byte-exact"), "summary: {text}");
+
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("frag.erofs.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(doc["hdx_recipe"], "1");
+    let inputs = doc["root"]["build"]["inputs"].as_array().unwrap();
+    let nodes: Vec<&serde_json::Value> = inputs
+        .iter()
+        .filter(|i| i["build"]["builder"] == "microlzma@0")
+        .collect();
+    assert_eq!(nodes.len(), 3, "one node per pcluster: {inputs:?}");
+    let params = &nodes[0]["build"]["params"];
+    assert_eq!(params["preset"], 6);
+    assert!(
+        params["dict_size"].as_u64().unwrap().is_power_of_two(),
+        "dict_size read from the image: {params}"
+    );
+    assert!(
+        params["pad"].as_u64().is_some(),
+        "padding recorded: {params}"
+    );
+
+    // Inputs are slices of the sources table, which carries the
+    // extract nodes — a member split across two pclusters is sliced by
+    // both, and stated once.
+    let sources = doc["sources"].as_array().unwrap();
+    assert_eq!(sources[0]["ref"]["digests"]["sha256"], pkgid.as_str());
+    assert_eq!(sources[0]["ref"]["claims"][0]["url"], rpm_url);
+    let span_idx = sources
+        .iter()
+        .position(|s| s["extract"]["path"] == "/opt/frag/span.bin")
+        .expect("span.bin has an extract node in the sources table");
+    assert_eq!(sources[span_idx]["extract"]["archive"]["source"], 0);
+    let slices: Vec<&serde_json::Value> = nodes
+        .iter()
+        .flat_map(|n| n["build"]["inputs"].as_array().unwrap())
+        .filter(|i| i["slice"]["source"] == span_idx || i["source"] == span_idx)
+        .collect();
+    assert_eq!(
+        slices.len(),
+        2,
+        "span.bin straddles two pclusters: {slices:?}"
+    );
+
+    // tiny.txt is below the identity floor: its bytes stay literal,
+    // and so do the image's own metadata blocks.
+    let cov = &doc["coverage"];
+    assert_eq!(cov["fetchable_bytes"].as_u64().unwrap(), 133_995);
+    assert!(
+        (4_096..4_200).contains(&cov["residue_bytes"].as_u64().unwrap()),
+        "residue is the superblock, inodes and tiny.txt: {cov}"
+    );
+
+    // Route 1: the rpm alone rebuilds the image, byte for byte.
+    let blobs = env.work().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join("frag.rpm"), &rpm).unwrap();
+    let rebuilt = env.work().join("rebuilt.erofs");
+    let recipe = env.work().join("frag.erofs.recipe.json");
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        recipe.to_str().unwrap(),
+        blobs.to_str().unwrap(),
+        "--output",
+        rebuilt.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    assert_eq!(
+        std::fs::read(&rebuilt).unwrap(),
+        std::fs::read(&image).unwrap(),
+        "rebuilt image differs"
+    );
+
+    // Route 2: without the rpm, the report names it and its URL.
+    std::fs::remove_file(blobs.join("frag.rpm")).unwrap();
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        recipe.to_str().unwrap(),
+        blobs.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    let se = stderr(&out);
+    assert!(se.contains(rpm_url), "stderr: {se}");
+
+    // A slice that points at the wrong bytes cannot pass: the encoder
+    // is fed something else, and the pcluster's digest says so.
+    let mut bad = doc.clone();
+    let (node, victim) = bad["root"]["build"]["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i["build"]["builder"] == "microlzma@0")
+        .find_map(|(n, i)| {
+            let at = i["build"]["inputs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|s| s["slice"]["from"].as_u64().is_some_and(|f| f > 0))?;
+            Some((n, at))
+        })
+        .expect("a sliced input");
+    bad["root"]["build"]["inputs"][node]["build"]["inputs"][victim]["slice"]["from"] =
+        serde_json::json!(1);
+    let bad_path = env.write(
+        "bad.recipe.json",
+        serde_json::to_string(&bad).unwrap().as_bytes(),
+    );
+    std::fs::copy(
+        env.work().join("frag.erofs.recipe.residue"),
+        env.work().join("bad.recipe.residue"),
+    )
+    .unwrap();
+    std::fs::write(blobs.join("frag.rpm"), &rpm).unwrap();
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        bad_path.to_str().unwrap(),
+        blobs.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("re-encoded pcluster hashes to"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+/// An image whose pclusters this hdx can't reproduce mints anyway —
+/// as an honest literal recipe, with no microlzma nodes and no error.
+#[test]
+fn erofs_recipe_of_lz4_image_stays_literal() {
+    let env = TestEnv::new("recipe-erofs-lz4");
+    let image = erofs_fixture(&env, "lz4");
+    let out = env.hdx(&["--offline", "recipe", image.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("lz4.erofs.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    let text = serde_json::to_string(&doc).unwrap();
+    assert!(!text.contains("microlzma"), "recipe: {text}");
+    assert_eq!(doc["hdx_recipe"], "0");
+}
+
 /// erofs images in every on-disk shape mkfs.erofs 1.9.2 produces from
 /// one source tree, walked to byte-verified member digests. Fixtures
 /// (tests/data/erofs/*.erofs.gz) were built in a fedora:44 container:

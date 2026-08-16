@@ -46,9 +46,21 @@ const LCL_HEAD2: u8 = 3;
 /// compressed block count, not a distance.
 const CBLKCNT: u32 = 1 << 11;
 
-const PCLUSTER_MAX_SIZE: u64 = 1 << 20;
-const PCLUSTER_MAX_DSIZE: u64 = 12 << 20;
+/// Format bounds: a pcluster never stores more than this many bytes,
+/// nor spans more than this many logical ones.
+pub(crate) const PCLUSTER_MAX_SIZE: u64 = 1 << 20;
+pub(crate) const PCLUSTER_MAX_DSIZE: u64 = 12 << 20;
 const LZMA_MAX_DICT: u32 = 8 << 20;
+
+/// feature_incompat bit that says `available_compr_algs` is a bitmap
+/// (rather than an lz4 max distance) and per-algorithm configuration
+/// blocks follow the superblock.
+const FEAT_COMPR_CFGS: u32 = 0x2;
+/// Bit position of MicroLZMA in `available_compr_algs`.
+const ALG_LZMA: u32 = 1;
+/// Size of `struct erofs_super_block` — where the compression
+/// configuration blocks begin.
+const SUPER_SIZE: u64 = 128;
 
 /// Decompressed packed-inode pclusters kept around: files packed as
 /// fragments share pclusters with their neighbors, and the walker
@@ -89,6 +101,10 @@ pub(crate) struct Erofs {
     meta_base: u64,
     root_nid: u64,
     packed_nid: u64,
+    /// `available_compr_algs` bitmap, and whether the superblock says
+    /// to read it as one (old images overload the field).
+    compr_algs: u16,
+    compr_cfgs: bool,
     packed: Mutex<Option<Arc<ZPlan>>>,
     cache: Mutex<PackedCache>,
 }
@@ -125,6 +141,49 @@ impl Inode {
 pub(crate) enum Plan {
     Ranged(Vec<(u64, u64)>),
     Streamed(ZPlan),
+}
+
+impl Plan {
+    /// The offset in the packed inode's stream where ALL of this
+    /// file's bytes live, when they live there contiguously — the
+    /// `-Eall-fragments` shape (Fedora live media). Files with
+    /// pclusters of their own, or with only a packed tail, return
+    /// None: recipes can only attribute a fragment span to a member
+    /// when the member IS that span.
+    pub(crate) fn packed_whole(&self) -> Option<u64> {
+        let Plan::Streamed(zp) = self else {
+            return None;
+        };
+        match &zp.exts[..] {
+            [ZExt {
+                la: 0,
+                llen,
+                src: ZSrc::Packed { off },
+            }] if *llen == zp.size => Some(*off),
+            _ => None,
+        }
+    }
+}
+
+/// One stored pcluster of the packed inode: `plen` bytes at image
+/// offset `pa` decode to the `llen` bytes at `la` of the packed
+/// stream. `lzma` marks the ones a `microlzma@0` node can rebuild.
+pub(crate) struct PCluster {
+    pub(crate) la: u64,
+    pub(crate) llen: u64,
+    pub(crate) pa: u64,
+    pub(crate) plen: u64,
+    pub(crate) lzma: bool,
+    alg: Alg,
+    partial: bool,
+}
+
+/// What mkfs recorded about the image's MicroLZMA compressor. The
+/// dictionary size is read, never assumed: it is an encoder input, and
+/// a wrong one produces different bytes.
+pub(crate) struct LzmaCfg {
+    pub(crate) dict_size: u32,
+    pub(crate) format: u16,
 }
 
 pub(crate) struct ZPlan {
@@ -208,6 +267,8 @@ impl Erofs {
             meta_base: (le32(&sb, 40) as u64) << blkszbits,
             root_nid: le16(&sb, 14) as u64,
             packed_nid: le64(&sb, 96),
+            compr_algs: le16(&sb, 84),
+            compr_cfgs: incompat & FEAT_COMPR_CFGS != 0,
             view,
             blkszbits,
             packed: Mutex::new(None),
@@ -841,6 +902,79 @@ impl Erofs {
         Ok(plan)
     }
 
+    /// Every stored pcluster of the packed inode, in stream order, and
+    /// the stream's total length. Holes (a packed inode written with
+    /// gaps) carry no stored bytes and are simply absent — each
+    /// pcluster names its own `la`, so the list needs no continuity.
+    pub(crate) fn packed_pclusters(&self) -> Result<(Vec<PCluster>, u64)> {
+        if self.packed_nid == 0 {
+            return Ok((Vec::new(), 0));
+        }
+        let plan = self.packed_plan()?;
+        let mut out = Vec::with_capacity(plan.exts.len());
+        for e in &plan.exts {
+            match &e.src {
+                ZSrc::Raw {
+                    pa,
+                    plen,
+                    alg,
+                    partial,
+                } => out.push(PCluster {
+                    la: e.la,
+                    llen: e.llen,
+                    pa: *pa,
+                    plen: *plen,
+                    lzma: matches!(alg, Alg::Lzma),
+                    alg: *alg,
+                    partial: *partial,
+                }),
+                ZSrc::Zero => {}
+                ZSrc::Packed { .. } => unreachable!("checked when the packed map was built"),
+            }
+        }
+        Ok((out, plan.size))
+    }
+
+    /// The logical bytes of one packed pcluster, decoded straight from
+    /// the image (no LRU: recipe minting sweeps the stream once).
+    pub(crate) fn decode_pcluster(&self, pc: &PCluster) -> Result<Vec<u8>> {
+        self.decode_raw(pc.pa, pc.plen, pc.llen, pc.alg, pc.partial)
+    }
+
+    /// The image's MicroLZMA configuration, from the per-algorithm
+    /// blocks that follow the superblock: each is a `le16` length then
+    /// that many bytes, in `available_compr_algs` bit order.
+    pub(crate) fn lzma_cfg(&self) -> Result<Option<LzmaCfg>> {
+        if !self.compr_cfgs {
+            return Ok(None);
+        }
+        let mut off = EROFS_SUPER_OFFSET + SUPER_SIZE;
+        let mut algs = self.compr_algs;
+        for bit in 0..16 {
+            if algs == 0 {
+                break;
+            }
+            if algs & 1 != 0 {
+                let mut len = [0u8; 2];
+                read_exact_at(&self.view, &mut len, off).context("compression config")?;
+                let size = le16(&len, 0) as u64;
+                off += 2;
+                if bit == ALG_LZMA {
+                    ensure!(size >= 6, "truncated lzma configuration ({size} bytes)");
+                    let mut cfg = vec![0u8; size as usize];
+                    read_exact_at(&self.view, &mut cfg, off).context("lzma configuration")?;
+                    return Ok(Some(LzmaCfg {
+                        dict_size: le32(&cfg, 0),
+                        format: le16(&cfg, 4),
+                    }));
+                }
+                off += size;
+            }
+            algs >>= 1;
+        }
+        Ok(None)
+    }
+
     /// Read from the packed inode's decompressed stream, through the
     /// pcluster LRU. Returns a short read at extent boundaries.
     fn packed_read(&self, off: u64, buf: &mut [u8]) -> Result<usize> {
@@ -1259,9 +1393,81 @@ fn microlzma_decode(input: &[u8], out_len: usize, exact: bool) -> Result<Vec<u8>
     Ok(out)
 }
 
+/// Encode one MicroLZMA pcluster the way mkfs.erofs does: FIXED
+/// OUTPUT. mkfs hands the encoder the whole remaining stream and an
+/// output buffer of the pcluster's size, and the encoder stops when
+/// that buffer is full — cutting the final match mid-symbol. Feeding
+/// exactly the pcluster's logical span instead would end the stream
+/// cleanly and differ in its last few bytes, so callers must pass
+/// MORE input than the span and let `consumed` say what was used.
+/// Returns (compressed bytes, input bytes consumed).
+pub(crate) fn microlzma_encode(
+    input: &[u8],
+    out_cap: usize,
+    preset: u32,
+    dict_size: u32,
+) -> Result<(Vec<u8>, u64)> {
+    ensure!(out_cap > 0, "zero-capacity pcluster");
+    ensure!(
+        (1 << 12..=LZMA_MAX_DICT).contains(&dict_size),
+        "implausible lzma dictionary size {dict_size}"
+    );
+    let mut out = vec![0u8; out_cap];
+    let (produced, consumed) = unsafe {
+        let mut opts: liblzma_sys::lzma_options_lzma = std::mem::zeroed();
+        ensure!(
+            liblzma_sys::lzma_lzma_preset(&mut opts, preset) == 0,
+            "lzma preset {preset} rejected"
+        );
+        opts.dict_size = dict_size;
+        let mut strm: liblzma_sys::lzma_stream = std::mem::zeroed();
+        let r = liblzma_sys::lzma_microlzma_encoder(&mut strm, &opts);
+        ensure!(
+            r == liblzma_sys::LZMA_OK,
+            "microlzma encoder init failed ({r})"
+        );
+        strm.next_in = input.as_ptr();
+        strm.avail_in = input.len();
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out_cap;
+        // LZMA_OK here means "output full, input left over" — the
+        // truncated shape mkfs stores; LZMA_STREAM_END means the input
+        // ran out first (the last pcluster of a stream).
+        let r = liblzma_sys::lzma_code(&mut strm, liblzma_sys::LZMA_FINISH);
+        let got = (out_cap - strm.avail_out, strm.total_in);
+        liblzma_sys::lzma_end(&mut strm);
+        ensure!(
+            r == liblzma_sys::LZMA_OK || r == liblzma_sys::LZMA_STREAM_END,
+            "microlzma encode failed ({r})"
+        );
+        got
+    };
+    out.truncate(produced);
+    Ok((out, consumed))
+}
+
+/// Leading zero bytes of a stored pcluster: erofs right-aligns
+/// compressed data inside its blocks (the 0padding feature) so the
+/// kernel can decompress in place. Rebuilding one means writing the
+/// same padding back.
+pub(crate) fn pcluster_padding(stored: &[u8]) -> usize {
+    margin(stored)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One of the committed test images (see `scan_descends_erofs_images`
+    /// in tests/cli.rs for how they were built), decompressed.
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("tests/data/erofs/{name}.erofs.gz"));
+        let gz = std::fs::read(path).expect("fixture image");
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&gz[..]), &mut raw).unwrap();
+        raw
+    }
 
     /// Round-trip through liblzma's MicroLZMA coder pair — proves the
     /// unsafe FFI usage (init order, buffer wiring, FINISH semantics)
@@ -1296,6 +1502,96 @@ mod tests {
         assert_eq!(back, data);
     }
 
+    /// Fixed-output encoding: with an output buffer too small for the
+    /// whole input, the encoder fills it exactly, reports how much
+    /// input those bytes represent, and the result decodes back to
+    /// that prefix (`exact = false` — the last match is cut short).
+    #[test]
+    fn microlzma_fixed_output_truncates() {
+        let data: Vec<u8> = (0..200_000u32)
+            .flat_map(|i| ((i / 3) as u16).to_le_bytes())
+            .collect();
+        let (full, all) = microlzma_encode(&data, data.len(), 6, 1 << 20).unwrap();
+        assert_eq!(all, data.len() as u64, "whole input fits");
+        let cap = full.len() / 2;
+        let (part, consumed) = microlzma_encode(&data, cap, 6, 1 << 20).unwrap();
+        assert_eq!(part.len(), cap, "fixed output fills the buffer exactly");
+        assert!(consumed > 0 && consumed < data.len() as u64, "{consumed}");
+        let back = microlzma_decode(&part, consumed as usize, false).unwrap();
+        assert_eq!(back, data[..consumed as usize]);
+    }
+
+    /// The packed inode's pclusters, against the all-fragments fixture:
+    /// they tile the stream, each decodes to its stated span, and the
+    /// image states the dictionary size the encoder needs.
+    #[test]
+    fn packed_pclusters_tile_the_stream() {
+        let raw = fixture("frag");
+        let len = raw.len() as u64;
+        let view = View::new(
+            Arc::new(crate::peek_source::PSource::Mem(raw.into())),
+            &[(0, len)],
+        );
+        let fs = Erofs::open(view).unwrap();
+        let (pcs, size) = fs.packed_pclusters().unwrap();
+        assert!(pcs.len() > 1, "fixture should have several pclusters");
+        let mut la = 0;
+        for pc in &pcs {
+            assert_eq!(pc.la, la, "pclusters tile the packed stream");
+            assert_eq!(fs.decode_pcluster(pc).unwrap().len(), pc.llen as usize);
+            la += pc.llen;
+        }
+        assert!(
+            pcs.iter().filter(|p| p.lzma).count() > 1,
+            "fixture should have several MicroLZMA pclusters: {:?}",
+            pcs.iter()
+                .map(|p| (p.llen, p.plen, p.lzma))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(la, size, "pclusters cover the whole stream");
+        let cfg = fs.lzma_cfg().unwrap().expect("lzma configuration");
+        assert!(
+            cfg.dict_size.is_power_of_two() && cfg.dict_size >= (1 << 12),
+            "dict_size {}",
+            cfg.dict_size
+        );
+    }
+
+    /// The whole point of rung E: mkfs.erofs' stored pclusters come
+    /// back byte-exact from the packed stream, at the preset and
+    /// dictionary size the image itself states.
+    #[test]
+    fn packed_pclusters_re_encode_byte_exact() {
+        let raw = fixture("frag");
+        let len = raw.len() as u64;
+        let view = View::new(
+            Arc::new(crate::peek_source::PSource::Mem(raw.clone().into())),
+            &[(0, len)],
+        );
+        let fs = Erofs::open(view).unwrap();
+        let (pcs, _) = fs.packed_pclusters().unwrap();
+        let cfg = fs.lzma_cfg().unwrap().unwrap();
+        let stream: Vec<u8> = pcs
+            .iter()
+            .flat_map(|pc| fs.decode_pcluster(pc).unwrap())
+            .collect();
+        for pc in pcs.iter().filter(|p| p.lzma) {
+            let stored = &raw[pc.pa as usize..(pc.pa + pc.plen) as usize];
+            let pad = pcluster_padding(stored);
+            // More input than the span: the encoder must run out of
+            // OUTPUT, not input, or it ends the stream cleanly and the
+            // tail bytes differ.
+            let input = &stream[pc.la as usize..];
+            let (out, consumed) =
+                microlzma_encode(input, stored.len() - pad, 6, cfg.dict_size).unwrap();
+            let mut candidate = vec![0u8; pad];
+            candidate.extend_from_slice(&out);
+            candidate.resize(stored.len(), 0);
+            assert_eq!(candidate, stored, "pcluster at {} differs", pc.pa);
+            assert_eq!(consumed, pc.llen, "pcluster at {} span", pc.pa);
+        }
+    }
+
     /// The interlaced transform matches erofs-utils' rotation copy.
     #[test]
     fn interlaced_rotation() {
@@ -1311,6 +1607,8 @@ mod tests {
             meta_base: 0,
             root_nid: 0,
             packed_nid: 0,
+            compr_algs: 0,
+            compr_cfgs: false,
             packed: Mutex::new(None),
             cache: Mutex::new(PackedCache::default()),
         };

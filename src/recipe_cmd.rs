@@ -54,11 +54,65 @@ enum Seg {
         at: u64,
         root_off: u64,
     },
+    /// One stored pcluster of an erofs image, rebuilt by re-encoding
+    /// the member bytes it holds; `pc` indexes `Plan::pclusters`.
+    PCluster {
+        pc: usize,
+        at: u64,
+        len: u64,
+        root_off: u64,
+    },
     /// A literal gap no surviving reference covers. `bytes` is filled
     /// by the verify pass: inline capture for short runs, residue
     /// offset for the rest.
     Gap {
         at: u64,
+        len: u64,
+        residue_off: Option<u64>,
+        inline: Option<Vec<u8>>,
+    },
+}
+
+impl Seg {
+    fn at(&self) -> u64 {
+        match self {
+            Seg::Child { at, .. } | Seg::PCluster { at, .. } | Seg::Gap { at, .. } => *at,
+        }
+    }
+
+    fn len(&self) -> u64 {
+        match self {
+            Seg::Child { len, .. } | Seg::PCluster { len, .. } | Seg::Gap { len, .. } => *len,
+        }
+    }
+}
+
+/// A microlzma@0 node: one stored pcluster of an erofs image's packed
+/// inode, reproduced by re-encoding the member bytes packed into it.
+/// Verified at planning time — the encoder's output is compared with
+/// the stored bytes, so a PClusterNode in the plan IS a proof, exactly
+/// like a Compress.
+struct PClusterNode {
+    /// Stored size and digest — what the node must produce.
+    size: u64,
+    sha256: [u8; 32],
+    /// Leading zero bytes erofs pads the stored data with (0padding).
+    pad: usize,
+    preset: u32,
+    dict_size: u32,
+    inputs: Vec<PcInput>,
+    name: String,
+}
+
+/// One input of a microlzma@0 node, in packed-stream order.
+enum PcInput {
+    /// Bytes of a member the sources table carries a node for.
+    Member { idx: usize, from: u64, len: u64 },
+    /// Packed-stream bytes no fetchable member covers. Spooled during
+    /// planning (they are gone once the sweep moves on) and copied
+    /// into the residue in document order by the verify pass.
+    Literal {
+        spool_off: u64,
         len: u64,
         residue_off: Option<u64>,
         inline: Option<Vec<u8>>,
@@ -113,6 +167,16 @@ struct Plan {
     compress: HashMap<usize, Compress>,
     /// Member idx → its extract plan (leaves fetched via an archive).
     extracts: HashMap<usize, Extract>,
+    /// microlzma@0 nodes, referenced by `Seg::PCluster`.
+    pclusters: Vec<PClusterNode>,
+    /// Members whose nodes live in the top-level sources table because
+    /// pcluster inputs slice them (they have no place in any splice —
+    /// their bytes only exist inside a compressed pcluster).
+    tabled: std::collections::BTreeSet<usize>,
+    /// Packed-stream literal bytes, spooled during planning.
+    literals: Option<LiteralSpool>,
+    /// What the pcluster sweeps found, for the summary line.
+    pcstats: PcStats,
     root: usize,
 }
 
@@ -257,6 +321,10 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
         builds: HashMap::new(),
         compress: HashMap::new(),
         extracts: HashMap::new(),
+        pclusters: Vec::new(),
+        tabled: Default::default(),
+        literals: None,
+        pcstats: PcStats::default(),
         root,
     };
     let mut planner = Planner {
@@ -265,6 +333,7 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
         evidence: &evidence,
         spaces: &spaces,
         ticker: &ticker,
+        threads,
     };
     // A whole-file extract attestation wins outright (100% fetchable);
     // otherwise plan the tree. Order matters: a plain root always
@@ -280,12 +349,12 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
     // The whole file is one attested archive member: the recipe is a
     // single extract node — nothing to splice, nothing literal.
     if plan.extracts.contains_key(&root) {
-        let (sources, src_of) = sources_json(&plan);
+        let (sources, src_of, node_of) = sources_json(&plan, &members, &evidence);
         let doc = json!({
             "hdx_recipe": "1",
             "source": source_json(path, &members[root]),
             "sources": sources,
-            "root": node_json(root, &members, &plan, &evidence, &src_of),
+            "root": node_json(root, &members, &plan, &evidence, &src_of, &node_of),
         });
         let out = write_doc(path, &doc)?;
         let line = format!(
@@ -337,7 +406,19 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
                         fetchable += len;
                     }
                 }
+                // A pcluster's stored bytes are neither: they are
+                // accounted for through the node's own inputs, in
+                // packed space, below.
+                Seg::PCluster { .. } => {}
                 Seg::Gap { len, .. } => residue_total += len,
+            }
+        }
+    }
+    for node in &plan.pclusters {
+        for input in &node.inputs {
+            match input {
+                PcInput::Member { len, .. } => fetchable += len,
+                PcInput::Literal { len, .. } => residue_total += len,
             }
         }
     }
@@ -348,7 +429,7 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
     }
     let mut nextracts = 0usize;
     for (i, m) in members.iter().enumerate() {
-        if referenced_as_leaf(&plan, i) && m.size > 0 {
+        if (referenced_as_leaf(&plan, i) || plan.tabled.contains(&i)) && m.size > 0 {
             if plan.extracts.contains_key(&i) {
                 nextracts += 1;
             } else {
@@ -360,11 +441,15 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
     // New grammar forms (extract nodes, the sources table) bump the
     // version so an older hdx bails with its "unknown version" path
     // instead of misreading the document.
-    let (sources, src_of) = sources_json(&plan);
+    let (sources, src_of, node_of) = sources_json(&plan, &members, &evidence);
+    let narchives = src_of
+        .values()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
     let mut doc = json!({
-        "hdx_recipe": if plan.extracts.is_empty() { "0" } else { "1" },
+        "hdx_recipe": if plan.extracts.is_empty() && plan.pclusters.is_empty() { "0" } else { "1" },
         "source": source_json(path, &members[root]),
-        "root": node_json(root, &members, &plan, &evidence, &src_of),
+        "root": node_json(root, &members, &plan, &evidence, &src_of, &node_of),
         "residue": residue.as_ref().map(|r| json!({
             "sha256": hex_lower(&r.sha256),
             "size": r.file_len,
@@ -403,13 +488,20 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
     ));
     if nextracts > 0 {
         line.push_str(&format!(
-            ", {nextracts} extract{} from {} archive{}",
+            ", {nextracts} extract{} from {narchives} archive{}",
             s(nextracts),
-            sources.len(),
-            s(sources.len()),
+            s(narchives),
+        ));
+    }
+    if !plan.pclusters.is_empty() {
+        line.push_str(&format!(
+            ", {} pcluster{}",
+            plan.pclusters.len(),
+            s(plan.pclusters.len()),
         ));
     }
     line.push(')');
+    line.push_str(&pcluster_note(&plan.pcstats));
     let mut compressors: Vec<String> = plan.compress.values().map(|c| c.params.name()).collect();
     compressors.sort();
     compressors.dedup();
@@ -421,6 +513,43 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
     }
     report_summary(json_out, &doc, residue.as_ref().map(|r| r.file_len), &line);
     Ok(())
+}
+
+/// What the erofs sweep left behind, stated rather than implied: a
+/// pcluster that stays literal is a byte range no index verified, and
+/// the reasons are worth naming.
+fn pcluster_note(st: &PcStats) -> String {
+    if st.total == 0 {
+        return String::new();
+    }
+    let mut why: Vec<String> = Vec::new();
+    for (n, what) in [
+        (st.uncovered, "no fetchable members"),
+        (st.other_alg, "not MicroLZMA"),
+        (st.mismatch, "re-encoded differently"),
+        (st.margin, "input margin too small"),
+    ] {
+        if n > 0 {
+            why.push(format!("{n} {what}"));
+        }
+    }
+    let mut note = format!(
+        "\nerofs: {}/{} pcluster{} rebuilt byte-exact",
+        st.verified,
+        st.total,
+        s(st.total)
+    );
+    if !why.is_empty() {
+        note.push_str(&format!(" ({} — literal)", why.join(", ")));
+    }
+    if st.unverified_members > 0 {
+        note.push_str(&format!(
+            "; {} member{} dropped: packed bytes don't match their digest",
+            st.unverified_members,
+            s(st.unverified_members)
+        ));
+    }
+    note
 }
 
 fn referenced_as_leaf(plan: &Plan, i: usize) -> bool {
@@ -439,6 +568,7 @@ struct Planner<'a> {
     evidence: &'a [report::Evidence],
     spaces: &'a HashMap<usize, View>,
     ticker: &'a Ticker,
+    threads: usize,
 }
 
 impl Planner<'_> {
@@ -448,6 +578,32 @@ impl Planner<'_> {
     /// descent at the caller.)
     fn plan_node(&mut self, i: usize, plan: &mut Plan) -> bool {
         if self.members[i].kind == "gzip" && self.plan_compress(i, plan) {
+            return true;
+        }
+        // An erofs image keeps its build even when no child of it can
+        // be spliced: an -Eall-fragments image has no plain ranges at
+        // all, and everything it holds arrives in the second pass.
+        if self.members[i].kind == "erofs" {
+            if !self.plan_build_inner(i, plan, true) {
+                return false;
+            }
+            match self.plan_erofs(i, plan) {
+                Ok(stats) => plan.pcstats.add(stats),
+                // An image this reader can't re-plan is not a failure:
+                // its bytes stay literal, exactly as before rung E.
+                Err(e) => eprintln!(
+                    "note: {}: erofs pclusters stay literal: {e:#}",
+                    self.members[i].path
+                ),
+            }
+            let useful = plan
+                .builds
+                .get(&i)
+                .is_some_and(|b| b.segs.iter().any(|s| !matches!(s, Seg::Gap { .. })));
+            if !useful && i != plan.root {
+                remove_plan_subtree(plan, i);
+                return false;
+            }
             return true;
         }
         self.plan_build(i, plan)
@@ -592,6 +748,13 @@ impl Planner<'_> {
     /// Claims stop descent the other way too: a member the indexes
     /// already name is one line — its inside needs no proof.
     fn plan_build(&mut self, i: usize, plan: &mut Plan) -> bool {
+        self.plan_build_inner(i, plan, false)
+    }
+
+    /// `keep_empty` holds on to a build with no accepted children —
+    /// for the root (whose all-literal recipe is still a recipe) and
+    /// for erofs images, whose children arrive in a second pass.
+    fn plan_build_inner(&mut self, i: usize, plan: &mut Plan, keep_empty: bool) -> bool {
         let members = self.members;
         let m = &members[i];
         if m.size < IDENTITY_MIN_BYTES || m.digests.is_none() {
@@ -656,48 +819,14 @@ impl Planner<'_> {
             }
             segs.extend(pieces);
         }
-        if segs.is_empty() && i != plan.root {
+        if segs.is_empty() && i != plan.root && !keep_empty {
             return false;
         }
-        segs.sort_by_key(|s| match s {
-            Seg::Child { at, .. } | Seg::Gap { at, .. } => *at,
-        });
-        // Gaps between accepted segments become literals; the tiling
-        // must come out exact or the plan is wrong.
-        let mut tiled: Vec<Seg> = Vec::new();
-        let mut pos = 0u64;
-        for seg in segs {
-            let at = match &seg {
-                Seg::Child { at, .. } | Seg::Gap { at, .. } => *at,
-            };
-            assert!(at >= pos, "overlapping splice segments survived planning");
-            if at > pos {
-                tiled.push(Seg::Gap {
-                    at: pos,
-                    len: at - pos,
-                    residue_off: None,
-                    inline: None,
-                });
-            }
-            pos = at
-                + match &seg {
-                    Seg::Child { len, .. } | Seg::Gap { len, .. } => *len,
-                };
-            tiled.push(seg);
-        }
-        let size = members[i].size;
-        if pos < size {
-            tiled.push(Seg::Gap {
-                at: pos,
-                len: size - pos,
-                residue_off: None,
-                inline: None,
-            });
-        }
+        segs.sort_by_key(|s| s.at());
         plan.builds.insert(
             i,
             Build {
-                segs: tiled,
+                segs: tile_gaps(segs, members[i].size),
                 dropped,
                 space,
                 runs,
@@ -705,6 +834,705 @@ impl Planner<'_> {
         );
         true
     }
+}
+
+// ------------------------------------------------------- erofs images
+
+/// How many bytes past a pcluster's own span the encoder may read.
+/// mkfs encodes fixed-output — it stops when the output buffer fills,
+/// mid-symbol — so the input must not run out first; anything the
+/// encoder consumes beyond its logical span is just more slices.
+const ENCODE_MARGIN: usize = 1 << 20;
+
+/// Packed-stream bytes no member covers, parked in a temp file during
+/// the sweep (they are gone once the sweep moves past them, and the
+/// residue can only take them in document order, later).
+struct LiteralSpool {
+    file: Mutex<(std::fs::File, u64)>,
+}
+
+impl LiteralSpool {
+    fn new() -> Result<LiteralSpool> {
+        let dir = crate::filter::filters_dir()
+            .parent()
+            .map(|p| p.join("tmp"))
+            .context("no cache dir")?;
+        std::fs::create_dir_all(&dir)?;
+        Ok(LiteralSpool {
+            file: Mutex::new((tempfile::tempfile_in(&dir)?, 0)),
+        })
+    }
+
+    fn append(&self, bytes: &[u8]) -> Result<u64> {
+        let mut g = self.file.lock().unwrap();
+        let at = g.1;
+        g.0.write_all(bytes)?;
+        g.1 += bytes.len() as u64;
+        Ok(at)
+    }
+
+    fn read_at(&self, off: u64, len: u64, feed: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        let g = self.file.lock().unwrap();
+        let mut pos = off;
+        let end = off + len;
+        let mut buf = vec![0u8; 1 << 20];
+        while pos < end {
+            let want = ((end - pos) as usize).min(buf.len());
+            #[cfg(unix)]
+            let n = std::os::unix::fs::FileExt::read_at(&g.0, &mut buf[..want], pos)?;
+            #[cfg(windows)]
+            let n = std::os::windows::fs::FileExt::seek_read(&g.0, &mut buf[..want], pos)?;
+            ensure!(n > 0, "literal spool truncated");
+            feed(&buf[..n])?;
+            pos += n as u64;
+        }
+        Ok(())
+    }
+}
+
+/// What one pass over a packed stream produced: the pcluster nodes
+/// that came back byte-exact (by pcluster index), and the members
+/// whose packed bytes did not hash to their digest.
+type Swept = (Vec<(usize, PClusterNode)>, std::collections::HashSet<usize>);
+
+/// A member whose bytes ARE a span of the packed stream.
+#[derive(Clone)]
+struct Cover {
+    idx: usize,
+    pstart: u64,
+    len: u64,
+}
+
+impl Cover {
+    fn end(&self) -> u64 {
+        self.pstart + self.len
+    }
+}
+
+/// What the pcluster sweep did, for the mint summary and the honest
+/// accounting of what stayed literal.
+#[derive(Default)]
+struct PcStats {
+    /// Stored pclusters of the packed inode, and how they ended up.
+    total: usize,
+    verified: usize,
+    /// No fetchable member covers enough of the span for a node to
+    /// shrink the residue.
+    uncovered: usize,
+    /// Not MicroLZMA (plain, interlaced, or another algorithm).
+    other_alg: usize,
+    /// Re-encoded to different bytes: a compressor this hdx can't
+    /// reproduce. These stay literal, like an unreproducible gzip.
+    mismatch: usize,
+    /// The encoder wanted more input than the sweep had buffered.
+    margin: usize,
+    /// Members dropped because the packed bytes don't hash to their
+    /// digest (a mapping this reader got wrong — never a silent slice).
+    unverified_members: usize,
+}
+
+impl PcStats {
+    /// One image's tally into the recipe's (an iso can hold several).
+    fn add(&mut self, o: PcStats) {
+        self.total += o.total;
+        self.verified += o.verified;
+        self.uncovered += o.uncovered;
+        self.other_alg += o.other_alg;
+        self.mismatch += o.mismatch;
+        self.margin += o.margin;
+        self.unverified_members += o.unverified_members;
+    }
+}
+
+/// liblzma's "extreme" preset flag (`LZMA_PRESET_EXTREME`).
+const LZMA_PRESET_EXTREME: u32 = 1 << 31;
+
+impl Planner<'_> {
+    /// The view a member's own bytes are read through.
+    fn member_view(&self, i: usize) -> Option<View> {
+        let m = &self.members[i];
+        if let Some(v) = &m.space {
+            return Some(v.clone());
+        }
+        let e = m.extents.as_ref()?;
+        let space = self.spaces.get(&e.src)?;
+        let runs: Vec<(u64, u64)> = e.runs.iter().map(|&(_, off, len)| (off, len)).collect();
+        Some(space.slice(&runs))
+    }
+
+    /// Plan the compressed bulk of an erofs image. `plan_build` has
+    /// already spliced whatever flat members the image stores as plain
+    /// ranges; everything else lives inside the packed inode's
+    /// pclusters, which is where an `-Eall-fragments` image (Fedora
+    /// live media) keeps literally all of its data. Each stored
+    /// pcluster holding fetchable member bytes becomes a microlzma@0
+    /// node — re-encoded and byte-compared right here, so a node that
+    /// survives is a proof, not a hypothesis.
+    fn plan_erofs(&mut self, i: usize, plan: &mut Plan) -> Result<PcStats> {
+        let mut stats = PcStats::default();
+        let view = self
+            .member_view(i)
+            .context("erofs member has no readable space")?;
+        let fs = crate::erofs::Erofs::open(view.clone())?;
+        let Some(cfg) = fs.lzma_cfg()? else {
+            return Ok(stats); // no MicroLZMA configured: nothing to rebuild
+        };
+        // Format 0 is plain LZMA1, the only shape erofs defines and the
+        // only one `microlzma_encode` models.
+        ensure!(
+            cfg.format == 0,
+            "unknown erofs lzma format {} — pclusters stay literal",
+            cfg.format
+        );
+        let (pcs, _) = fs.packed_pclusters()?;
+        stats.total = pcs.len();
+        if pcs.is_empty() {
+            return Ok(stats);
+        }
+        let (files, _) = fs.files()?;
+
+        // Which member is which file: the walker names erofs children
+        // "<image path>!<path inside>".
+        let mut by_path: HashMap<&str, usize> = HashMap::new();
+        for &c in self.kids[i].iter() {
+            by_path.insert(self.members[c].path.as_str(), c);
+        }
+        let mut covers: Vec<Cover> = Vec::new();
+        for f in &files {
+            let Some(off) = f.plan.packed_whole() else {
+                continue; // own pclusters, or only a packed tail
+            };
+            let path = format!("{}!{}", self.members[i].path, f.path);
+            let Some(&c) = by_path.get(path.as_str()) else {
+                continue;
+            };
+            let m = &self.members[c];
+            if m.size != f.size || m.size < IDENTITY_MIN_BYTES || m.digests.is_none() {
+                continue;
+            }
+            // A node for these bytes, or they may as well be literal:
+            // a claim URL that fetches them directly, or a witness that
+            // states them inside an archive (rung D).
+            if !self.direct_claimed(c) && !self.plan_extract(c, plan) {
+                continue;
+            }
+            covers.push(Cover {
+                idx: c,
+                pstart: off,
+                len: m.size,
+            });
+        }
+        if covers.is_empty() {
+            stats.uncovered = pcs.iter().filter(|p| p.lzma).count();
+            stats.other_alg = stats.total - stats.uncovered;
+            return Ok(stats);
+        }
+        // Dedupe (and hardlinks) put two members on the same bytes:
+        // longest-first at a shared start, and the tiling takes one
+        // cover per byte.
+        covers.sort_by_key(|c| (c.pstart, std::cmp::Reverse(c.len)));
+
+        // A node earns its place only by shrinking the residue: it
+        // trades `plen` stored bytes for whatever of its input span no
+        // member covers.
+        let union = merge_spans(&covers);
+        let mut eligible = vec![false; pcs.len()];
+        for (k, pc) in pcs.iter().enumerate() {
+            if !pc.lzma {
+                stats.other_alg += 1;
+                continue;
+            }
+            let covered = overlap(&union, pc.la, pc.llen);
+            if covered > 0 && pc.llen - covered < pc.plen {
+                eligible[k] = true;
+            } else {
+                stats.uncovered += 1;
+            }
+        }
+        if !eligible.iter().any(|&e| e) {
+            return Ok(stats);
+        }
+        // Covers touching an eligible pcluster are the ones worth
+        // verifying; their spans decide which pclusters must decode.
+        let used: Vec<Cover> = covers
+            .iter()
+            .filter(|c| {
+                pcs.iter()
+                    .zip(&eligible)
+                    .any(|(pc, &e)| e && c.pstart < pc.la + pc.llen && pc.la < c.end())
+            })
+            .cloned()
+            .collect();
+        let mut need = eligible.clone();
+        for (k, pc) in pcs.iter().enumerate() {
+            if need[k] {
+                continue;
+            }
+            need[k] = used
+                .iter()
+                .any(|c| c.pstart < pc.la + pc.llen && pc.la < c.end());
+        }
+
+        let spool = match plan.literals.take() {
+            Some(s) => s,
+            None => LiteralSpool::new()?,
+        };
+        let (nodes, failed) = self.sweep_pclusters(
+            &fs, &view, &pcs, &eligible, &need, &used, &cfg, &spool, &mut stats,
+        )?;
+        plan.literals = Some(spool);
+
+        // A member the packed bytes don't hash to is a mapping this
+        // reader got wrong: drop every node that sliced it rather than
+        // emit a slice that can't be true.
+        let mut kept: Vec<(usize, PClusterNode)> = Vec::new();
+        for (k, node) in nodes {
+            let bad = node.inputs.iter().any(|input| match input {
+                PcInput::Member { idx, .. } => failed.contains(idx),
+                PcInput::Literal { .. } => false,
+            });
+            if bad {
+                stats.verified -= 1;
+            } else {
+                kept.push((k, node));
+            }
+        }
+        if kept.is_empty() {
+            return Ok(stats);
+        }
+
+        // Nodes take their place in the image's splice; the members
+        // they slice move into the sources table.
+        let mut segs: Vec<Seg> = Vec::new();
+        for (k, node) in kept {
+            for input in &node.inputs {
+                if let PcInput::Member { idx, .. } = input {
+                    plan.tabled.insert(*idx);
+                }
+            }
+            let pc = &pcs[k];
+            segs.push(Seg::PCluster {
+                pc: plan.pclusters.len(),
+                at: 0,
+                len: pc.plen,
+                root_off: pc.pa,
+            });
+            plan.pclusters.push(node);
+        }
+        // Extract nodes minted for members that no surviving node
+        // slices would state an archive nothing fetches from.
+        let unused: Vec<usize> = plan
+            .extracts
+            .keys()
+            .copied()
+            .filter(|c| {
+                !plan.tabled.contains(c)
+                    && covers.iter().any(|cv| cv.idx == *c)
+                    && !referenced_as_leaf(plan, *c)
+            })
+            .collect();
+        for c in unused {
+            plan.extracts.remove(&c);
+        }
+        splice_in(i, plan, segs, &view)?;
+        Ok(stats)
+    }
+
+    /// One pass over the packed stream: decode what's needed, verify
+    /// that each covering member's bytes really are the packed bytes
+    /// claimed for it, and hand every eligible pcluster to the encoder
+    /// pool. Returns the nodes that came back byte-exact, and the
+    /// members whose digests didn't check out.
+    #[allow(clippy::too_many_arguments)]
+    fn sweep_pclusters(
+        &self,
+        fs: &crate::erofs::Erofs,
+        view: &View,
+        pcs: &[crate::erofs::PCluster],
+        eligible: &[bool],
+        need: &[bool],
+        used: &[Cover],
+        cfg: &crate::erofs::LzmaCfg,
+        spool: &LiteralSpool,
+        stats: &mut PcStats,
+    ) -> Result<Swept> {
+        struct Job {
+            k: usize,
+            input: Vec<u8>,
+            stored: Vec<u8>,
+        }
+        let jobs = std::sync::mpsc::sync_channel::<Job>(self.threads.max(1));
+        let (tx, rx) = jobs;
+        let rx = Mutex::new(rx);
+        let out: Mutex<Vec<(usize, PClusterNode)>> = Mutex::new(Vec::new());
+        let counts: Mutex<(usize, usize, usize)> = Mutex::new((0, 0, 0)); // ok, mismatch, margin
+        let failed: Mutex<std::collections::HashSet<usize>> = Mutex::new(Default::default());
+        let preset = Mutex::new(None::<u32>);
+        let done = AtomicUsize::new(0);
+        let want = eligible.iter().filter(|&&e| e).count();
+
+        let mut result: Result<()> = Ok(());
+        std::thread::scope(|scope| {
+            for _ in 0..self.threads.max(1) {
+                scope.spawn(|| loop {
+                    let Ok(job) = rx.lock().unwrap().recv() else {
+                        return;
+                    };
+                    let pc = &pcs[job.k];
+                    // The first job settles the preset for the whole
+                    // image (one compressor invocation built it); the
+                    // rest reuse it, and only re-search if it fails.
+                    let known = *preset.lock().unwrap();
+                    let outcome = plan_pcluster(
+                        pc,
+                        &job.stored,
+                        &job.input,
+                        used,
+                        known,
+                        cfg.dict_size,
+                        spool,
+                    );
+                    match outcome {
+                        Ok(Some((node, p))) => {
+                            *preset.lock().unwrap() = Some(p);
+                            out.lock().unwrap().push((job.k, node));
+                            counts.lock().unwrap().0 += 1;
+                        }
+                        Ok(None) => counts.lock().unwrap().1 += 1,
+                        Err(e) if e.to_string() == MARGIN_SHORT => counts.lock().unwrap().2 += 1,
+                        Err(_) => counts.lock().unwrap().1 += 1,
+                    }
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    self.ticker
+                        .update(1, 0, || format!("re-encoding pclusters… {d}/{want}"));
+                });
+            }
+            result = (|| -> Result<()> {
+                // Members hash as their bytes stream past; a cover
+                // whose start was never decoded can't be checked at
+                // all, so it never becomes a slice.
+                let mut cursor = 0usize;
+                let mut active: Vec<(usize, u64, sha2::Sha256)> = Vec::new();
+                let mut cur: Option<Vec<u8>> = None;
+                for k in 0..pcs.len() {
+                    if !need[k] {
+                        cur = None;
+                        continue;
+                    }
+                    let pc = &pcs[k];
+                    let bytes = match cur.take() {
+                        Some(b) => b,
+                        None => fs.decode_pcluster(pc)?,
+                    };
+                    let end = pc.la + bytes.len() as u64;
+                    while cursor < used.len() && used[cursor].pstart < end {
+                        let cv = &used[cursor];
+                        if cv.pstart < pc.la {
+                            // Its first bytes were never decoded.
+                            failed.lock().unwrap().insert(cv.idx);
+                        } else {
+                            active.push((cursor, cv.pstart, sha2::Sha256::new()));
+                        }
+                        cursor += 1;
+                    }
+                    active.retain_mut(|(ci, pos, h)| {
+                        let cv = &used[*ci];
+                        let lo = (*pos - pc.la) as usize;
+                        let hi = ((cv.end().min(end)) - pc.la) as usize;
+                        if hi > lo {
+                            h.update(&bytes[lo..hi]);
+                            *pos = pc.la + hi as u64;
+                        }
+                        if *pos < cv.end() {
+                            return true;
+                        }
+                        let got: [u8; 32] = h.clone().finalize().into();
+                        if got
+                            != self.members[cv.idx]
+                                .digests
+                                .as_ref()
+                                .expect("digests")
+                                .sha256
+                        {
+                            failed.lock().unwrap().insert(cv.idx);
+                        }
+                        false
+                    });
+
+                    if eligible[k] {
+                        let mut input = bytes;
+                        if k + 1 < pcs.len() {
+                            let next = fs.decode_pcluster(&pcs[k + 1])?;
+                            let take = next.len().min(ENCODE_MARGIN);
+                            input.extend_from_slice(&next[..take]);
+                            cur = Some(next);
+                        }
+                        let mut stored = vec![0u8; pc.plen as usize];
+                        ensure!(
+                            view.read_full_at(&mut stored, pc.pa)? == stored.len(),
+                            "truncated pcluster at {}",
+                            pc.pa
+                        );
+                        if tx.send(Job { k, input, stored }).is_err() {
+                            break;
+                        }
+                    }
+                }
+                // Covers past the last decoded pcluster never verified.
+                for cv in used.iter().skip(cursor) {
+                    failed.lock().unwrap().insert(cv.idx);
+                }
+                for (ci, _, _) in &active {
+                    failed.lock().unwrap().insert(used[*ci].idx);
+                }
+                Ok(())
+            })();
+            drop(tx);
+        });
+        result?;
+        let (ok, mismatch, margin) = counts.into_inner().unwrap();
+        stats.verified = ok;
+        stats.mismatch += mismatch;
+        stats.margin += margin;
+        let failed = failed.into_inner().unwrap();
+        stats.unverified_members += failed.len();
+        Ok((out.into_inner().unwrap(), failed))
+    }
+}
+
+/// Merge cover spans into a disjoint ascending union.
+fn merge_spans(covers: &[Cover]) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for c in covers {
+        match out.last_mut() {
+            Some(last) if c.pstart <= last.1 => last.1 = last.1.max(c.end()),
+            _ => out.push((c.pstart, c.end())),
+        }
+    }
+    out
+}
+
+/// Bytes of [at, at+len) the (ascending, disjoint) union covers.
+fn overlap(union: &[(u64, u64)], at: u64, len: u64) -> u64 {
+    let end = at + len;
+    let start = union.partition_point(|&(_, e)| e <= at);
+    let mut n = 0;
+    for &(s, e) in &union[start..] {
+        if s >= end {
+            break;
+        }
+        n += e.min(end) - s.max(at);
+    }
+    n
+}
+
+const MARGIN_SHORT: &str = "encoder ran out of input before filling the pcluster";
+
+/// Re-encode one stored pcluster and, when it comes back byte-exact,
+/// tile the input span it consumed with the members that cover it.
+/// `known` is the preset the image has already been shown to use; with
+/// none, every preset is tried (mkfs runs one compressor config per
+/// image, so the first answer settles it).
+#[allow(clippy::too_many_arguments)]
+fn plan_pcluster(
+    pc: &crate::erofs::PCluster,
+    stored: &[u8],
+    stream: &[u8],
+    covers: &[Cover],
+    known: Option<u32>,
+    dict_size: u32,
+    spool: &LiteralSpool,
+) -> Result<Option<(PClusterNode, u32)>> {
+    let pad = crate::erofs::pcluster_padding(stored);
+    ensure!(pad < stored.len(), "pcluster is all padding");
+    let cap = stored.len() - pad;
+    // Preset 6 is what mkfs.erofs defaults to; the rest of the ladder
+    // and the extreme variants are the fallback.
+    let presets: Vec<u32> = match known {
+        Some(p) => vec![p],
+        None => std::iter::once(6)
+            .chain(0..=9u32)
+            .chain((0..=9u32).map(|p| p | LZMA_PRESET_EXTREME))
+            .collect(),
+    };
+    // How much input to hand the encoder. mkfs hands it the whole
+    // remaining stream and lets the OUTPUT buffer end the pcluster, so
+    // an encoder fed exactly the span can end its stream cleanly
+    // instead and differ in the last few bytes. Whatever length is
+    // used here is what the node records as its inputs, so `check`
+    // re-encodes byte-identically by construction.
+    let lengths: Vec<usize> = [pc.llen as usize, 1 << 12, 1 << 16, ENCODE_MARGIN]
+        .iter()
+        .scan(0usize, |acc, &n| {
+            *acc = if *acc == 0 { n } else { pc.llen as usize + n };
+            Some((*acc).min(stream.len()))
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut hit = None;
+    let mut short = false;
+    'search: for p in presets {
+        for &fed in &lengths {
+            let (out, consumed) =
+                crate::erofs::microlzma_encode(&stream[..fed], cap, p, dict_size)?;
+            if out.len() < cap && consumed == fed as u64 && fed < stream.len() {
+                short = true; // ran out of input, not output: feed more
+                continue;
+            }
+            let mut candidate = vec![0u8; pad];
+            candidate.extend_from_slice(&out);
+            candidate.resize(stored.len(), 0);
+            if candidate == stored {
+                hit = Some((p, fed as u64));
+                break 'search;
+            }
+        }
+    }
+    let Some((preset, fed)) = hit else {
+        if short {
+            bail!("{MARGIN_SHORT}");
+        }
+        return Ok(None);
+    };
+
+    // Tile the span that was fed: one cover per byte, the rest literal.
+    let mut inputs: Vec<PcInput> = Vec::new();
+    let end = pc.la + fed;
+    let mut pos = pc.la;
+    let literal = |from: u64, to: u64, inputs: &mut Vec<PcInput>| -> Result<()> {
+        let bytes = &stream[(from - pc.la) as usize..(to - pc.la) as usize];
+        let len = to - from;
+        let (spool_off, inline) = if len <= INLINE_MAX {
+            (0, Some(bytes.to_vec()))
+        } else {
+            (spool.append(bytes)?, None)
+        };
+        inputs.push(PcInput::Literal {
+            spool_off,
+            len,
+            residue_off: None,
+            inline,
+        });
+        Ok(())
+    };
+    for cv in covers {
+        if cv.end() <= pos {
+            continue;
+        }
+        if cv.pstart >= end {
+            break;
+        }
+        let lo = cv.pstart.max(pos);
+        let hi = cv.end().min(end);
+        if lo >= hi {
+            continue;
+        }
+        if lo > pos {
+            literal(pos, lo, &mut inputs)?;
+        }
+        inputs.push(PcInput::Member {
+            idx: cv.idx,
+            from: lo - cv.pstart,
+            len: hi - lo,
+        });
+        pos = hi;
+    }
+    if pos < end {
+        literal(pos, end, &mut inputs)?;
+    }
+    // A node whose inputs are all literal proves nothing and costs the
+    // residue more than the stored bytes it replaces.
+    if !inputs.iter().any(|i| matches!(i, PcInput::Member { .. })) {
+        return Ok(None);
+    }
+    Ok(Some((
+        PClusterNode {
+            size: pc.plen,
+            sha256: sha2::Sha256::digest(stored).into(),
+            pad,
+            preset,
+            dict_size,
+            inputs,
+            name: format!("pcluster@{}", pc.pa),
+        },
+        preset,
+    )))
+}
+
+/// Merge freshly planned segments into an already-planned build,
+/// re-tiling its literal gaps around them.
+fn splice_in(i: usize, plan: &mut Plan, extra: Vec<Seg>, _view: &View) -> Result<()> {
+    let build = plan
+        .builds
+        .get_mut(&i)
+        .context("erofs image has no build")?;
+    let size = build.runs.iter().map(|&(_, _, l)| l).sum::<u64>();
+    let mut segs: Vec<Seg> = std::mem::take(&mut build.segs)
+        .into_iter()
+        .filter(|s| !matches!(s, Seg::Gap { .. }))
+        .collect();
+    let mut taken = Intervals::default();
+    for s in &segs {
+        taken.insert(s.at(), s.len());
+    }
+    for mut s in extra {
+        // Segments arrive in the image's own space: a pcluster's `pa`
+        // is an offset into the image, which maps to this build's
+        // logical space through its runs.
+        let Seg::PCluster {
+            at, root_off, len, ..
+        } = &mut s
+        else {
+            continue;
+        };
+        let Some(&(rlog, roff, _)) = build
+            .runs
+            .iter()
+            .find(|&&(_, off, l)| off <= *root_off && *root_off + *len <= off + l)
+        else {
+            continue; // outside the image's own ranges — cannot happen
+        };
+        *at = rlog + (*root_off - roff);
+        if !taken.admits(*at, *len) {
+            continue;
+        }
+        taken.insert(*at, *len);
+        segs.push(s);
+    }
+    segs.sort_by_key(|s| s.at());
+    build.segs = tile_gaps(segs, size);
+    Ok(())
+}
+
+/// Fill the space between accepted segments with literal gaps; the
+/// tiling must come out exact or the plan is wrong.
+fn tile_gaps(segs: Vec<Seg>, size: u64) -> Vec<Seg> {
+    let mut tiled: Vec<Seg> = Vec::new();
+    let mut pos = 0u64;
+    for seg in segs {
+        let at = seg.at();
+        assert!(at >= pos, "overlapping splice segments survived planning");
+        if at > pos {
+            tiled.push(Seg::Gap {
+                at: pos,
+                len: at - pos,
+                residue_off: None,
+                inline: None,
+            });
+        }
+        pos = at + seg.len();
+        tiled.push(seg);
+    }
+    if pos < size {
+        tiled.push(Seg::Gap {
+            at: pos,
+            len: size - pos,
+            residue_off: None,
+            inline: None,
+        });
+    }
+    tiled
 }
 
 /// Discard a rejected subtree's plans (a parent refused the child on
@@ -953,6 +1781,36 @@ struct VerifyState<'a> {
     ticker: &'a Ticker,
 }
 
+/// Hand a pcluster node's literal inputs to the residue, in the order
+/// the node lists them — which is the order `check` will read them
+/// back in, so the sidecar stays stream-ordered and compressible.
+fn spill_pcluster(pc: usize, plan: &mut Plan, vs: &mut VerifyState) -> Result<()> {
+    let Plan {
+        pclusters,
+        literals,
+        ..
+    } = plan;
+    for input in pclusters[pc].inputs.iter_mut() {
+        if let PcInput::Literal {
+            spool_off,
+            len,
+            residue_off,
+            inline,
+        } = input
+        {
+            if inline.is_some() {
+                continue;
+            }
+            *residue_off = Some(vs.residue.len);
+            let spool = literals
+                .as_ref()
+                .context("pcluster literals without a spool")?;
+            spool.read_at(*spool_off, *len, &mut |b| vs.residue.write(b))?;
+        }
+    }
+    Ok(())
+}
+
 /// Verify the node at `i` in document order: builds re-splice and
 /// capture their residue; compression nodes were byte-verified at
 /// planning time, so only their input subtree still needs the pass.
@@ -995,6 +1853,17 @@ fn verify_build(i: usize, plan: &mut Plan, vs: &mut VerifyState) -> Result<()> {
                 if planned_build || plan.compress.contains_key(&idx) {
                     verify_node(idx, plan, vs)?;
                 }
+            }
+            Seg::PCluster {
+                pc, len, root_off, ..
+            } => {
+                // The node itself was proven at planning time (the
+                // re-encode IS the comparison); what's left is to hash
+                // the stored bytes in place and hand its literal
+                // inputs to the residue, here, in document order.
+                hash_root_range(&view, *root_off, *len, &mut buf, |b| h.update(b))
+                    .with_context(|| format!("pcluster at {root_off}"))?;
+                spill_pcluster(*pc, plan, vs)?;
             }
             Seg::Gap {
                 at,
@@ -1125,7 +1994,11 @@ fn source_json(path: &Path, root: &Member) -> Value {
 /// the plan's extract nodes fetch from, plus member idx → table idx.
 /// Claims are first-seen (every extract node carries its own witness
 /// line; the table entry exists so the archive is stated once).
-fn sources_json(plan: &Plan) -> (Vec<Value>, HashMap<usize, usize>) {
+fn sources_json(
+    plan: &Plan,
+    members: &[Member],
+    evidence: &[report::Evidence],
+) -> (Vec<Value>, HashMap<usize, usize>, HashMap<usize, usize>) {
     let mut order: Vec<usize> = plan.extracts.keys().copied().collect();
     order.sort_unstable();
     let mut idx_of_digest: HashMap<String, usize> = HashMap::new();
@@ -1149,7 +2022,72 @@ fn sources_json(plan: &Plan) -> (Vec<Value>, HashMap<usize, usize>) {
             });
         src_of.insert(i, idx);
     }
-    (sources, src_of)
+    // Members that only exist inside a compressed pcluster get their
+    // node here too: several pclusters may slice one member, and a
+    // slice needs a node to point at.
+    let mut node_of = HashMap::new();
+    for &i in &plan.tabled {
+        node_of.insert(i, sources.len());
+        sources.push(node_json(
+            i,
+            members,
+            plan,
+            evidence,
+            &src_of,
+            &HashMap::new(),
+        ));
+    }
+    (sources, src_of, node_of)
+}
+
+/// One microlzma@0 node: the stored bytes of an erofs pcluster, as the
+/// encoder run that produces them from member slices.
+fn pcluster_json(
+    node: &PClusterNode,
+    members: &[Member],
+    node_of: &HashMap<usize, usize>,
+) -> Value {
+    let inputs: Vec<Value> = node
+        .inputs
+        .iter()
+        .map(|input| match input {
+            PcInput::Member { idx, from, len } => {
+                let source = node_of[idx];
+                if *from == 0 && *len == members[*idx].size {
+                    json!({ "source": source })
+                } else {
+                    json!({ "slice": { "source": source, "from": from, "len": len } })
+                }
+            }
+            PcInput::Literal {
+                len,
+                residue_off,
+                inline,
+                ..
+            } => match inline {
+                Some(bytes) => json!({ "literal": {
+                    "inline_hex": hex_lower(bytes), "len": len } }),
+                None => json!({ "literal": {
+                    "residue_offset": residue_off.expect("residue offset assigned"),
+                    "len": len } }),
+            },
+        })
+        .collect();
+    let mut params = json!({
+        "preset": node.preset & !LZMA_PRESET_EXTREME,
+        "dict_size": node.dict_size,
+        "pad": node.pad,
+    });
+    if node.preset & LZMA_PRESET_EXTREME != 0 {
+        params["extreme"] = json!(true);
+    }
+    json!({ "build": {
+        "builder": "microlzma@0",
+        "name": node.name,
+        "params": params,
+        "output": { "sha256": hex_lower(&node.sha256), "size": node.size },
+        "inputs": inputs,
+    } })
 }
 
 fn node_json(
@@ -1158,6 +2096,7 @@ fn node_json(
     plan: &Plan,
     evidence: &[report::Evidence],
     src_of: &HashMap<usize, usize>,
+    node_of: &HashMap<usize, usize>,
 ) -> Value {
     let m = &members[i];
     if let Some(e) = plan.extracts.get(&i) {
@@ -1184,7 +2123,7 @@ fn node_json(
             },
             "output": { "sha256": hex_lower(&m.digests.as_ref().expect("digests").sha256),
                         "size": m.size },
-            "inputs": [node_json(c.child, members, plan, evidence, src_of)],
+            "inputs": [node_json(c.child, members, plan, evidence, src_of, node_of)],
         } });
     }
     match plan.builds.get(&i) {
@@ -1195,12 +2134,15 @@ fn node_json(
                 .iter()
                 .map(|seg| match seg {
                     Seg::Child { idx, from, len, .. } => {
-                        let node = node_json(*idx, members, plan, evidence, src_of);
+                        let node = node_json(*idx, members, plan, evidence, src_of, node_of);
                         if *from == 0 && *len == members[*idx].size {
                             node
                         } else {
                             json!({ "slice": { "of": node, "from": from, "len": len } })
                         }
+                    }
+                    Seg::PCluster { pc, .. } => {
+                        pcluster_json(&plan.pclusters[*pc], members, node_of)
                     }
                     Seg::Gap {
                         len,
@@ -1736,6 +2678,7 @@ fn assemble(
         match builder {
             "splice@0" => {}
             "gzip@0" => return assemble_gzip(b, &sha, ctx, feed),
+            "microlzma@0" => return assemble_microlzma(b, &sha, ctx, feed),
             other => bail!(
                 "{}: unknown builder {other:?} — this recipe needs a newer hdx",
                 node_name(node)
@@ -1818,6 +2761,66 @@ fn assemble_gzip(
         ensure!(n == size, "{name}: rebuilt {n} bytes, recipe says {size}");
     }
     Ok(n)
+}
+
+/// Rebuild a microlzma@0 node: concatenate its inputs — slices of the
+/// files packed into this pcluster, plus whatever the residue carries
+/// — and re-run the fixed-output MicroLZMA encoder with the recorded
+/// parameters. mkfs.erofs' output is a function of those bytes and
+/// those parameters, so the digest check is the whole proof.
+fn assemble_microlzma(
+    b: &Value,
+    sha: &str,
+    ctx: &mut CheckCtx,
+    feed: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+) -> Result<u64> {
+    let name = b["name"].as_str().unwrap_or("?").to_string();
+    let p = &b["params"];
+    let preset = p["preset"].as_u64().context("microlzma@0 preset")? as u32
+        | if p["extreme"] == json!(true) {
+            LZMA_PRESET_EXTREME
+        } else {
+            0
+        };
+    let dict_size = p["dict_size"].as_u64().context("microlzma@0 dict_size")? as u32;
+    let pad = p["pad"].as_u64().unwrap_or(0) as usize;
+    let size = b["output"]["size"]
+        .as_u64()
+        .context("microlzma@0 output size")?;
+    ensure!(
+        (pad as u64) < size && size <= crate::erofs::PCLUSTER_MAX_SIZE,
+        "{name}: implausible pcluster ({size} bytes, {pad} padding)"
+    );
+
+    // A pcluster's input is bounded by the format (one pcluster's
+    // logical span), so it assembles in memory.
+    let mut input: Vec<u8> = Vec::new();
+    for i in b["inputs"].as_array().context("build inputs")? {
+        assemble(i, ctx, &mut |bytes| {
+            input.extend_from_slice(bytes);
+            Ok(())
+        })?;
+        ensure!(
+            input.len() as u64 <= crate::erofs::PCLUSTER_MAX_DSIZE,
+            "{name}: pcluster inputs exceed the format's maximum span"
+        );
+    }
+    // The node's inputs ARE the bytes mint handed the encoder — they
+    // may run past what it consumed, on purpose: an encoder that runs
+    // out of input ends its stream cleanly, which is not what mkfs
+    // stored.
+    let (out, _) = crate::erofs::microlzma_encode(&input, size as usize - pad, preset, dict_size)
+        .with_context(|| format!("{name}: re-encoding"))?;
+    let mut bytes = vec![0u8; pad];
+    bytes.extend_from_slice(&out);
+    bytes.resize(size as usize, 0);
+    let got = hex_lower(&sha2::Sha256::digest(&bytes));
+    ensure!(
+        got == sha,
+        "{name}: re-encoded pcluster hashes to {got}, recipe says {sha} — is this the same liblzma that minted it?"
+    );
+    feed(&bytes)?;
+    Ok(size)
 }
 
 /// Stream one member's bytes out of a locally-present archive blob.
