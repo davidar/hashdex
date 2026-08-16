@@ -100,10 +100,15 @@ async fn list_remote_files(
             let (Some(kind), Some(path)) = (e["type"].as_str(), e["path"].as_str()) else {
                 continue;
             };
-            if kind == "file"
-                && path.ends_with(".parquet")
-                && (path.starts_with("data/") || path.starts_with("maps/"))
-            {
+            let is_parquet = path.ends_with(".parquet")
+                && (path.starts_with("data/") || path.starts_with("maps/"));
+            // The dataset's own membership filter is published in the
+            // same repo. Pulled under the same revision pin, it can be
+            // trusted to gate the parquet it was built from
+            // (datasets::Gates); the independently-fetched filters dir
+            // cannot.
+            let is_bloom = path.ends_with(".bloom") && !path.contains('/');
+            if kind == "file" && (is_parquet || is_bloom) {
                 files.push(RemoteFile {
                     path: path.to_string(),
                     size: e["size"].as_u64().unwrap_or(0),
@@ -140,7 +145,7 @@ pub async fn pull(client: &reqwest::Client, name: &str) -> Result<()> {
         .to_string();
 
     let files = list_remote_files(client, spec, &revision).await?;
-    if files.is_empty() {
+    if !files.iter().any(|f| f.path.ends_with(".parquet")) {
         bail!("no parquet files under data/ or maps/ in {}", spec.repo);
     }
     let total: u64 = files.iter().map(|f| f.size).sum();
@@ -181,7 +186,7 @@ pub async fn pull(client: &reqwest::Client, name: &str) -> Result<()> {
             continue;
         }
         let url = format!("{}/{revision}/{path}", spec.resolve_base());
-        let part = dest.with_extension("parquet.part");
+        let part = dir.join(format!("{path}.part"));
         let got = download(&bulk, &url, &part, *size, path, &progress)
             .await
             .with_context(|| format!("download {path}"))?;
@@ -199,6 +204,14 @@ pub async fn pull(client: &reqwest::Client, name: &str) -> Result<()> {
     // Written LAST: its presence is the "pull completed" marker that
     // makes the local copy eligible for resolution.
     std::fs::write(&pin, &revision)?;
+
+    // Length said every byte arrived; only hashing says the RIGHT
+    // bytes did. The transport this checks is the pull's own, so it
+    // runs now instead of waiting to be remembered — a file that
+    // doesn't hash to its published oid is quarantined and the pin
+    // dropped before anything reads it as evidence.
+    verify(client, Some(name)).await?;
+
     println!(
         "installed {name}: {} files, {} in {} — resolution now reads it from disk \
          (offline included); `hdx index rm {name}` frees it",
@@ -222,6 +235,9 @@ struct Progress {
     file_size: AtomicU64,
     started: std::time::Instant,
     last_tick_ms: AtomicU64,
+    /// `moved` as of the last printed tick: the displayed rate is the
+    /// last window's, not the whole run's, so a stall reads as one.
+    tick_moved: AtomicU64,
 }
 
 impl Progress {
@@ -235,6 +251,7 @@ impl Progress {
             file_size: AtomicU64::new(0),
             started: std::time::Instant::now(),
             last_tick_ms: AtomicU64::new(0),
+            tick_moved: AtomicU64::new(0),
         }
     }
 
@@ -272,7 +289,10 @@ impl Progress {
         {
             return;
         }
-        let rate = if ms > 0 { moved * 1000 / ms } else { 0 };
+        // The CAS above guarantees ms - last >= 100. A retry's rewind
+        // can put `moved` below the last tick's; that window prints 0.
+        let prev = self.tick_moved.swap(moved, Ordering::Relaxed);
+        let rate = moved.saturating_sub(prev) * 1000 / (ms - last);
         eprint!(
             "\r  {label} — {} / {} ({} of {} total, {}/s)   ",
             human(file_done),
@@ -386,6 +406,10 @@ async fn chunk(
                 progress.rewind(wrote);
                 if attempt < TRIES {
                     eprintln!("\r\x1b[2K  {label} — chunk at {start} failed ({e}), retrying");
+                    // A moment's pause: a transport blip needs it, and
+                    // a systemic failure shouldn't burn its retries in
+                    // the same millisecond it first failed in.
+                    tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
                 }
                 last = Some(e);
             }
@@ -619,6 +643,21 @@ pub async fn verify(client: &reqwest::Client, name: Option<&str>) -> Result<()> 
                     "  note: previously quarantined {} (safe to delete)",
                     p.strip_prefix(&dir).unwrap_or(p).display()
                 ),
+                // Stale parquet is inert (lookups open expected paths
+                // only), but a bloom in this dir WOULD be read — Gates
+                // trusts it as coherent with the pin. Move it out of
+                // trust, don't just mention it.
+                Some("bloom") => {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("bloom");
+                    let q = p.with_file_name(format!("{name}.drifted"));
+                    std::fs::rename(p, &q)
+                        .with_context(|| format!("quarantine {}", p.display()))?;
+                    println!(
+                        "  note: {} is not in the published revision — quarantined as \
+                         *.drifted (safe to delete)",
+                        p.strip_prefix(&dir).unwrap_or(p).display()
+                    );
+                }
                 _ => {}
             }
         }
@@ -631,7 +670,12 @@ pub async fn verify(client: &reqwest::Client, name: Option<&str>) -> Result<()> 
         // would otherwise keep a size-preserving corruption).
         if !quarantine.is_empty() || missing > 0 {
             for p in &quarantine {
-                let q = p.with_extension("parquet.drifted");
+                // Appended, not substituted: a drifted bloom must not
+                // quarantine under a parquet name.
+                let q = match p.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => p.with_file_name(format!("{n}.drifted")),
+                    None => p.with_extension("drifted"),
+                };
                 std::fs::rename(p, &q).with_context(|| format!("quarantine {}", p.display()))?;
             }
             let _ = std::fs::remove_file(dir.join("revision"));

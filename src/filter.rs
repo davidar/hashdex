@@ -240,9 +240,15 @@ pub fn filters_dir() -> PathBuf {
 
 /// Load every installed filter. Convention: `<name>.<scheme>.bloom`.
 pub fn load_all() -> Result<Vec<NamedFilter>> {
-    let dir = filters_dir();
+    load_dir(&filters_dir())
+}
+
+/// Every `<name>.<scheme>.bloom` in one directory — the filters dir,
+/// or a pulled dataset's own dir, where `hdx index pull` installs the
+/// filter published beside the parquet.
+pub fn load_dir(dir: &Path) -> Result<Vec<NamedFilter>> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(out);
     };
     for entry in entries.flatten() {

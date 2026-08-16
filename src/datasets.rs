@@ -173,9 +173,14 @@ pub fn open_all() -> &'static [LocalDataset] {
 /// probe rule scan already applies to the network (a filter hit is the
 /// demand that justifies a request), pointed at the local read.
 ///
-/// Only the schemes a filter is published for are gated; a dataset
-/// serving a scheme no installed filter covers keeps reading its
-/// parquet, so absence stays proved by the data either way.
+/// The gate's soundness is coherence: a filter that predates the rows
+/// on disk would deny keys the parquet holds, silently dropping
+/// evidence. So only the bloom pulled WITH a dataset — installed by
+/// `index pull` beside the parquet, under the same revision pin —
+/// gates it; the independently-fetched filters dir is never consulted
+/// here. Only the schemes a pulled filter covers are gated; everything
+/// else keeps reading its parquet, so absence stays proved by the
+/// data either way.
 pub struct Gates {
     blooms: Vec<(String, crate::coord::Scheme, crate::filter::Bloom)>,
 }
@@ -194,10 +199,24 @@ impl Gates {
         }
     }
 
-    /// The installed filters, opened once per process.
+    /// The pulled datasets' own filters, opened once per process. A
+    /// dataset dir holding no bloom (a pull from before blooms were
+    /// part of one — re-pull to add it) is simply ungated.
     pub fn installed() -> &'static Gates {
         static GATES: OnceLock<Gates> = OnceLock::new();
-        GATES.get_or_init(|| Gates::new(crate::filter::load_all().unwrap_or_default()))
+        GATES.get_or_init(|| {
+            Gates::new(
+                open_all()
+                    .iter()
+                    .flat_map(|d| {
+                        crate::filter::load_dir(&d.dir)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|f| f.name == d.spec.name)
+                    })
+                    .collect(),
+            )
+        })
     }
 
     /// Whether `dataset` could hold a row keyed by this coordinate.
@@ -345,38 +364,54 @@ mod tests {
                         continue;
                     };
                     let meta = Arc::new(meta);
-                    if meta.num_row_groups() == 0 {
-                        continue;
-                    }
-                    for col in ["digest", "sha256", "sha1", "md5", "pkgid"] {
-                        let Ok(cidx) = crate::parquet_index::column_index(&meta, col) else {
+                    for rgi in 0..meta.num_row_groups() {
+                        let rows = meta.row_group(rgi).num_rows() as usize;
+                        if rows == 0 {
                             continue;
-                        };
-                        let vals =
-                            crate::parquet_index::read_column(&reader, &meta, 0, cidx, 0, 50)
-                                .unwrap();
-                        let crate::parquet_index::ColValues::Str(vals) = vals else {
-                            continue;
-                        };
-                        for hex in vals.into_iter().flatten() {
-                            // A column of another scheme's digests
-                            // proves nothing about this filter.
-                            if hex.len() != width {
+                        }
+                        // First, middle and last row of EVERY row
+                        // group: a filter built from another
+                        // revision's rows differs mid-file, where a
+                        // head sample never looks.
+                        let mut positions = vec![0, rows / 2, rows - 1];
+                        positions.dedup();
+                        for col in ["digest", "sha256", "sha1", "md5", "pkgid"] {
+                            let Ok(cidx) = crate::parquet_index::column_index(&meta, col) else {
                                 continue;
-                            }
-                            let digest: Vec<u8> = (0..hex.len() / 2)
-                                .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
-                                .collect();
-                            let coord = Coord {
-                                scheme: *scheme,
-                                digest,
                             };
-                            assert!(
-                                gates.admits(name, &coord),
-                                "{name} filter denies {hex}, a key in {}",
-                                path.display()
-                            );
-                            checked += 1;
+                            let vals = crate::parquet_index::read_records(
+                                &reader,
+                                &meta,
+                                rgi,
+                                cidx,
+                                crate::parquet_index::Rows::At(&positions),
+                            )
+                            .unwrap();
+                            let crate::parquet_index::ColValues::Str(vals) = vals else {
+                                continue;
+                            };
+                            for hex in vals.into_iter().flatten() {
+                                // A column of another scheme's digests
+                                // proves nothing about this filter.
+                                if hex.len() != width {
+                                    continue;
+                                }
+                                let digest: Vec<u8> = (0..hex.len() / 2)
+                                    .map(|i| {
+                                        u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()
+                                    })
+                                    .collect();
+                                let coord = Coord {
+                                    scheme: *scheme,
+                                    digest,
+                                };
+                                assert!(
+                                    gates.admits(name, &coord),
+                                    "{name} filter denies {hex}, a key in {}",
+                                    path.display()
+                                );
+                                checked += 1;
+                            }
                         }
                     }
                 }
