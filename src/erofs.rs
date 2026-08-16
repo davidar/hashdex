@@ -218,6 +218,21 @@ pub(crate) struct PCluster {
 }
 
 impl PCluster {
+    /// Where the logical bytes begin inside a rotated raw pcluster.
+    ///
+    /// EROFS stores some uncompressed pclusters "interlaced": the data
+    /// starts `skip` bytes into the block and wraps around to the
+    /// front, which lets the kernel decompress in place when a logical
+    /// span doesn't begin on a block boundary. The bytes are all
+    /// there, in the wrong order — so a planner can still express them
+    /// as the member's own bytes, in two pieces.
+    pub(crate) fn interlace_skip(&self) -> Option<u64> {
+        match self.alg {
+            Alg::Interlaced { skip } if self.plen > 0 => Some(skip as u64 % self.plen),
+            _ => None,
+        }
+    }
+
     /// How this pcluster is stored. Only the referee needs the name;
     /// the planner cares whether it is MicroLZMA or verbatim.
     #[cfg(test)]
@@ -1849,6 +1864,57 @@ mod tests {
             "  plain ranges:          {} files, {} bytes",
             ranged.0, ranged.1
         );
+        let (packed_pcs, stream) = fs.packed_pclusters().unwrap();
+        if !packed_pcs.is_empty() {
+            let mut by_alg: HashMap<&str, (usize, u64, u64)> = HashMap::new();
+            for pc in &packed_pcs {
+                let e = by_alg.entry(pc.alg_name()).or_default();
+                e.0 += 1;
+                e.1 += pc.plen;
+                e.2 += pc.llen;
+            }
+            println!("  packed inode: {stream} bytes of stream");
+            for (alg, (n, stored, logical)) in by_alg {
+                println!("    {alg}: {n} pclusters, {stored} stored, {logical} logical");
+            }
+        }
+    }
+
+    /// A rotated pcluster's stored bytes are its logical bytes with
+    /// the tail brought to the front — which is what lets a recipe
+    /// express them as two slices of the member instead of a literal.
+    /// This pins the inverse of `decode_raw`'s rotation: what the
+    /// planner reconstructs must be what the image holds.
+    #[test]
+    fn interlaced_storage_is_the_logical_bytes_rotated() {
+        let stored: Vec<u8> = (0u8..16).collect();
+        let fs_view = View::new(
+            Arc::new(crate::peek_source::PSource::Mem(stored.clone().into())),
+            &[(0, 16)],
+        );
+        let fs = Erofs {
+            view: fs_view,
+            blkszbits: 4, // 16-byte "blocks"
+            meta_base: 0,
+            root_nid: 0,
+            packed_nid: 0,
+            compr_algs: 0,
+            compr_cfgs: false,
+            packed: Mutex::new(None),
+            cache: Mutex::new(PackedCache::default()),
+        };
+        // A full-block span: every stored byte is a logical byte.
+        let skip = 5usize;
+        let logical = fs
+            .decode_raw(0, 16, 16, Alg::Interlaced { skip: skip as u32 }, false)
+            .unwrap();
+        let head = 16 - skip; // logical bytes stored after the wrap
+        let rebuilt: Vec<u8> = logical[head..]
+            .iter()
+            .chain(logical[..head].iter())
+            .copied()
+            .collect();
+        assert_eq!(rebuilt, stored, "tail-first rotation must restore storage");
     }
 
     /// The interlaced transform matches erofs-utils' rotation copy.

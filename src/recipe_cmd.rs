@@ -571,12 +571,19 @@ fn pcluster_note(st: &PcStats) -> String {
     }
     let mut note = format!(
         "\nerofs: {}/{} pcluster{} rebuilt byte-exact",
-        st.verified + st.verbatim,
+        st.verified + st.verbatim + st.rotated,
         st.total,
         s(st.total)
     );
-    if st.verbatim > 0 {
-        note.push_str(&format!(" ({} stored uncompressed, spliced)", st.verbatim));
+    if st.verbatim > 0 || st.rotated > 0 {
+        let mut how: Vec<String> = Vec::new();
+        if st.verbatim > 0 {
+            how.push(format!("{} stored uncompressed, spliced", st.verbatim));
+        }
+        if st.rotated > 0 {
+            how.push(format!("{} stored rotated, spliced tail-first", st.rotated));
+        }
+        note.push_str(&format!(" ({})", how.join("; ")));
     }
     if !why.is_empty() {
         note.push_str(&format!(" ({} — literal)", why.join(", ")));
@@ -1045,8 +1052,12 @@ struct PcStats {
     /// Stored uncompressed and spliced straight in — no encoder, no
     /// node, just member bytes at their place in the image.
     verbatim: usize,
-    /// Not compressed, but not a verbatim copy either (rotated in
-    /// place, or an algorithm with no encoder here).
+    /// Stored rotated in place and spliced as two pieces of the
+    /// member, tail first (erofs' interlaced storage).
+    rotated: usize,
+    /// Not compressed, but neither a verbatim copy nor a rotation this
+    /// planner can express (a short rotated span, or an algorithm with
+    /// no encoder here).
     not_verbatim: usize,
     /// Re-encoded to different bytes: a compressor this hdx can't
     /// reproduce. These stay literal, like an unreproducible gzip.
@@ -1065,6 +1076,7 @@ impl PcStats {
         self.verified += o.verified;
         self.uncovered += o.uncovered;
         self.verbatim += o.verbatim;
+        self.rotated += o.rotated;
         self.not_verbatim += o.not_verbatim;
         self.mismatch += o.mismatch;
         self.margin += o.margin;
@@ -1445,6 +1457,7 @@ impl Planner<'_> {
         let want = eligible.iter().filter(|e| **e == Elig::Encode).count();
         let mut segs: Vec<Seg> = Vec::new();
         let mut verbatim = 0usize;
+        let mut rotated = 0usize;
         let mut not_verbatim = 0usize;
 
         let mut result: Result<()> = Ok(());
@@ -1573,10 +1586,13 @@ impl Planner<'_> {
                                 if segs.len() > n {
                                     verbatim += 1;
                                 }
+                            } else if splice_rotated(pc, &bytes, &stored, used, &mut segs) {
+                                rotated += 1;
                             } else {
-                                // Stored some other way after all —
-                                // rotated in place, or an algorithm
-                                // this reader decodes but can't emit.
+                                // Stored some other way after all — a
+                                // rotation over a short span, or an
+                                // algorithm this reader decodes but
+                                // can't emit.
                                 not_verbatim += 1;
                             }
                         }
@@ -1597,6 +1613,7 @@ impl Planner<'_> {
         let (ok, mismatch, margin) = counts.into_inner().unwrap();
         stats.verified = ok;
         stats.verbatim = verbatim;
+        stats.rotated = rotated;
         stats.not_verbatim = not_verbatim;
         stats.mismatch += mismatch;
         stats.margin += margin;
@@ -1650,6 +1667,7 @@ fn plan_own_file(
             // not stay in the tally as if it had been emitted.
             stats.verified = 0;
             stats.verbatim = 0;
+            stats.rotated = 0;
             stats.unverified_members += 1;
             return Ok((Vec::new(), Vec::new(), stats));
         }
@@ -1686,6 +1704,8 @@ fn plan_own_file(
                 if segs.len() > n {
                     stats.verbatim += 1;
                 }
+            } else if splice_rotated(pc, &window[lo..lo + logical], &stored, &covers, &mut segs) {
+                stats.rotated += 1;
             } else {
                 stats.not_verbatim += 1;
             }
@@ -1708,6 +1728,7 @@ fn plan_own_file(
         // tally must not count them as emitted.
         stats.verified = 0;
         stats.verbatim = 0;
+        stats.rotated = 0;
         stats.unverified_members += 1;
         return Ok((Vec::new(), Vec::new(), stats));
     }
@@ -1753,8 +1774,16 @@ fn read_stored(view: &View, pc: &crate::erofs::PCluster) -> Result<Vec<u8>> {
 /// literal aren't worth a slice, and anything uncovered simply stays a
 /// gap for the normal literal machinery.
 fn splice_verbatim(pc: &crate::erofs::PCluster, llen: u64, covers: &[Cover], segs: &mut Vec<Seg>) {
-    let end = pc.la + llen;
-    let mut pos = pc.la;
+    splice_span(covers, pc.la, llen, pc.pa, segs);
+}
+
+/// Splice the logical range `[lstart, lstart+len)` out of whichever
+/// members cover it, landing at image offset `root_at`. Ranges no
+/// member covers are simply not emitted — they stay literal, at their
+/// own image offsets, because every segment carries where it goes.
+fn splice_span(covers: &[Cover], lstart: u64, len: u64, root_at: u64, segs: &mut Vec<Seg>) {
+    let end = lstart + len;
+    let mut pos = lstart;
     for cv in covers {
         if cv.end() <= pos {
             continue;
@@ -1772,11 +1801,44 @@ fn splice_verbatim(pc: &crate::erofs::PCluster, llen: u64, covers: &[Cover], seg
                 from: lo - cv.pstart,
                 len: hi - lo,
                 at: 0, // assigned when merged into the image's build
-                root_off: pc.pa + (lo - pc.la),
+                root_off: root_at + (lo - lstart),
             });
         }
         pos = hi;
     }
+}
+
+/// A raw pcluster stored rotated (erofs' in-place trick) expressed as
+/// the member's own bytes in two pieces: the tail of the logical span
+/// lands first, the head follows it.
+///
+/// Only a pcluster whose logical span fills the whole block qualifies
+/// — where it is shorter, the block also holds bytes that are in no
+/// member, and those cannot be spliced from one. The rotation is
+/// reconstructed and compared against the stored bytes before anything
+/// is emitted: as everywhere else here, the byte comparison IS the
+/// proof, so a rotation this reader has misread stays literal.
+fn splice_rotated(
+    pc: &crate::erofs::PCluster,
+    logical: &[u8],
+    stored: &[u8],
+    covers: &[Cover],
+    segs: &mut Vec<Seg>,
+) -> bool {
+    let Some(skip) = pc.interlace_skip() else {
+        return false;
+    };
+    if skip == 0 || logical.len() as u64 != pc.plen || stored.len() as u64 != pc.plen {
+        return false;
+    }
+    let head = (pc.plen - skip) as usize; // logical bytes stored after the wrap
+    if stored[..skip as usize] != logical[head..] || stored[skip as usize..] != logical[..head] {
+        return false;
+    }
+    let n = segs.len();
+    splice_span(covers, pc.la + head as u64, skip, pc.pa, segs);
+    splice_span(covers, pc.la, head as u64, pc.pa + skip, segs);
+    segs.len() > n
 }
 
 /// Merge cover spans into a disjoint ascending union.
