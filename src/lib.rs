@@ -34,6 +34,8 @@ pub mod datasets;
 #[cfg(feature = "cli")]
 mod erofs;
 #[cfg(feature = "cli")]
+mod fat;
+#[cfg(feature = "cli")]
 pub mod filter;
 #[cfg(feature = "cli")]
 pub mod filters_cmd;

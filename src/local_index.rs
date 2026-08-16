@@ -7,8 +7,10 @@ use std::path::Path;
 /// a new container format, so descents cached before it knew (the
 /// container closed as an opaque file) don't replay stale trees
 /// forever. Rows from other versions are invisible (never replayed,
-/// overwritten on the next descent). 2: erofs descent added.
-const CONTAINER_SCHEMA: i64 = 2;
+/// overwritten on the next descent). 2: erofs descent added. 3: FAT
+/// filesystems, and the El Torito boot images an iso keeps outside its
+/// directory tree.
+const CONTAINER_SCHEMA: i64 = 3;
 
 /// One cached member of a descended container, keyed by the
 /// container's sha256 — content-addressed, so it NEVER invalidates: a

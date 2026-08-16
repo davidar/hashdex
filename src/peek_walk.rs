@@ -69,6 +69,7 @@ pub(crate) enum Kind {
     Erofs,
     SevenZ,
     Iso,
+    Fat,
     Plain,
 }
 
@@ -91,6 +92,7 @@ impl Kind {
             Kind::Erofs,
             Kind::SevenZ,
             Kind::Iso,
+            Kind::Fat,
         ] {
             if k.label() == s {
                 return k.label();
@@ -118,6 +120,7 @@ impl Kind {
             Kind::Erofs => "erofs",
             Kind::SevenZ => "7z",
             Kind::Iso => "iso9660",
+            Kind::Fat => "fat",
             Kind::Plain => "file",
         }
     }
@@ -268,6 +271,7 @@ impl Descent {
                     | Kind::SquashFs
                     | Kind::Erofs
                     | Kind::Iso
+                    | Kind::Fat
             ),
         }
     }
@@ -532,7 +536,7 @@ impl Walk<'_, '_> {
         // Seek-needing containers fed by a stream have to spool; the
         // spool then descends exactly like a ranged member, so their
         // children can be views over the spool.
-        let spools = matches!(kind, Kind::SquashFs | Kind::Erofs | Kind::Iso)
+        let spools = matches!(kind, Kind::SquashFs | Kind::Erofs | Kind::Iso | Kind::Fat)
             || (kind == Kind::Zip && ctx.conservative);
         if !too_deep && enter && spools {
             let mut src = std::io::Cursor::new(head).chain(r);
@@ -754,7 +758,7 @@ impl Walk<'_, '_> {
                 note = walk_note;
                 drain(&mut *tee);
             }
-            Kind::SquashFs | Kind::Erofs | Kind::Iso => {
+            Kind::SquashFs | Kind::Erofs | Kind::Iso | Kind::Fat => {
                 unreachable!("handled by the spool path above")
             }
         }
@@ -787,6 +791,12 @@ impl Walk<'_, '_> {
             if view.read_full_at(&mut magic, 32769)? == 5 && &magic == b"CD001" {
                 kind = Kind::Iso;
             }
+        }
+        // FAT is recognized only here, never from a stream's head: it
+        // has no magic of its own, and the whole BPB has to agree
+        // before a walker is entitled to read a file as a filesystem.
+        if kind == Kind::Plain && crate::fat::looks_like(&head) {
+            kind = Kind::Fat;
         }
         let pool = self.pool;
         let extents = crate::peek_pool::Extents {
@@ -1002,6 +1012,17 @@ impl Walk<'_, '_> {
                 self.iso_ranged(view, path, depth, own, &mut children, ctx),
                 "iso9660 parse failed",
             )?,
+            Kind::Fat => {
+                let mut fnote = None;
+                let r = self.fat_ranged(view, path, depth, own, &mut children, &mut fnote, ctx);
+                match swallow(r, "fat parse failed")? {
+                    Some(err) => Some(match fnote {
+                        Some(n) => format!("{err}; {n}"),
+                        None => err,
+                    }),
+                    None => fnote,
+                }
+            }
         };
         Ok((children, note))
     }
@@ -1678,6 +1699,43 @@ impl Walk<'_, '_> {
     /// Ridge NM entries; plain 9660 names get their ";1" version
     /// suffix stripped. Joliet is not read.
     #[allow(clippy::too_many_arguments)]
+    /// A FAT filesystem's files, each a view over its cluster runs.
+    #[allow(clippy::too_many_arguments)]
+    fn fat_ranged(
+        &self,
+        view: &View,
+        path: &str,
+        depth: usize,
+        own: usize,
+        children: &mut usize,
+        note: &mut Option<String>,
+        ctx: &mut Ctx,
+    ) -> Result<()> {
+        let fs = crate::fat::Fat::open(view)?;
+        let (files, notes) = fs.files(view)?;
+        for f in files {
+            *children += 1;
+            let name = f.path.rsplit('/').next().unwrap_or(&f.path).to_string();
+            self.process_ranged(
+                view.slice(&f.runs),
+                format!("{path}!{}", f.path),
+                &name,
+                depth + 1,
+                Some(own),
+                ctx,
+            )?;
+        }
+        if !notes.is_empty() {
+            let shown: Vec<&str> = notes.iter().take(3).map(String::as_str).collect();
+            *note = Some(format!(
+                "fat walk skipped {}: {}",
+                notes.len(),
+                shown.join("; ")
+            ));
+        }
+        Ok(())
+    }
+
     fn iso_ranged(
         &self,
         view: &View,
@@ -1689,6 +1747,7 @@ impl Walk<'_, '_> {
     ) -> Result<()> {
         const SECTOR: u64 = 2048;
         let mut root: Option<(u64, u64)> = None;
+        let mut catalog: Option<u64> = None;
         for sector in 16..48u64 {
             let mut vd = [0u8; 2048];
             anyhow::ensure!(
@@ -1697,6 +1756,14 @@ impl Walk<'_, '_> {
             );
             anyhow::ensure!(&vd[1..6] == b"CD001", "no CD001 volume descriptor");
             match vd[0] {
+                // A boot record names the El Torito catalog, which is
+                // the only route to the boot images: they sit outside
+                // the directory tree, so nothing else in the walk can
+                // reach them. On a UEFI image that is the entire EFI
+                // system partition.
+                0 if &vd[7..30] == b"EL TORITO SPECIFICATION" => {
+                    catalog = Some(u32::from_le_bytes(vd[71..75].try_into().unwrap()) as u64);
+                }
                 1 if root.is_none() => {
                     // The root record's "name" is the pseudo-entry byte
                     // 0x00, so read the fields raw instead of via
@@ -1712,6 +1779,26 @@ impl Walk<'_, '_> {
             }
         }
         let (lba, size) = root.context("no primary volume descriptor")?;
+        if let Some(cat) = catalog {
+            // A malformed catalog is a note-worthy nuisance, never a
+            // reason to abandon a directory tree that parses.
+            match crate::fat::boot_images(view, cat) {
+                Ok(images) => {
+                    for img in images {
+                        *children += 1;
+                        self.process_ranged(
+                            view.slice(&[(img.at, img.len)]),
+                            format!("{path}!el-torito/{}", img.name),
+                            img.name,
+                            depth + 1,
+                            Some(own),
+                            ctx,
+                        )?;
+                    }
+                }
+                Err(e) => eprintln!("  note: El Torito catalog unreadable: {e}"),
+            }
+        }
         self.iso_dir(view, lba, size, path, "", depth, own, children, ctx)
     }
 

@@ -3624,3 +3624,181 @@ fn scan_descends_erofs_images() {
         assert_eq!(nested_tar_children, 2, "{img}: nested tar members");
     }
 }
+
+// ------------------------------------------------------------------ fat
+
+fn fat_fixture(env: &TestEnv, bits: &str) -> PathBuf {
+    let gz = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/data/fat/fat{bits}.img.gz")),
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&gz[..]), &mut raw).unwrap();
+    env.write(&format!("fat{bits}.img"), &raw)
+}
+
+/// The files an EFI system partition holds, and their digests — the
+/// same tree written into all three FAT widths.
+const FAT_TRUTH: &[(&str, &str)] = &[
+    (
+        "EFI/BOOT/BOOTX64.EFI",
+        "7a2d60e49176c95d98a3be63e400d8a16ed600327d7a7b4ea11ca5a89ce1eb92",
+    ),
+    (
+        "EFI/BOOT/grub.cfg",
+        "05831f8cbd6e1ad6156a52187ab448500cc1ba3ac9ddf530ab38111d4e235d5c",
+    ),
+    (
+        "EFI/BOOT/grubx64.efi",
+        "ee5b94d80871d6ed57a6cd311528870cfad7df9d8de33a17a0e9de089e20fe5b",
+    ),
+    (
+        "EFI/fedora/a-rather-long-file-name.efi",
+        "a048c89449bb671738ea5c4e97cac9fa8cad07a58f027d295cc4cfa42e527f8b",
+    ),
+];
+
+/// FAT in all three widths, walked to byte-verified member digests.
+/// The 12-bit table packs two entries into three bytes, 16 and 32 are
+/// flat arrays, and FAT32 keeps its root directory in a cluster chain
+/// where the others use a fixed region — one tree through all three
+/// paths. The long name (stored as fragments before its 8.3 entry)
+/// must come back whole, and cluster runs must coalesce into the
+/// ranges that hash to the source files.
+///
+/// Fixtures (tests/data/fat/fat{12,16,32}.img.gz) were built in the
+/// fedora:44 container (dosfstools + mtools):
+///
+///   dd if=/dev/zero of=IMG bs=1024 count={1024,4096,34000}
+///   mkfs.fat -F{12,16,32} -s1 -i DEADBEEF -n FIXTURE IMG
+///   MTOOLS_SKIP_CHECK=1 mcopy -i IMG -s tree/EFI ::/EFI
+///
+/// (`-s1` keeps the images small enough to commit: FAT16 needs 4085
+/// clusters and FAT32 needs 65525, whatever the payload.)
+#[test]
+fn scan_descends_fat_filesystems() {
+    for bits in ["12", "16", "32"] {
+        let env = TestEnv::new(&format!("fat{bits}"));
+        let img = fat_fixture(&env, bits);
+        let out = env.hdx(&[
+            "--offline",
+            "--json",
+            "scan",
+            "--list",
+            "all",
+            img.to_str().unwrap(),
+        ]);
+        assert!(out.status.success(), "FAT{bits}: {}", stderr(&out));
+        let members: Vec<serde_json::Value> = stdout(&out)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect();
+        let root = members
+            .iter()
+            .find(|m| !m["path"].as_str().unwrap_or_default().contains('!'))
+            .expect("root line");
+        assert_eq!(root["kind"], "fat", "FAT{bits} not recognized");
+        for (path, sha) in FAT_TRUTH {
+            let m = members
+                .iter()
+                .find(|m| {
+                    m["path"]
+                        .as_str()
+                        .is_some_and(|p| p.ends_with(&format!("!{path}")))
+                })
+                .unwrap_or_else(|| panic!("FAT{bits}: {path} missing"));
+            let coords: Vec<&str> = m["coords"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c.as_str().unwrap())
+                .collect();
+            assert!(
+                coords.contains(&format!("sha256:{sha}").as_str()),
+                "FAT{bits}: {path} hashed to {coords:?}"
+            );
+        }
+    }
+}
+
+/// An EFI system partition on a hybrid ISO lives OUTSIDE the ISO9660
+/// directory tree: the firmware finds it through the El Torito boot
+/// catalog, and a walker that only reads directories never sees it at
+/// all. Here a minimal ISO carries the FAT16 fixture as its EFI boot
+/// image, and the walk has to reach the files inside it.
+#[test]
+fn iso_walks_the_el_torito_boot_image() {
+    let env = TestEnv::new("el-torito");
+    let esp = std::fs::read(fat_fixture(&env, "16")).unwrap();
+    const SECTOR: usize = 2048;
+    let cat_lba = 20usize;
+    let esp_lba = 24usize;
+    let mut img = vec![0u8; (esp_lba + esp.len().div_ceil(SECTOR)) * SECTOR];
+
+    // Primary volume descriptor at sector 16, root directory at 22.
+    let pvd = 16 * SECTOR;
+    img[pvd] = 1;
+    img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+    img[pvd + 6] = 1;
+    let r = pvd + 156;
+    img[r] = 34;
+    img[r + 2..r + 6].copy_from_slice(&22u32.to_le_bytes());
+    img[r + 10..r + 14].copy_from_slice(&(SECTOR as u32).to_le_bytes());
+    img[r + 25] = 0x02;
+    img[r + 32] = 1;
+
+    // Boot record volume descriptor at 17, naming the catalog.
+    let brvd = 17 * SECTOR;
+    img[brvd] = 0;
+    img[brvd + 1..brvd + 6].copy_from_slice(b"CD001");
+    img[brvd + 6] = 1;
+    img[brvd + 7..brvd + 30].copy_from_slice(b"EL TORITO SPECIFICATION");
+    img[brvd + 71..brvd + 75].copy_from_slice(&(cat_lba as u32).to_le_bytes());
+    let term = 18 * SECTOR;
+    img[term] = 255;
+    img[term + 1..term + 6].copy_from_slice(b"CD001");
+    img[term + 6] = 1;
+
+    // Boot catalog: validation entry, then an EFI section whose entry
+    // points at the ESP (no emulation, length in 512-byte sectors).
+    let cat = cat_lba * SECTOR;
+    img[cat] = 0x01;
+    img[cat + 30] = 0x55;
+    img[cat + 31] = 0xAA;
+    img[cat + 32] = 0x91; // final section header
+    img[cat + 33] = 0xEF; // EFI platform
+    img[cat + 34..cat + 36].copy_from_slice(&1u16.to_le_bytes());
+    let e = cat + 64;
+    img[e] = 0x88; // bootable
+    img[e + 6..e + 8].copy_from_slice(&((esp.len() / 512) as u16).to_le_bytes());
+    img[e + 8..e + 12].copy_from_slice(&(esp_lba as u32).to_le_bytes());
+
+    // An ordinary file in the directory tree, so the ISO walk itself
+    // still has something to find.
+    let d = 22 * SECTOR;
+    let name = b"README.TXT;1";
+    let payload = b"an iso with an efi system partition\n";
+    img[d] = (33 + name.len()) as u8;
+    img[d + 2..d + 6].copy_from_slice(&23u32.to_le_bytes());
+    img[d + 10..d + 14].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    img[d + 32] = name.len() as u8;
+    img[d + 33..d + 33 + name.len()].copy_from_slice(name);
+    img[23 * SECTOR..23 * SECTOR + payload.len()].copy_from_slice(payload);
+    img[esp_lba * SECTOR..esp_lba * SECTOR + esp.len()].copy_from_slice(&esp);
+
+    let iso = env.write("hybrid.iso", &img);
+    let out = env.hdx(&["--offline", "scan", "--list", "all", iso.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("README.TXT"), "iso tree not walked:\n{text}");
+    assert!(
+        text.contains("el-torito/efi.img"),
+        "boot image not reached:\n{text}"
+    );
+    for (path, _) in FAT_TRUTH {
+        assert!(
+            text.contains(path),
+            "{path} inside the ESP not walked:\n{text}"
+        );
+    }
+}
