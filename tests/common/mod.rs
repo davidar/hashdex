@@ -471,6 +471,30 @@ pub fn plain_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
     b.into_inner().unwrap()
 }
 
+/// A microcode archive shaped the way Intel's is: self-delimiting
+/// entries whose 48-byte headers state the stride at offset 32, and
+/// nothing anywhere saying which of them were packaged together.
+/// Returns the blob and each entry's own bytes.
+pub fn intel_ucode(sizes: &[usize]) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let mut entries = Vec::new();
+    for (i, &total) in sizes.iter().enumerate() {
+        let mut e = vec![0u8; total];
+        e[0..4].copy_from_slice(&1u32.to_le_bytes()); // header version
+        e[4..8].copy_from_slice(&(i as u32).to_le_bytes()); // update revision
+        e[8..12].copy_from_slice(&0x0512_2025u32.to_le_bytes()); // 05/12/2025
+        e[12..16].copy_from_slice(&(0x0806f8u32).to_le_bytes()); // one shared signature
+        e[20..24].copy_from_slice(&1u32.to_le_bytes()); // loader revision
+        e[24] = 1 << (i % 8); // processor flags
+        e[28..32].copy_from_slice(&((total - 48) as u32).to_le_bytes());
+        e[32..36].copy_from_slice(&(total as u32).to_le_bytes());
+        for (k, b) in e[48..].iter_mut().enumerate() {
+            *b = ((k * 7 + i * 31) % 251) as u8;
+        }
+        entries.push(e);
+    }
+    (entries.concat(), entries)
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(bytes))

@@ -47,6 +47,11 @@ hdx recipe FILE       # reconstruction manifest: verified splice of
                       #   the CLI frames it — the compressed half of a
                       #   boot image; a member a recipe can rebuild is
                       #   a source those pclusters may slice)
+                      #   + microcode archives split at their entry
+                      #   headers, the index asked which runs of
+                      #   consecutive entries are published files
+                      #   (longest run wins — the packaging is not in
+                      #   the headers)
                       #   + literal residue → FILE.recipe.json
                       #   (a container the indexes name resolves to
                       #   one ref; --from-parts plans its interior

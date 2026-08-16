@@ -1597,3 +1597,98 @@ fn erofs_recipe_of_lz4_image_stays_literal() {
     assert!(!text.contains("microlzma"), "recipe: {text}");
     assert_eq!(doc["hdx_recipe"], "0");
 }
+
+/// A microcode archive is a bare concatenation of files the distros
+/// publish — no table of contents, no per-entry names. Mint splits it
+/// at the entry headers and asks the index which runs of consecutive
+/// entries are published files, longest run first: the packaging is
+/// NOT in the headers (one signature can serve several packages), so
+/// the index decides the boundaries and everything it doesn't name
+/// stays literal.
+#[test]
+fn recipe_splices_a_microcode_archive() {
+    let env = TestEnv::new("recipe-ucode");
+    let (blob, entries) = intel_ucode(&[2048, 4096, 2048, 2048]);
+    // What the rpm ships: entry 0 alone, entries 1+2 as one file, and
+    // — as a decoy — entry 1 on its own, which the longest-run rule
+    // must not take. Entry 3 has no witness at all.
+    let pair = [entries[1].clone(), entries[2].clone()].concat();
+    let files: Vec<(&str, &[u8])> = vec![
+        ("usr/lib/firmware/intel-ucode/06-8f-06", &entries[0]),
+        ("usr/lib/firmware/intel-ucode/06-8f-07", &pair),
+        ("usr/lib/firmware/intel-ucode/06-8f-08", &entries[1]),
+    ];
+    let rpm = fake_rpm(&files);
+    let pkgid = sha256_hex(&rpm);
+    let url = "https://dl.example.org/pool/m/microcode_ctl-2.1-1.fc44.x86_64.rpm";
+    let digests: Vec<String> = files.iter().map(|(_, b)| sha256_hex(b)).collect();
+    let paths: Vec<String> = files.iter().map(|(p, _)| format!("/{p}")).collect();
+    let rows: Vec<(&str, &str, usize)> = digests
+        .iter()
+        .zip(&paths)
+        .map(|(d, p)| (d.as_str(), p.as_str(), 0))
+        .collect();
+    install_rpm_files_dataset(
+        &env,
+        &[(&pkgid, "fedora-44", "microcode_ctl", "2.1-1.fc44", url)],
+        &rows,
+    );
+
+    let early = newc_cpio(&[("kernel/x86/microcode/GenuineIntel.bin", &blob)]);
+    let path = env.write("early.cpio", &early);
+    let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("microcode: 3/4 entries in 1 archive matched 2 published files"),
+        "summary: {text}"
+    );
+    assert!(text.contains("(1 no witness — literal)"), "summary: {text}");
+
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("early.cpio.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    let ucode = doc["root"]["build"]["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["build"]["name"] == "kernel/x86/microcode/GenuineIntel.bin")
+        .unwrap_or_else(|| panic!("no blob build: {doc:#}"))["build"]
+        .clone();
+    assert_eq!(ucode["builder"], "splice@0");
+    assert_eq!(ucode["output"]["sha256"], sha256_hex(&blob).as_str());
+    let inputs = ucode["inputs"].as_array().unwrap();
+    let names: Vec<&str> = inputs
+        .iter()
+        .filter_map(|i| i["extract"]["name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["06-8f-06", "06-8f-07"], "inputs: {inputs:?}");
+    // The 6 KiB run beat the 2 KiB decoy inside it.
+    assert_eq!(inputs[1]["extract"]["output"]["size"], 6144);
+    let literal: u64 = inputs
+        .iter()
+        .filter_map(|i| i["literal"]["len"].as_u64())
+        .sum();
+    assert_eq!(literal, 2048, "only the unwitnessed entry: {inputs:?}");
+
+    // And it rebuilds: check walks the rpm for the two extracts.
+    let blobs = env.work().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join("microcode_ctl.rpm"), &rpm).unwrap();
+    let rebuilt = env.work().join("rebuilt.cpio");
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        env.work().join("early.cpio.recipe.json").to_str().unwrap(),
+        blobs.to_str().unwrap(),
+        "--output",
+        rebuilt.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    assert_eq!(
+        std::fs::read(&rebuilt).unwrap(),
+        early,
+        "rebuilt cpio differs"
+    );
+}

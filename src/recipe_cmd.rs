@@ -305,10 +305,10 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool, from_parts: bool) -> R
         !truncated,
         "descent hit the member cap — refusing to mint from a partial tree"
     );
-    let members = report::compact_members(pool.members.into_inner().unwrap(), &dead);
+    let mut members = report::compact_members(pool.members.into_inner().unwrap(), &dead);
 
     let datasets = crate::datasets::open_all();
-    let evidence = report::resolve_members(&members, datasets, threads, use_cache, &ticker);
+    let mut evidence = report::resolve_members(&members, datasets, threads, use_cache, &ticker);
     ticker.clear();
 
     let mut kids: Vec<Vec<usize>> = vec![Vec::new(); members.len()];
@@ -361,6 +361,20 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool, from_parts: bool) -> R
         report_summary(json_out, &doc, None, &line);
         return Ok(());
     }
+
+    // Boundaries no format states: a microcode archive is a bare
+    // concatenation of published files, and the members that recovers
+    // join the tree before anything is planned.
+    let ustats = splice_microcode(
+        &mut members,
+        &mut kids,
+        &mut evidence,
+        &spaces,
+        datasets,
+        use_cache,
+        &ticker,
+    );
+    ticker.clear();
 
     let mut plan = Plan {
         builds: HashMap::new(),
@@ -579,6 +593,7 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool, from_parts: bool) -> R
     }
     line.push(')');
     line.push_str(&pcluster_note(&plan.pcstats));
+    line.push_str(&ucode_note(&ustats));
     let mut compressors: Vec<String> = plan.compress.values().map(|c| c.how.name()).collect();
     compressors.sort();
     compressors.dedup();
@@ -679,6 +694,241 @@ fn referenced_as_leaf(plan: &Plan, i: usize) -> bool {
                 .iter()
                 .any(|s| matches!(s, Seg::Child { idx, .. } if *idx == i))
         }) || plan.compress.values().any(|c| c.child == i))
+}
+
+// -------------------------------------------------- microcode archives
+
+/// How many consecutive microcode entries one published file may hold.
+/// The longest run in Fedora's blob is 3; the bound is what keeps the
+/// probe count at `UCODE_MAX_RUN` per entry.
+const UCODE_MAX_RUN: usize = 8;
+/// A member bigger than this is not read into memory to be split.
+const UCODE_MAX_BYTES: u64 = 64 << 20;
+
+/// One run of entries a witness names: where it starts in the blob,
+/// how long it runs, its digests, and the evidence that named it.
+type UcodeRun = (u64, u64, [u8; 32], [u8; 20], report::Evidence);
+
+/// What the microcode pass found, for the summary line.
+#[derive(Default)]
+struct UcodeStats {
+    archives: usize,
+    entries: usize,
+    matched: usize,
+    files: usize,
+    bytes: u64,
+}
+
+/// Find the published files a microcode archive is a concatenation of,
+/// and append them to the member table as members in their own right.
+///
+/// A boot image's early cpio carries `GenuineIntel.bin` — 16 MB of
+/// self-delimiting entries no index names, because nobody publishes
+/// the concatenation. The distros publish the pieces, one file per
+/// packaged run of entries. The walk can't find them: member
+/// boundaries a format doesn't state aren't a walker's business, and
+/// the descent pool has no datasets to ask. Mint does have them, so it
+/// asks — hashing runs of consecutive entries and taking the longest
+/// one a witness names. Which entries were packaged together is not in
+/// the headers (Intel's extended signature table breaks any grouping
+/// rule you'd invent); the index knows, so the index decides.
+///
+/// The runs that resolve become ordinary members — real bytes, real
+/// digest, real extents inside the blob — and planning treats them
+/// like any other child: a ref where a witness names them directly, an
+/// extract node where an rpm ships them, and literal gaps for the
+/// entries nothing named. Nothing is taken on faith: the verify pass
+/// re-reads every one of them, and the blob's own splice has to
+/// reproduce its digest.
+fn splice_microcode(
+    members: &mut Vec<Member>,
+    kids: &mut Vec<Vec<usize>>,
+    evidence: &mut Vec<report::Evidence>,
+    spaces: &HashMap<usize, View>,
+    datasets: &'static [crate::datasets::LocalDataset],
+    use_cache: bool,
+    ticker: &Ticker,
+) -> UcodeStats {
+    let mut st = UcodeStats::default();
+    let cache = use_cache
+        .then(|| crate::cache::Cache::open().ok())
+        .flatten();
+    // The range is taken once, so the members this appends are not
+    // themselves examined — they are leaves by construction.
+    for i in 0..members.len() {
+        let m = &members[i];
+        // Containers have their own walkers; claimed bytes need no
+        // reconstruction; and a member with nowhere to read from is
+        // not addressable as a splice anyway.
+        if !kids[i].is_empty()
+            || m.digests.is_none()
+            || m.size < IDENTITY_MIN_BYTES
+            || m.size > UCODE_MAX_BYTES
+            || ucode_witnessed(&evidence[i])
+            || (m.space.is_none() && m.extents.is_none())
+        {
+            continue;
+        }
+        let (size, path, depth) = (m.size, m.path.clone(), m.depth);
+        // The space the blob's own children must name: the recorded
+        // one, not the fresh root view's — mint reopened the file, so
+        // the ids differ even though the offsets don't.
+        let space = match &m.space {
+            Some(v) => v.src_id(),
+            None => m.extents.as_ref().expect("addressable").src,
+        };
+        let (view, runs) = member_ranges(m, spaces);
+        let whole: Vec<(u64, u64)> = runs.iter().map(|&(_, off, len)| (off, len)).collect();
+        let mview = view.slice(&whole);
+        let mut head = [0u8; 48];
+        if mview.read_full_at(&mut head, 0).unwrap_or(0) < head.len()
+            || !crate::microcode::looks_like(&head)
+        {
+            continue;
+        }
+        let mut bytes = vec![0u8; size as usize];
+        if mview.read_full_at(&mut bytes, 0).unwrap_or(0) as u64 != size {
+            continue;
+        }
+        let Some((vendor, entries)) = crate::microcode::split(&bytes) else {
+            continue;
+        };
+        let name = leaf_name(&members[i]).to_string();
+        ticker.update(1, 0, || {
+            format!(
+                "microcode… {name}: {} {} entries",
+                entries.len(),
+                vendor.name()
+            )
+        });
+
+        // Greedy longest-run search: one pass over the bytes per start
+        // position, cloning the hash state at each entry boundary, then
+        // probing the candidates longest-first.
+        let mut found: Vec<UcodeRun> = Vec::new();
+        let mut matched = 0usize;
+        let mut pos = 0usize;
+        while pos < entries.len() {
+            let start = entries[pos].0;
+            let mut s256 = sha2::Sha256::new();
+            let mut s1 = <sha1::Sha1 as sha2::Digest>::new();
+            let mut cands: Vec<(u64, [u8; 32], [u8; 20])> = Vec::new();
+            for k in 0..UCODE_MAX_RUN.min(entries.len() - pos) {
+                let (off, len) = entries[pos + k];
+                let run = &bytes[off as usize..(off + len) as usize];
+                s256.update(run);
+                s1.update(run);
+                cands.push((
+                    off + len - start,
+                    s256.clone().finalize().into(),
+                    s1.clone().finalize().into(),
+                ));
+            }
+            let hit = cands.iter().enumerate().rev().find_map(|(k, c)| {
+                let ev = crate::scan_cmd::local_verdicts(&c.1, &c.2, datasets, cache.as_ref());
+                ucode_witnessed(&ev).then_some((k, c, ev))
+            });
+            match hit {
+                Some((k, &(len, sha256, sha1), ev)) => {
+                    found.push((start, len, sha256, sha1, ev));
+                    matched += k + 1;
+                    pos += k + 1;
+                }
+                // No witness for anything starting here: this entry's
+                // bytes stay literal, and the search moves on.
+                None => pos += 1,
+            }
+        }
+        if found.is_empty() {
+            continue;
+        }
+        st.archives += 1;
+        st.entries += entries.len();
+        st.matched += matched;
+        st.files += found.len();
+        st.bytes += found.iter().map(|f| f.1).sum::<u64>();
+        for (off, len, sha256, sha1, ev) in found {
+            let ext = mview.slice(&[(off, len)]);
+            let idx = members.len();
+            members.push(Member {
+                path: format!("{path}!{}", ucode_name(&ev, off)),
+                depth: depth + 1,
+                parent: Some(i),
+                ord: idx,
+                kind: "file",
+                size: len,
+                fs: false,
+                digests: Some(crate::peek_pool::Digests {
+                    md5: None,
+                    sha1,
+                    sha256,
+                    sha512: None,
+                    blake2s: None,
+                    sha1_git: None,
+                }),
+                extents: Some(crate::peek_pool::Extents {
+                    src: space,
+                    runs: ext.extents().into(),
+                }),
+                space: None,
+                matched: Vec::new(),
+                children: 0,
+                note: None,
+            });
+            kids.push(Vec::new());
+            kids[i].push(idx);
+            evidence.push(ev);
+            members[i].children += 1;
+        }
+    }
+    st
+}
+
+/// Whether a witness names these bytes at a URL — directly, or inside
+/// a sha256-named archive. The planner's bar for a ref and for an
+/// extract node respectively; a candidate that clears neither is not
+/// worth a member.
+fn ucode_witnessed(ev: &report::Evidence) -> bool {
+    ev.0.iter().any(|f| match &f.archive {
+        None => f.claims.iter().any(|c| c.url.is_some()),
+        Some(a) => a.scheme == "sha256" && a.url.is_some(),
+    })
+}
+
+/// What to call a run of entries: the name the witness gives its file
+/// (`06-8f-08`), else where it sits in the blob.
+fn ucode_name(ev: &report::Evidence, off: u64) -> String {
+    ev.0.iter()
+        .filter_map(|f| f.archive.as_ref())
+        .find_map(|a| a.path.rsplit('/').find(|n| !n.is_empty()))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("@{off}"))
+}
+
+/// What the microcode pass found, stated rather than implied — same
+/// shape as the erofs sweep's tally.
+fn ucode_note(st: &UcodeStats) -> String {
+    if st.archives == 0 {
+        return String::new();
+    }
+    let mut note = format!(
+        "\nmicrocode: {}/{} entr{} in {} archive{} matched {} published file{} ({})",
+        st.matched,
+        st.entries,
+        if st.entries == 1 { "y" } else { "ies" },
+        st.archives,
+        s(st.archives),
+        st.files,
+        s(st.files),
+        human(st.bytes),
+    );
+    if st.matched < st.entries {
+        note.push_str(&format!(
+            " ({} no witness — literal)",
+            st.entries - st.matched
+        ));
+    }
+    note
 }
 
 /// What a wrapper's head yields before the search: gzip's raw header

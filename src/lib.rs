@@ -44,6 +44,8 @@ pub mod index_cmd;
 #[cfg(feature = "cli")]
 pub mod local_index;
 #[cfg(feature = "cli")]
+mod microcode;
+#[cfg(feature = "cli")]
 mod peek_pool;
 #[cfg(feature = "cli")]
 mod peek_source;
