@@ -515,12 +515,17 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
             s(narchives),
         ));
     }
-    if !plan.pclusters.is_empty() {
-        line.push_str(&format!(
-            ", {} pcluster{}",
-            plan.pclusters.len(),
-            s(plan.pclusters.len()),
-        ));
+    // Nodes the document actually references: planning can produce two
+    // for the same image range (deduplicated files share pclusters),
+    // and only the first one takes the splice.
+    let npc = plan
+        .builds
+        .values()
+        .flat_map(|b| &b.segs)
+        .filter(|s| matches!(s, Seg::PCluster { .. }))
+        .count();
+    if npc > 0 {
+        line.push_str(&format!(", {npc} pcluster{}", s(npc)));
     }
     line.push(')');
     line.push_str(&pcluster_note(&plan.pcstats));
@@ -1302,10 +1307,12 @@ impl Planner<'_> {
             }
             todo.push((c, f));
         }
-        stats.total += files
-            .iter()
-            .map(|f| f.plan.own_pclusters().len())
-            .sum::<usize>();
+        // Everything a file with no fetchable evidence stores is
+        // literal, and says so in the tally rather than vanishing.
+        let all: usize = files.iter().map(|f| f.plan.own_pclusters().len()).sum();
+        let planned: usize = todo.iter().map(|(_, f)| f.plan.own_pclusters().len()).sum();
+        stats.total += all;
+        stats.uncovered += all - planned;
         if todo.is_empty() {
             return Ok(());
         }
@@ -1641,11 +1648,14 @@ fn plan_own_file(
                 stats.not_verbatim += 1;
             }
         }
-        // Drop what the next pcluster can't need.
+        // Drop what the next pcluster can't need. `at` only advances
+        // by what was really there: a short read at EOF must not leave
+        // the window's offset ahead of the bytes in it.
         let keep = pc.la + pc.llen;
         if keep > at {
-            window.drain(..((keep - at) as usize).min(window.len()));
-            at = keep;
+            let drop = ((keep - at) as usize).min(window.len());
+            window.drain(..drop);
+            at += drop as u64;
         }
     }
     // Whatever is left of the member still has to be hashed.
@@ -3241,8 +3251,10 @@ fn assemble_microlzma(
             input.extend_from_slice(bytes);
             Ok(())
         })?;
+        // One pcluster's span, plus the lookahead a node may have been
+        // fed past it (see the input ladder in plan_pcluster).
         ensure!(
-            input.len() as u64 <= crate::erofs::PCLUSTER_MAX_DSIZE,
+            input.len() as u64 <= crate::erofs::PCLUSTER_MAX_DSIZE + ENCODE_MARGIN as u64,
             "{name}: pcluster inputs exceed the format's maximum span"
         );
     }
