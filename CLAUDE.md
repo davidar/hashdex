@@ -43,6 +43,10 @@ hdx recipe FILE       # reconstruction manifest: verified splice of
                       #   (re-encoded and byte-compared at mint; the
                       #   packed inode's files become their inputs,
                       #   uncompressed pclusters splice directly)
+                      #   + zstd@0 nodes (level ladder, framed the way
+                      #   the CLI frames it — the compressed half of a
+                      #   boot image; a member a recipe can rebuild is
+                      #   a source those pclusters may slice)
                       #   + literal residue → FILE.recipe.json
                       #   (a container the indexes name resolves to
                       #   one ref; --from-parts plans its interior

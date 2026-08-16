@@ -1495,6 +1495,77 @@ fn erofs_recipe_rebuilds_a_boot_image_it_ships() {
     );
 }
 
+/// The same image, nested — the case where an erofs image is NOT the
+/// root file. A pcluster's `pa` is an offset into the image, and where
+/// the image is the root those are the same number as the root offset;
+/// one layer of container between them and they are not. A recipe that
+/// merges pcluster segments by the wrong one still reproduces the
+/// CONTAINER's bytes at mint (it reads them from the same place it
+/// wrote them), so only a rebuild catches it: this test mints through a
+/// tar and rebuilds from the rpm.
+#[test]
+fn erofs_recipe_of_a_nested_image_places_its_pclusters() {
+    let env = TestEnv::new("recipe-erofs-nested");
+    let image = erofs_fixture(&env, "boot");
+    let raw = std::fs::read(&image).unwrap();
+    std::fs::remove_file(&image).unwrap();
+    let tarball = plain_tar(&[("boot.erofs", &raw)]);
+    let path = env.write("outer.tar", &tarball);
+
+    let modules = boot_modules();
+    let rpm = fake_rpm(
+        &modules
+            .iter()
+            .map(|(p, b)| (*p, &b[..]))
+            .collect::<Vec<_>>(),
+    );
+    let pkgid = sha256_hex(&rpm);
+    let url = "https://dl.example.org/pool/k/kernel-modules-6.19-1.fc44.x86_64.rpm";
+    let digests: Vec<String> = modules.iter().map(|(_, b)| sha256_hex(b)).collect();
+    let paths: Vec<String> = modules.iter().map(|(p, _)| format!("/{p}")).collect();
+    let rows: Vec<(&str, &str, usize)> = digests
+        .iter()
+        .zip(&paths)
+        .map(|(d, p)| (d.as_str(), p.as_str(), 0))
+        .collect();
+    install_rpm_files_dataset(
+        &env,
+        &[(&pkgid, "fedora-44", "kernel-modules", "6.19-1.fc44", url)],
+        &rows,
+    );
+
+    let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("outer.tar.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        doc.to_string().contains("microlzma@0"),
+        "the nested image still earns pcluster nodes: {}",
+        stdout(&out)
+    );
+
+    let blobs = env.work().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join("kernel-modules.rpm"), &rpm).unwrap();
+    let rebuilt = env.work().join("rebuilt.tar");
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        env.work().join("outer.tar.recipe.json").to_str().unwrap(),
+        blobs.to_str().unwrap(),
+        "--output",
+        rebuilt.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    assert_eq!(
+        std::fs::read(&rebuilt).unwrap(),
+        tarball,
+        "rebuilt tar differs"
+    );
+}
+
 /// Writes a fixture tree for the container that builds the images.
 /// Ignored: run it when a tree changes, then rebuild the image (the
 /// mkfs invocations are on the tests above).

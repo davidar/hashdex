@@ -2106,9 +2106,11 @@ fn splice_in(i: usize, plan: &mut Plan, extra: Vec<Seg>) -> Result<()> {
         taken.insert(s.at(), s.len());
     }
     for mut s in extra {
-        // Segments arrive in the image's own space: a pcluster's `pa`
-        // is an offset into the image, which maps to this build's
-        // logical space through its runs.
+        // Segments arrive in the image's OWN coordinates: a pcluster's
+        // `pa` is an offset into the erofs image, which is this build's
+        // logical space — and becomes a root offset through the runs.
+        // (For an image that is itself the root file the two are the
+        // same number, which is why this only bites nested images.)
         let (at, root_off, len) = match &mut s {
             Seg::PCluster {
                 at, root_off, len, ..
@@ -2118,14 +2120,16 @@ fn splice_in(i: usize, plan: &mut Plan, extra: Vec<Seg>) -> Result<()> {
             } => (at, root_off, len),
             _ => continue,
         };
+        let image_at = *root_off;
         let Some(&(rlog, roff, _)) = build
             .runs
             .iter()
-            .find(|&&(_, off, l)| off <= *root_off && *root_off + *len <= off + l)
+            .find(|&&(log, _, l)| log <= image_at && image_at + *len <= log + l)
         else {
-            continue; // outside the image's own ranges — cannot happen
+            continue; // straddles two runs of a fragmented image
         };
-        *at = rlog + (*root_off - roff);
+        *at = image_at;
+        *root_off = roff + (image_at - rlog);
         if !taken.admits(*at, *len) {
             continue;
         }
@@ -2591,12 +2595,27 @@ fn verify_build(i: usize, plan: &mut Plan, vs: &mut VerifyState) -> Result<()> {
             Seg::PCluster {
                 pc, len, root_off, ..
             } => {
-                // The node itself was proven at planning time (the
-                // re-encode IS the comparison); what's left is to hash
-                // the stored bytes in place and hand its literal
-                // inputs to the residue, here, in document order.
-                hash_root_range(&view, *root_off, *len, &mut buf, |b| h.update(b))
-                    .with_context(|| format!("pcluster at {root_off}"))?;
+                // The node reproduces the pcluster it was built from —
+                // proven at planning time, the re-encode IS the
+                // comparison. What this pass adds is that the node sits
+                // where the splice says it does: the bytes hashed here
+                // must be the node's own output, or a mapping bug could
+                // place a proven node at the wrong offset and still
+                // reproduce the container. Then its literal inputs go
+                // to the residue, in document order.
+                let mut node_h = sha2::Sha256::new();
+                hash_root_range(&view, *root_off, *len, &mut buf, |b| {
+                    h.update(b);
+                    node_h.update(b);
+                })
+                .with_context(|| format!("pcluster at {root_off}"))?;
+                let got: [u8; 32] = node_h.finalize().into();
+                ensure!(
+                    got == plan.pclusters[*pc].sha256,
+                    "{}: pcluster node {} does not match the bytes at its place in the splice",
+                    vs.members[i].path,
+                    plan.pclusters[*pc].name
+                );
                 spill_pcluster(*pc, plan, vs)?;
             }
             Seg::Gap {
