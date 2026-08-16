@@ -223,23 +223,27 @@ where
     if !missing.is_empty() {
         let (preader, pmeta) = open("data/packages.parquet")?;
         let fetched = rows_at(&preader, &pmeta, PKG_COLS, &missing)?;
+        let by_idx: std::collections::HashMap<u64, Arc<Value>> = missing
+            .iter()
+            .zip(fetched)
+            .map(|(idx, row)| (*idx, Arc::new(row)))
+            .collect();
         let mut memo = pkg_memo().lock().expect("package memo");
-        if memo.len() < PKG_MEMO_MAX {
-            for (idx, row) in missing.iter().zip(fetched.iter()) {
-                memo.insert(*idx, Arc::new(row.clone()));
+        for (idx, row) in &by_idx {
+            if memo.len() >= PKG_MEMO_MAX {
+                break;
             }
+            memo.insert(*idx, Arc::clone(row));
         }
         // Serve this call from what was just read, so a full memo
         // still answers correctly.
         let mut out = Vec::with_capacity(refs.len());
         for r in refs {
-            let v = match memo.get(r) {
-                Some(v) => Arc::clone(v),
-                None => match missing.iter().position(|m| m == r) {
-                    Some(i) => Arc::new(fetched[i].clone()),
-                    None => Arc::new(Value::Null),
-                },
-            };
+            let v = memo
+                .get(r)
+                .or_else(|| by_idx.get(r))
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Value::Null));
             out.push(v);
         }
         return Ok(out);
