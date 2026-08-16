@@ -38,6 +38,11 @@ cli = [
     "dep:zip",
     "dep:ar",
     "dep:zstd",
+    # zstd@0 recipe nodes re-encode frames the way the zstd CLI does:
+    # its default is multi-threaded framing, whose bytes differ from
+    # the single-threaded encoder's. Feature-gated to `cli` so the
+    # wasm core never pulls in libzstd's pthread build.
+    "zstd/zstdmt",
     "dep:bzip2",
     "dep:tempfile",
     "dep:liblzma",

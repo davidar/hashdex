@@ -157,10 +157,30 @@ struct Build {
 /// plan IS a proof, same as a verified splice.
 struct Compress {
     child: usize,
-    params: crate::compressors::GnuGzip,
-    /// The original gzip header, spliced back verbatim at rebuild
-    /// (embedded names and mtimes never touch the compressor).
-    header: Vec<u8>,
+    how: Comp,
+}
+
+/// Which catalog run rebuilds a wrapper, with whatever the rebuild
+/// needs that isn't in the child's bytes.
+enum Comp {
+    Gzip {
+        params: crate::compressors::GnuGzip,
+        /// The original gzip header, spliced back verbatim at rebuild
+        /// (embedded names and mtimes never touch the compressor).
+        header: Vec<u8>,
+    },
+    /// One zstd frame — header, blocks and checksum all come out of
+    /// the encoder, so there is nothing to splice back.
+    Zstd { params: crate::compressors::Zstd },
+}
+
+impl Comp {
+    fn name(&self) -> String {
+        match self {
+            Comp::Gzip { params, .. } => params.name(),
+            Comp::Zstd { params } => params.name(),
+        }
+    }
 }
 
 /// An extract node: this member's bytes live at a path inside a
@@ -538,7 +558,7 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool, from_parts: bool) -> R
     }
     line.push(')');
     line.push_str(&pcluster_note(&plan.pcstats));
-    let mut compressors: Vec<String> = plan.compress.values().map(|c| c.params.name()).collect();
+    let mut compressors: Vec<String> = plan.compress.values().map(|c| c.how.name()).collect();
     compressors.sort();
     compressors.dedup();
     if !compressors.is_empty() {
@@ -640,6 +660,13 @@ fn referenced_as_leaf(plan: &Plan, i: usize) -> bool {
         }) || plan.compress.values().any(|c| c.child == i))
 }
 
+/// What a wrapper's head yields before the search: gzip's raw header
+/// bytes, or the flags a zstd frame states about itself.
+enum Probe {
+    Gzip(Vec<u8>),
+    Zstd(crate::compressors::Zstd),
+}
+
 struct Planner<'a> {
     members: &'a [Member],
     kids: &'a [Vec<usize>],
@@ -655,7 +682,7 @@ impl Planner<'_> {
     /// splice build. (Claimed members never get here — a claim stops
     /// descent at the caller.)
     fn plan_node(&mut self, i: usize, plan: &mut Plan) -> bool {
-        if self.members[i].kind == "gzip" && self.plan_compress(i, plan) {
+        if matches!(self.members[i].kind, "gzip" | "zstd") && self.plan_compress(i, plan) {
             return true;
         }
         // An erofs image keeps its build even when no child of it can
@@ -728,11 +755,32 @@ impl Planner<'_> {
         true
     }
 
-    /// Plan wrapper `i` as a gzip@0 node: its single decompressed
-    /// child must itself be plannable (a claimed ref, or a verified
-    /// build/chain), and a catalog compressor must reproduce the
-    /// wrapper's body byte-exact from the child's bytes. The search
-    /// IS the verification — no node is emitted on faith.
+    /// What a wrapper's own head says about the run that made it: the
+    /// gzip header to splice back, or the flags a zstd frame states.
+    /// None means no catalog compressor could have produced these
+    /// bytes, so there is nothing to search for.
+    fn probe_wrapper(&self, kind: &str, wview: &View) -> Option<Probe> {
+        match kind {
+            "gzip" => match crate::compressors::parse_gzip_header(&mut wview.rewound()) {
+                Ok(Some(h)) => Some(Probe::Gzip(h)),
+                _ => None,
+            },
+            "zstd" => {
+                let mut head = [0u8; 5];
+                match wview.read_full_at(&mut head, 0) {
+                    Ok(5) => crate::compressors::parse_zstd_header(&head).map(Probe::Zstd),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Plan wrapper `i` as a compression node (`gzip@0`, `zstd@0`): its
+    /// single decompressed child must itself be plannable (a claimed
+    /// ref, or a verified build/chain), and a catalog compressor must
+    /// reproduce the wrapper's bytes byte-exact from the child's. The
+    /// search IS the verification — no node is emitted on faith.
     fn plan_compress(&mut self, i: usize, plan: &mut Plan) -> bool {
         let m = &self.members[i];
         if m.size < IDENTITY_MIN_BYTES || m.digests.is_none() {
@@ -756,6 +804,14 @@ impl Planner<'_> {
         let Some(wspace) = self.spaces.get(&wext.src) else {
             return false;
         };
+        let wruns: Vec<(u64, u64)> = wext.runs.iter().map(|&(_, off, len)| (off, len)).collect();
+        let wview = wspace.slice(&wruns);
+        // What the wrapper states about itself, read before any child
+        // work: a header no catalog run could have written ends this
+        // here, with the subtree untouched.
+        let Some(probe) = self.probe_wrapper(m.kind, &wview) else {
+            return false;
+        };
         // An unclaimed, unplannable child doesn't kill the chain: the
         // decompressed bytes ride in the sidecar as an all-literal
         // build. Fetchability stays at zero — honestly — but the
@@ -763,22 +819,18 @@ impl Planner<'_> {
         // than the gzip stream they came from).
         let claimed = self.direct_claimed(c);
         let synthetic = !claimed && !self.plan_node(c, plan) && !self.plan_extract(c, plan);
-        let wruns: Vec<(u64, u64)> = wext.runs.iter().map(|&(_, off, len)| (off, len)).collect();
-        let wview = wspace.slice(&wruns);
-        let header = match crate::compressors::parse_gzip_header(&mut wview.rewound()) {
-            Ok(Some(h)) => h,
-            _ => {
-                if !synthetic {
-                    remove_plan_subtree(plan, c);
-                }
-                return false;
-            }
-        };
         let name = leaf_name(m).to_string();
         self.ticker
             .update(1, 0, || format!("searching compressors… {name}"));
-        match search_gzip(&wview, header.len() as u64, &cview) {
-            Some(params) => {
+        let found = match probe {
+            Probe::Gzip(header) => search_gzip(&wview, header.len() as u64, &cview)
+                .map(|params| Comp::Gzip { params, header }),
+            Probe::Zstd(flags) => {
+                search_zstd(&wview, &cview, flags).map(|params| Comp::Zstd { params })
+            }
+        };
+        match found {
+            Some(how) => {
                 if synthetic {
                     plan.builds.insert(
                         c,
@@ -795,14 +847,7 @@ impl Planner<'_> {
                         },
                     );
                 }
-                plan.compress.insert(
-                    i,
-                    Compress {
-                        child: c,
-                        params,
-                        header,
-                    },
-                );
+                plan.compress.insert(i, Compress { child: c, how });
                 true
             }
             None => {
@@ -2111,6 +2156,49 @@ fn rangeable(members: &[Member], space: usize, i: usize) -> Option<&[(u64, u64, 
         .map(|e| &e.runs[..])
 }
 
+/// Compares a candidate compressor's output against the wrapper's own
+/// bytes as it streams: the first disagreement stops the run, and a
+/// candidate is the answer only if it also ends exactly where the
+/// wrapper does.
+struct Matcher<'v> {
+    wrapper: &'v View,
+    pos: u64,
+    end: u64,
+    buf: Vec<u8>,
+}
+
+impl Matcher<'_> {
+    fn new(wrapper: &View, from: u64) -> Matcher<'_> {
+        Matcher {
+            wrapper,
+            pos: from,
+            end: wrapper.len(),
+            buf: vec![0u8; 1 << 20],
+        }
+    }
+
+    fn feed(&mut self, b: &[u8]) -> Result<bool> {
+        if self.pos + b.len() as u64 > self.end {
+            return Ok(false);
+        }
+        let mut off = 0;
+        while off < b.len() {
+            let n = (b.len() - off).min(self.buf.len());
+            let got = self.wrapper.read_full_at(&mut self.buf[..n], self.pos)?;
+            if got < n || self.buf[..n] != b[off..off + n] {
+                return Ok(false);
+            }
+            self.pos += n as u64;
+            off += n;
+        }
+        Ok(true)
+    }
+
+    fn complete(&self) -> bool {
+        self.pos == self.end
+    }
+}
+
 /// Try catalog compressors until one reproduces the wrapper's body —
 /// everything after its recorded header, trailer included — from the
 /// decompressed child's bytes. Mismatched candidates abort on their
@@ -2121,35 +2209,47 @@ fn search_gzip(
     input: &View,
 ) -> Option<crate::compressors::GnuGzip> {
     use crate::compressors::{gzip_body, GnuGzip, GNU_GZIP_CANDIDATES};
-    let end = wrapper.len();
-    if header_len >= end {
+    if header_len >= wrapper.len() {
         return None;
     }
     for level in GNU_GZIP_CANDIDATES {
         for rsyncable in [false, true] {
             let params = GnuGzip { level, rsyncable };
             let mut inp = input.rewound();
-            let mut pos = header_len;
-            let mut cmp = vec![0u8; 1 << 20];
-            let run = gzip_body(params, &mut inp, &mut |b: &[u8]| {
-                if pos + b.len() as u64 > end {
-                    return Ok(false);
-                }
-                let mut off = 0;
-                while off < b.len() {
-                    let n = (b.len() - off).min(cmp.len());
-                    let got = wrapper.read_full_at(&mut cmp[..n], pos)?;
-                    if got < n || cmp[..n] != b[off..off + n] {
-                        return Ok(false);
-                    }
-                    pos += n as u64;
-                    off += n;
-                }
-                Ok(true)
-            });
+            let mut m = Matcher::new(wrapper, header_len);
+            let run = gzip_body(params, &mut inp, &mut |b: &[u8]| m.feed(b));
             // Errors (no gzip on PATH, --rsyncable unsupported) just
             // mean this candidate can't be tried — never a wrong node.
-            if matches!(run, Ok(true)) && pos == end {
+            if matches!(run, Ok(true)) && m.complete() {
+                return Some(params);
+            }
+        }
+    }
+    None
+}
+
+/// The same search for a zstd frame, which the encoder emits whole —
+/// header, blocks and checksum — so the comparison starts at byte 0.
+/// Only the level and the framing are searched: the flags come from
+/// the frame's own header, which is a statement, not a guess.
+fn search_zstd(
+    wrapper: &View,
+    input: &View,
+    flags: crate::compressors::Zstd,
+) -> Option<crate::compressors::Zstd> {
+    use crate::compressors::{zstd_body, ZSTD_LEVEL_CANDIDATES};
+    let ilen = input.len();
+    for level in ZSTD_LEVEL_CANDIDATES {
+        for single_thread in [false, true] {
+            let params = crate::compressors::Zstd {
+                level,
+                single_thread,
+                ..flags
+            };
+            let mut inp = input.rewound();
+            let mut m = Matcher::new(wrapper, 0);
+            let run = zstd_body(params, ilen, &mut inp, &mut |b: &[u8]| m.feed(b));
+            if matches!(run, Ok(true)) && m.complete() {
                 return Some(params);
             }
         }
@@ -2669,13 +2769,32 @@ fn node_json(
         } });
     }
     if let Some(c) = plan.compress.get(&i) {
+        let (builder, params) = match &c.how {
+            Comp::Gzip { params, header } => (
+                "gzip@0",
+                json!({ "compressor": params.name(), "header_hex": hex_lower(header) }),
+            ),
+            Comp::Zstd { params } => {
+                // Level and framing are what the search settled; the
+                // two header flags are stated only where they differ
+                // from what a piped `zstd -N` writes.
+                let mut p = json!({ "level": params.level });
+                if params.single_thread {
+                    p["single_thread"] = json!(true);
+                }
+                if !params.checksum {
+                    p["checksum"] = json!(false);
+                }
+                if params.content_size {
+                    p["content_size"] = json!(true);
+                }
+                ("zstd@0", p)
+            }
+        };
         return json!({ "build": {
-            "builder": "gzip@0",
+            "builder": builder,
             "name": leaf_name(m),
-            "params": {
-                "compressor": c.params.name(),
-                "header_hex": hex_lower(&c.header),
-            },
+            "params": params,
             "output": { "sha256": hex_lower(&m.digests.as_ref().expect("digests").sha256),
                         "size": m.size },
             "inputs": [node_json(c.child, members, plan, evidence, src_of, node_of)],
@@ -2931,6 +3050,13 @@ enum Spool {
 }
 
 impl Spool {
+    fn len(&self) -> Result<u64> {
+        match self {
+            Spool::Mem(v) => Ok(v.len() as u64),
+            Spool::File(f) => Ok(f.metadata()?.len()),
+        }
+    }
+
     /// A sequential reader over the spool (positional reads — the
     /// spool is shared).
     fn reader(&self) -> SpoolReader<'_> {
@@ -3241,6 +3367,7 @@ fn assemble(
         match builder {
             "splice@0" => {}
             "gzip@0" => return assemble_gzip(b, &sha, ctx, feed),
+            "zstd@0" => return assemble_zstd(b, &sha, ctx, feed),
             "microlzma@0" => return assemble_microlzma(b, &sha, ctx, feed),
             other => bail!(
                 "{}: unknown builder {other:?} — this recipe needs a newer hdx",
@@ -3319,6 +3446,51 @@ fn assemble_gzip(
     ensure!(
         got == sha,
         "{name}: recompression hashes to {got}, recipe says {sha} — is the system gzip the same GNU gzip that minted this?"
+    );
+    if let Some(size) = b["output"]["size"].as_u64() {
+        ensure!(n == size, "{name}: rebuilt {n} bytes, recipe says {size}");
+    }
+    Ok(n)
+}
+
+/// Rebuild a zstd@0 node: materialize its input (whose own assembly
+/// verifies its digest) and re-run the recorded zstd settings over it.
+/// The frame is entirely the encoder's — header, blocks and checksum —
+/// so the digest check covers all of it.
+fn assemble_zstd(
+    b: &Value,
+    sha: &str,
+    ctx: &mut CheckCtx,
+    feed: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+) -> Result<u64> {
+    let name = b["name"].as_str().unwrap_or("?").to_string();
+    let p = &b["params"];
+    let params = crate::compressors::Zstd {
+        level: p["level"].as_i64().context("zstd@0 level")? as i32,
+        single_thread: p["single_thread"] == json!(true),
+        checksum: p["checksum"] != json!(false),
+        content_size: p["content_size"] == json!(true),
+    };
+    let inputs = b["inputs"].as_array().context("build inputs")?;
+    ensure!(inputs.len() == 1, "zstd@0 takes exactly one input");
+    let spool = materialize(&inputs[0], ctx)?;
+    let ilen = spool.len()?;
+
+    let mut h = sha2::Sha256::new();
+    let mut n = 0u64;
+    let ran = crate::compressors::zstd_body(params, ilen, &mut spool.reader(), &mut |bytes| {
+        h.update(bytes);
+        feed(bytes)?;
+        n += bytes.len() as u64;
+        Ok(true)
+    })
+    .with_context(|| format!("{name}: running {}", params.name()))?;
+    ensure!(ran, "{name}: {} run aborted", params.name());
+    let got = hex_lower(&h.finalize());
+    ensure!(
+        got == sha,
+        "{name}: recompression hashes to {got}, recipe says {sha} — is this the same libzstd that minted it (this hdx links {})?",
+        zstd::zstd_safe::version_string()
     );
     if let Some(size) = b["output"]["size"].as_u64() {
         ensure!(n == size, "{name}: rebuilt {n} bytes, recipe says {size}");

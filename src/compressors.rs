@@ -1,6 +1,7 @@
-//! The compressor catalog for recipe compression nodes (`gzip@0`):
-//! named, deterministic compressors that mint verifies against the
-//! original bytes and `recipe check` re-runs to rebuild them.
+//! The compressor catalog for recipe compression nodes (`gzip@0`,
+//! `zstd@0`): named, deterministic compressors that mint verifies
+//! against the original bytes and `recipe check` re-runs to rebuild
+//! them.
 //!
 //! The GNU family currently shells out to the system's GNU gzip —
 //! whose deflate output has been byte-stable since 1993, and which is
@@ -130,6 +131,122 @@ pub fn gzip_body(
         Ok(accepted)
     });
     result
+}
+
+/// One zstd catalog entry. Framing matters as much as the level: the
+/// CLI compresses multi-threaded by default, and its frames differ
+/// from the single-threaded encoder's at the first job boundary (the
+/// worker COUNT doesn't matter — the job geometry does). The two
+/// header flags a frame states about itself come from the original
+/// bytes, not from a guess: a piped run knows no content size, and the
+/// CLI turns the XXH64 checksum on where libzstd leaves it off.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Zstd {
+    pub level: i32,
+    pub single_thread: bool,
+    pub checksum: bool,
+    pub content_size: bool,
+}
+
+impl Zstd {
+    pub fn name(self) -> String {
+        let mut n = format!("zstd-{}", self.level);
+        if self.single_thread {
+            n.push_str("-single");
+        }
+        n
+    }
+}
+
+/// Search order: dracut's 15 first (every Fedora boot image), then the
+/// CLI default 3, the maxima 19/22, and a spread of the rest. Anything
+/// outside the ladder simply stays literal — a recipe never guesses.
+pub const ZSTD_LEVEL_CANDIDATES: [i32; 12] = [15, 3, 19, 9, 1, 6, 22, 17, 12, 5, 8, 11];
+
+/// What a zstd frame says about itself, read from its header: enough
+/// to reproduce the flags a re-encode must set. None when this isn't a
+/// frame a catalog run could have produced (a dictionary, a magic that
+/// isn't zstd's).
+pub fn parse_zstd_header(head: &[u8]) -> Option<Zstd> {
+    if head.len() < 5 || head[..4] != [0x28, 0xb5, 0x2f, 0xfd] {
+        return None;
+    }
+    let fhd = head[4];
+    if fhd & 0x08 != 0 || fhd & 0x03 != 0 {
+        return None; // reserved bit set, or a dictionary we don't have
+    }
+    Some(Zstd {
+        level: 0,
+        single_thread: false,
+        checksum: fhd & 0x04 != 0,
+        content_size: (fhd >> 6) != 0 || (fhd & 0x20) != 0,
+    })
+}
+
+/// A writer that hands every byte to a comparison sink and stops the
+/// encoder the moment one disagrees.
+struct SinkWriter<'a> {
+    sink: &'a mut dyn FnMut(&[u8]) -> Result<bool>,
+    err: Option<anyhow::Error>,
+    mismatched: bool,
+}
+
+impl Write for SinkWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match (self.sink)(buf) {
+            Ok(true) => Ok(buf.len()),
+            Ok(false) => {
+                self.mismatched = true;
+                Err(std::io::Error::other("candidate mismatched"))
+            }
+            Err(e) => {
+                self.err = Some(e);
+                Err(std::io::Error::other("sink failed"))
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Compress `input` with the named zstd settings and hand the frame —
+/// header, blocks and checksum — to `sink` in order. `len` is the
+/// input's size, needed only when the frame states its content size.
+/// Same contract as `gzip_body`: Ok(false) means the sink rejected a
+/// chunk (a search candidate that isn't this frame).
+pub fn zstd_body(
+    params: Zstd,
+    len: u64,
+    input: &mut dyn Read,
+    sink: &mut dyn FnMut(&[u8]) -> Result<bool>,
+) -> Result<bool> {
+    let mut w = SinkWriter {
+        sink,
+        err: None,
+        mismatched: false,
+    };
+    let mut enc = zstd::stream::write::Encoder::new(&mut w, params.level)?;
+    enc.include_checksum(params.checksum)?;
+    enc.include_contentsize(params.content_size)?;
+    if params.content_size {
+        enc.set_pledged_src_size(Some(len))?;
+    }
+    if !params.single_thread {
+        // The CLI's `-T` framing. One worker is enough: job geometry
+        // is what the bytes depend on, not how many threads run it.
+        enc.multithread(1)?;
+    }
+    let ran = std::io::copy(input, &mut enc).and_then(|_| enc.finish().map(|_| ()));
+    if let Some(e) = w.err.take() {
+        return Err(e);
+    }
+    if w.mismatched {
+        return Ok(false);
+    }
+    ran.context("zstd encoder")?;
+    Ok(true)
 }
 
 /// Parse a gzip member header from the start of `r`: returns its raw

@@ -697,6 +697,119 @@ fn recipe_unreproducible_gzip_stays_literal() {
 }
 
 #[test]
+fn recipe_boot_image_mints_a_zstd_node() {
+    let env = TestEnv::new("recipe-zstd");
+    let ucode = noisy_payload(9_000, 5);
+    let one = noisy_payload(40_000, 6);
+    let two = noisy_payload(25_000, 7);
+    let rows = [digest_row(&one), digest_row(&two)];
+    let rows: Vec<(&str, &str, &str)> = rows
+        .iter()
+        .map(|r| (r.0.as_str(), r.1.as_str(), r.2.as_str()))
+        .collect();
+    install_fatcat_dataset(&env, &rows);
+    let early = newc_cpio(&[("kernel/x86/microcode/GenuineIntel.bin", &ucode)]);
+    let body = newc_cpio(&[("usr/lib/one.bin", &one), ("usr/lib/two.bin", &two)]);
+    let img = initramfs_shape(&early, &system_zstd(&["-15"], &body));
+    let path = env.write("initramfs.img", &img);
+
+    let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    let so = stdout(&out);
+    assert!(so.contains("compressors: zstd-15"), "summary: {so}");
+    assert!(so.contains("verified byte-exact"), "summary: {so}");
+
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("initramfs.img.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    let root = &doc["root"]["build"];
+    assert_eq!(root["builder"], "splice@0");
+    let frame = root["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["build"]["builder"] == "zstd@0")
+        .expect("a zstd@0 node for the compressed segment");
+    assert_eq!(frame["build"]["params"]["level"], 15);
+    assert_eq!(frame["build"]["name"], "segment-2");
+    let inner = &frame["build"]["inputs"][0]["build"];
+    assert_eq!(inner["builder"], "splice@0");
+    let refs: Vec<&str> = inner["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["ref"]["name"].as_str())
+        .collect();
+    assert_eq!(refs, vec!["usr/lib/one.bin", "usr/lib/two.bin"]);
+
+    // The image rebuilds from the two payloads and the sidecar: the
+    // microcode archive is machine-made and stays literal, the frame
+    // is re-encoded.
+    let blobs = env.work().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join("one"), &one).unwrap();
+    std::fs::write(blobs.join("two"), &two).unwrap();
+    let rebuilt = env.work().join("rebuilt.img");
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        env.work()
+            .join("initramfs.img.recipe.json")
+            .to_str()
+            .unwrap(),
+        blobs.to_str().unwrap(),
+        "--output",
+        rebuilt.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    assert_eq!(std::fs::read(&rebuilt).unwrap(), img);
+}
+
+#[test]
+fn recipe_unreproducible_zstd_stays_literal() {
+    // `--long` widens the window, which the frame header states and no
+    // catalog run reproduces. The wrapper stays literal — honestly —
+    // and the recipe still rebuilds byte-exact from the sidecar.
+    let env = TestEnv::new("recipe-zstd-alien");
+    let one = noisy_payload(40_000, 6);
+    let row = digest_row(&one);
+    install_fatcat_dataset(&env, &[(&row.0, &row.1, &row.2)]);
+    let early = newc_cpio(&[("kernel/x86/microcode/GenuineIntel.bin", &one)]);
+    let body = newc_cpio(&[("usr/lib/one.bin", &one)]);
+    let img = initramfs_shape(&early, &system_zstd(&["-15", "--long=27"], &body));
+    let path = env.write("initramfs.img", &img);
+
+    let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("initramfs.img.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !doc.to_string().contains("zstd@0"),
+        "a frame no catalog run reproduces must not earn a node"
+    );
+    let blobs = env.work().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join("one"), &one).unwrap();
+    let rebuilt = env.work().join("rebuilt.img");
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        env.work()
+            .join("initramfs.img.recipe.json")
+            .to_str()
+            .unwrap(),
+        blobs.to_str().unwrap(),
+        "--output",
+        rebuilt.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    assert_eq!(std::fs::read(&rebuilt).unwrap(), img);
+}
+
+#[test]
 fn recipe_disarchive_projection_matches_git() {
     let env = TestEnv::new("recipe-disarchive");
     // No dataset: the chain survives via the structural fallback
