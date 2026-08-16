@@ -9,8 +9,9 @@ use std::path::Path;
 /// forever. Rows from other versions are invisible (never replayed,
 /// overwritten on the next descent). 2: erofs descent added. 3: FAT
 /// filesystems, and the El Torito boot images an iso keeps outside its
-/// directory tree.
-const CONTAINER_SCHEMA: i64 = 3;
+/// directory tree. 4: cpio archives continue past their trailer, so an
+/// initramfs' compressed body is a member instead of invisible bytes.
+const CONTAINER_SCHEMA: i64 = 4;
 
 /// One cached member of a descended container, keyed by the
 /// container's sha256 — content-addressed, so it NEVER invalidates: a

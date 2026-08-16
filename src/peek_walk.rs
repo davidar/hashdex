@@ -24,6 +24,10 @@ pub(crate) const MAX_MEMBERS: usize = 1_000_000;
 /// (2048 covers every magic we look at head-on: one tar block would
 /// do for most, but erofs puts its superblock at byte 1024).
 const HEAD: usize = 2048;
+/// What the bytes past a cpio's trailer are called: dracut's boot
+/// images are a microcode archive followed by a compressed one, and
+/// the second archive is a member in its own right.
+const CPIO_TAIL: &str = "segment-2";
 /// A squashfs reader's fragment cache grows without bound (every
 /// decompressed fragment block is kept forever), so after this many
 /// bytes of fragment-backed files the reader is rebuilt — dropping
@@ -536,8 +540,13 @@ impl Walk<'_, '_> {
         // Seek-needing containers fed by a stream have to spool; the
         // spool then descends exactly like a ranged member, so their
         // children can be views over the spool.
+        // Seek-needing containers always spool; a cpio does so only for
+        // recipes, where its segments have to carry extents (the
+        // compressed body of an initramfs is compared against its own
+        // bytes, and the files inside it are spliced from the spool).
         let spools = matches!(kind, Kind::SquashFs | Kind::Erofs | Kind::Iso | Kind::Fat)
-            || (kind == Kind::Zip && ctx.conservative);
+            || (kind == Kind::Zip && ctx.conservative)
+            || (kind == Kind::Cpio && self.spool_wrappers);
         if !too_deep && enter && spools {
             let mut src = std::io::Cursor::new(head).chain(r);
             let view = match spool_stream(&mut src, |b| feed.push(pool, b)) {
@@ -1250,6 +1259,49 @@ impl Walk<'_, '_> {
 
     // ----------------------------------------------------------- cpio
 
+    /// What follows a cpio trailer, if anything: archives are
+    /// concatenated (dracut writes a microcode cpio, zero padding, then
+    /// the compressed body — 94% of an initramfs lives past the first
+    /// `TRAILER!!!`), so the walk skips the padding and hands whatever
+    /// is left to one member of its own. The sniffer decides what it
+    /// is: another cpio, a compressed frame, or bytes we can only
+    /// hash. Both cpio arms do this the same way, so a file's member
+    /// tree doesn't depend on whether it was walked ranged or streamed.
+    #[allow(clippy::too_many_arguments)]
+    fn cpio_tail_stream(
+        &self,
+        r: &mut Tee<'_, '_, '_>,
+        path: &str,
+        depth: usize,
+        own: usize,
+        children: &mut usize,
+        ctx: &mut Ctx,
+    ) -> Result<Option<String>> {
+        let mut buf = vec![0u8; 64 << 10];
+        let rest = loop {
+            let n = match r.read(&mut buf) {
+                Ok(0) => return Ok(None),
+                Ok(n) => n,
+                Err(e) => return Ok(Some(format!("cpio tail unreadable: {e}"))),
+            };
+            if let Some(k) = buf[..n].iter().position(|&b| b != 0) {
+                break buf[k..n].to_vec();
+            }
+        };
+        *children += 1;
+        let mut src = std::io::Cursor::new(rest).chain(&mut *r);
+        self.process_stream(
+            &mut src,
+            None,
+            format!("{path}!{CPIO_TAIL}"),
+            CPIO_TAIL,
+            depth + 1,
+            Some(own),
+            ctx,
+        )?;
+        Ok(None)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn cpio_stream(
         &self,
@@ -1270,7 +1322,8 @@ impl Walk<'_, '_> {
                 return Ok(Some("cpio walk stopped: bad member magic".into()));
             };
             if name == "TRAILER!!!" {
-                return Ok(None);
+                skip_n(r, filesize.div_ceil(4) * 4 - filesize)?;
+                return self.cpio_tail_stream(r, path, depth, own, children, ctx);
             }
             let data_pad = filesize.div_ceil(4) * 4 - filesize;
             if mode & 0o170000 == 0o100000 {
@@ -1326,6 +1379,20 @@ impl Walk<'_, '_> {
                 return Ok(Some("cpio walk stopped: bad member magic".into()));
             };
             if name == "TRAILER!!!" {
+                let end = name_off + filesize.div_ceil(4) * 4;
+                let Some(next) = first_nonzero(view, end)? else {
+                    return Ok(None);
+                };
+                *children += 1;
+                let sub = view.slice(&[(next, view.len() - next)]);
+                self.process_ranged(
+                    sub,
+                    format!("{path}!{CPIO_TAIL}"),
+                    CPIO_TAIL,
+                    depth + 1,
+                    Some(own),
+                    ctx,
+                )?;
                 return Ok(None);
             }
             let data_off = name_off;
@@ -1889,6 +1956,25 @@ impl Walk<'_, '_> {
 }
 
 // ------------------------------------------------------------ helpers
+
+/// The first byte at or after `from` that isn't zero padding, or None
+/// when nothing but padding is left.
+fn first_nonzero(view: &View, from: u64) -> Result<Option<u64>> {
+    let mut pos = from;
+    let mut buf = vec![0u8; 64 << 10];
+    while pos < view.len() {
+        let want = ((view.len() - pos) as usize).min(buf.len());
+        let n = view.read_full_at(&mut buf[..want], pos)?;
+        if n == 0 {
+            break;
+        }
+        if let Some(k) = buf[..n].iter().position(|&b| b != 0) {
+            return Ok(Some(pos + k as u64));
+        }
+        pos += n as u64;
+    }
+    Ok(None)
+}
 
 fn skip_n(r: &mut dyn Read, n: u64) -> Result<()> {
     let copied = std::io::copy(&mut r.take(n), &mut std::io::sink())?;

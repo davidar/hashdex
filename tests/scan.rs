@@ -1106,6 +1106,58 @@ fn scan_retry_is_localized_to_the_squashfs_file() {
 
 // ---------------------------------------------------------------- recipe
 
+#[test]
+fn scan_walks_past_a_cpio_trailer() {
+    // A boot image is two archives: the microcode cpio, then a
+    // compressed one holding everything dracut copied out of packages.
+    // The walker used to stop at the first TRAILER!!! — 94% of the
+    // file, invisible.
+    let env = TestEnv::new("cpio-segments");
+    let ucode = noisy_payload(9_000, 5);
+    let one = noisy_payload(30_000, 6);
+    let two = noisy_payload(12_000, 7);
+    let early = newc_cpio(&[("kernel/x86/microcode/GenuineIntel.bin", &ucode)]);
+    let body = newc_cpio(&[("usr/lib/one.bin", &one), ("usr/lib/two.bin", &two)]);
+    let img = initramfs_shape(&early, &system_zstd(&["-15"], &body));
+    let path = env.write("initramfs.img", &img);
+
+    let names = |out: &Output| -> Vec<String> {
+        stdout(out)
+            .lines()
+            .filter(|l| l.starts_with(' '))
+            .filter_map(|l| l.trim().split(" — ").next().map(str::to_string))
+            .filter(|n| !n.is_empty())
+            .collect()
+    };
+    let out = env.hdx(&["--offline", "scan", path.to_str().unwrap()]);
+    assert!(out.status.success(), "scan failed: {}", stderr(&out));
+    let ranged = names(&out);
+    for want in [
+        "kernel/x86/microcode/GenuineIntel.bin",
+        "segment-2",
+        "segment-2~unpacked",
+        "usr/lib/one.bin",
+        "usr/lib/two.bin",
+    ] {
+        assert!(
+            ranged.iter().any(|n| n == want),
+            "{want} missing from {ranged:?}"
+        );
+    }
+
+    // The same bytes streamed (inside a tar) must produce the same
+    // member tree — the descent cache is content-addressed, so the two
+    // arms are not allowed to disagree about what a file contains.
+    let tarball = plain_tar(&[("initramfs.img", &img)]);
+    let tpath = env.write("boot.tar", &tarball);
+    let out = env.hdx(&["--offline", "scan", tpath.to_str().unwrap()]);
+    assert!(out.status.success(), "scan failed: {}", stderr(&out));
+    let mut streamed = names(&out);
+    assert_eq!(streamed.first().map(String::as_str), Some("initramfs.img"));
+    streamed.remove(0);
+    assert_eq!(streamed, ranged);
+}
+
 /// erofs images in every on-disk shape mkfs.erofs 1.9.2 produces from
 /// one source tree, walked to byte-verified member digests. Fixtures
 /// (tests/data/erofs/*.erofs.gz) were built in a fedora:44 container:

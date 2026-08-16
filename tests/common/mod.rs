@@ -567,6 +567,43 @@ pub fn system_gzip(args: &[&str], input: &[u8]) -> Vec<u8> {
 
 /// Deterministic mixed-entropy payload: compressible runs with seeded
 /// noise, long enough that rsyncable window resets actually fire.
+/// Compress with the system zstd, STREAMED — a piped run states no
+/// content size and frames multi-threaded, which is exactly what
+/// dracut's `cpio | zstd` writes and what zstd@0 nodes reproduce.
+pub fn system_zstd(args: &[&str], input: &[u8]) -> Vec<u8> {
+    use std::io::{Read as _, Write as _};
+    let mut child = std::process::Command::new("zstd")
+        .args(args)
+        .args(["-q", "-T0", "-c"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("zstd on PATH (required by the zstd@0 tests)");
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = std::thread::spawn({
+        let input = input.to_vec();
+        move || stdin.write_all(&input)
+    });
+    let mut out = Vec::new();
+    child.stdout.take().unwrap().read_to_end(&mut out).unwrap();
+    writer.join().unwrap().unwrap();
+    assert!(child.wait().unwrap().success());
+    out
+}
+
+/// A boot image the way dracut builds one: an uncompressed "early"
+/// cpio (the microcode archive), zero padding to a block boundary,
+/// then one compressed frame over the cpio that holds everything else.
+/// 94% of a real initramfs lives past that first `TRAILER!!!`.
+pub fn initramfs_shape(early: &[u8], frame: &[u8]) -> Vec<u8> {
+    let mut out = early.to_vec();
+    while !out.len().is_multiple_of(4096) {
+        out.push(0);
+    }
+    out.extend_from_slice(frame);
+    out
+}
+
 pub fn noisy_payload(len: usize, mut seed: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
     while out.len() < len {
