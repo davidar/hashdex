@@ -43,7 +43,10 @@ hdx recipe FILE       # reconstruction manifest: verified splice of
                       #   (re-encoded and byte-compared at mint; the
                       #   packed inode's files become their inputs,
                       #   uncompressed pclusters splice directly)
-                      #   + literal residue → FILE.recipe.json;
+                      #   + literal residue → FILE.recipe.json
+                      #   (a container the indexes name resolves to
+                      #   one ref; --from-parts plans its interior
+                      #   anyway);
                       #   `hdx recipe check RECIPE
                       #   DIR` rebuilds from local blobs, never
                       #   fetches (extracts walk the local rpm);
