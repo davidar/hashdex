@@ -1783,7 +1783,10 @@ impl Walk<'_, '_> {
             // A malformed catalog is a note-worthy nuisance, never a
             // reason to abandon a directory tree that parses.
             match crate::fat::boot_images(view, cat) {
-                Ok(images) => {
+                Ok((images, notes)) => {
+                    for n in notes {
+                        eprintln!("  note: {n}");
+                    }
                     for img in images {
                         *children += 1;
                         self.process_ranged(

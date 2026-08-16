@@ -402,14 +402,16 @@ pub(crate) struct BootImage {
     pub(crate) len: u64,
 }
 
-/// Boot images named by an El Torito catalog at `catalog_lba`.
+/// Boot images named by an El Torito catalog at `catalog_lba`, plus a
+/// note for any entry that had to be left unwalked — a boot image the
+/// walk skips silently would read as residue with no explanation.
 ///
 /// The catalog's length field counts 512-byte sectors in 16 bits, so
 /// it tops out at 32 MiB and tools that exceed it write zero. When the
 /// image turns out to be a filesystem, its own superblock is the
 /// better witness of how long it is — and it is the length that
 /// decides which bytes a recipe can account for.
-pub(crate) fn boot_images(view: &View, catalog_lba: u64) -> Result<Vec<BootImage>> {
+pub(crate) fn boot_images(view: &View, catalog_lba: u64) -> Result<(Vec<BootImage>, Vec<String>)> {
     let mut cat = [0u8; 2048];
     ensure!(
         view.read_full_at(&mut cat, catalog_lba * 2048)? == cat.len(),
@@ -417,6 +419,7 @@ pub(crate) fn boot_images(view: &View, catalog_lba: u64) -> Result<Vec<BootImage
     );
     ensure!(cat[0] == 0x01, "no El Torito validation entry");
     let mut out = Vec::new();
+    let mut notes = Vec::new();
     let mut platform = 0u8;
     for e in cat.chunks_exact(32) {
         match e[0] {
@@ -426,6 +429,9 @@ pub(crate) fn boot_images(view: &View, catalog_lba: u64) -> Result<Vec<BootImage
                 let stated = le16(e, 6) * 512;
                 let at = lba * 2048;
                 if at >= view.len() {
+                    notes.push(format!(
+                        "el-torito boot image at lba {lba}: past the end of the image"
+                    ));
                     continue;
                 }
                 let sub = view.slice(&[(at, view.len() - at)]);
@@ -434,6 +440,13 @@ pub(crate) fn boot_images(view: &View, catalog_lba: u64) -> Result<Vec<BootImage
                     _ => stated,
                 };
                 if len == 0 || at + len > view.len() {
+                    // A non-filesystem image longer than the catalog's
+                    // 16-bit sector count (which wraps to zero) has no
+                    // other witness of its length.
+                    notes.push(format!(
+                        "el-torito boot image at lba {lba}: catalog states {stated} bytes \
+                         and the image names no length of its own — left unwalked"
+                    ));
                     continue;
                 }
                 out.push(BootImage {
@@ -448,7 +461,7 @@ pub(crate) fn boot_images(view: &View, catalog_lba: u64) -> Result<Vec<BootImage
             _ => {}
         }
     }
-    Ok(out)
+    Ok((out, notes))
 }
 
 #[cfg(test)]
