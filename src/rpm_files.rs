@@ -34,8 +34,11 @@ use std::sync::Arc;
 pub const MAX_ROWS: usize = 40;
 
 /// Columns fetched from packages.parquet, whether by pkgid key or by
-/// row index.
-pub const PKG_COLS: &[&str] = &["witness", "name", "evr", "arch", "location"];
+/// row index. pkgid + scheme ride along so a file row's finding can
+/// state its containment edge (the rpm artifact's own checksum).
+pub const PKG_COLS: &[&str] = &[
+    "pkgid", "scheme", "witness", "name", "evr", "arch", "location",
+];
 
 pub fn supports(s: Scheme) -> bool {
     matches!(
@@ -71,6 +74,8 @@ pub fn start_paths(coord: &Coord) -> Vec<String> {
 
 /// One package's identity, however it was fetched.
 pub struct Pkg<'a> {
+    pub pkgid: &'a str,
+    pub scheme: &'a str,
     pub witness: &'a str,
     pub name: &'a str,
     pub evr: &'a str,
@@ -128,6 +133,16 @@ fn witness_display(witness: &str) -> (&str, String) {
 pub fn file_finding(path: &str, pkg: &Pkg, scheme: Scheme, hex: &str) -> Finding {
     let (backend, human) = witness_display(pkg.witness);
     let rpm = pkg.location.rsplit('/').next().unwrap_or(pkg.location);
+    // The URL fetches the rpm, not these bytes — the containment edge
+    // rides structured on the finding (recipe extract nodes need the
+    // rpm's own checksum, which FILEDIGESTS witnesses alongside).
+    let archive = (!pkg.pkgid.is_empty()).then(|| crate::finding::Archive {
+        scheme: pkg.scheme.to_string(),
+        digest: pkg.pkgid.to_string(),
+        path: path.to_string(),
+        name: rpm.to_string(),
+        url: Some(pkg.location.to_string()),
+    });
     Finding {
         backend: backend.into(),
         claims: vec![Claim::new(
@@ -135,6 +150,7 @@ pub fn file_finding(path: &str, pkg: &Pkg, scheme: Scheme, hex: &str) -> Finding
             Some(pkg.location.to_string()),
         )],
         coords: vec![format!("{}:{hex}", scheme.as_str())],
+        archive,
     }
 }
 
@@ -152,12 +168,15 @@ pub fn pkg_finding(pkg: &Pkg, scheme: Scheme, hex: &str) -> Finding {
             Some(pkg.location.to_string()),
         )],
         coords: vec![format!("{}:{hex}", scheme.as_str())],
+        archive: None,
     }
 }
 
 fn json_pkg(v: &Value) -> Pkg<'_> {
     let s = |k: &str| v[k].as_str().unwrap_or("");
     Pkg {
+        pkgid: s("pkgid"),
+        scheme: s("scheme"),
         witness: s("witness"),
         name: s("name"),
         evr: s("evr"),
@@ -223,6 +242,8 @@ mod tests {
     fn renders_file_and_package_rows() {
         let hex = "2c".repeat(32);
         let pkg = Pkg {
+            pkgid: &"3d".repeat(32),
+            scheme: "sha256",
             witness: "fedora-44",
             name: "bash",
             evr: "5.3.9-3.fc44",
@@ -241,12 +262,22 @@ mod tests {
             .unwrap()
             .starts_with("https://dl.fedoraproject.org/"));
         assert_eq!(file.coords, vec![format!("sha256:{hex}")]);
+        let a = file.archive.as_ref().expect("containment edge");
+        assert_eq!(
+            (a.scheme.as_str(), a.digest.as_str()),
+            ("sha256", pkg.pkgid)
+        );
+        assert_eq!(a.path, "/usr/bin/bash");
+        assert_eq!(a.name, "bash-5.3.9-3.fc44.x86_64.rpm");
+        assert_eq!(a.url.as_deref(), Some(pkg.location));
 
         let p = pkg_finding(&pkg, Scheme::Sha256, &hex);
         assert_eq!(
             p.claims[0].statement,
             "Fedora 44 packages these bytes as bash-5.3.9-3.fc44.x86_64.rpm (bash 5.3.9-3.fc44)"
         );
+        // Artifact-level rows ARE the bytes at the URL — no edge.
+        assert!(p.archive.is_none());
     }
 
     #[test]

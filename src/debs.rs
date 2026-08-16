@@ -113,6 +113,7 @@ pub fn finding(row: &Row) -> Finding {
         backend: project.into(),
         claims: vec![Claim::new(statement, Some(url))],
         coords,
+        archive: None,
     }
 }
 

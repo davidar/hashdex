@@ -2065,6 +2065,58 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
+/// A newc cpio archive of (path, bytes) entries — rpm-payload style.
+fn newc_cpio(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut cpio = Vec::new();
+    let header = |cpio: &mut Vec<u8>, mode: u32, filesize: usize, namesize: usize, ino: usize| {
+        write!(
+            cpio,
+            "070701{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+            ino, mode, 0, 0, 1, 0, filesize, 0, 0, 0, 0, namesize, 0
+        )
+        .unwrap();
+    };
+    for (i, (name, bytes)) in entries.iter().enumerate() {
+        let name_nul = format!("{name}\0");
+        header(&mut cpio, 0o100644, bytes.len(), name_nul.len(), i + 1);
+        cpio.extend_from_slice(name_nul.as_bytes());
+        while cpio.len() % 4 != 0 {
+            cpio.push(0);
+        }
+        cpio.extend_from_slice(bytes);
+        while cpio.len() % 4 != 0 {
+            cpio.push(0);
+        }
+    }
+    let trailer = "TRAILER!!!\0";
+    header(&mut cpio, 0, 0, trailer.len(), 0);
+    cpio.extend_from_slice(trailer.as_bytes());
+    while cpio.len() % 4 != 0 {
+        cpio.push(0);
+    }
+    cpio
+}
+
+/// A minimal rpm: 96-byte lead (magic + zeros), empty signature and
+/// main headers, gzip'd newc cpio payload — the exact shape the
+/// header skip + payload sniff walk through.
+fn fake_rpm(files: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut rpm = vec![0u8; 96];
+    rpm[..4].copy_from_slice(&[0xed, 0xab, 0xee, 0xdb]);
+    for _ in 0..2 {
+        rpm.extend_from_slice(&[0x8e, 0xad, 0xe8, 0x01]); // header magic + version
+        rpm.extend_from_slice(&[0; 4]); // reserved
+        rpm.extend_from_slice(&0u32.to_be_bytes()); // nindex
+        rpm.extend_from_slice(&0u32.to_be_bytes()); // hsize
+    }
+    let mut enc = flate2::write::GzEncoder::new(&mut rpm, flate2::Compression::default());
+    enc.write_all(&newc_cpio(files)).unwrap();
+    enc.finish().unwrap();
+    rpm
+}
+
 /// (sha1, sha256, md5) of some bytes — a fixture-dataset row: refs
 /// require claims now, so recipe tests register their members.
 fn digest_row(bytes: &[u8]) -> (String, String, String) {
@@ -2160,6 +2212,194 @@ fn recipe_splices_a_plain_tar() {
     assert!(se.contains("missing: b.bin"), "stderr: {se}");
     assert!(se.contains(&sha256_hex(&mid)), "stderr: {se}");
     assert!(se.contains("web.archive.org"), "claim URL missing: {se}");
+}
+
+/// Members witnessed as archive-interior bytes (rpm-files FILEDIGESTS
+/// rows) become extract nodes — "fetch this archive, extract this
+/// path, expect this digest" — with the archive stated once in the
+/// top-level sources table. check rebuilds through a real rpm→cpio
+/// walk, from the extracted bytes directly, and reports the ARCHIVE
+/// (the fetchable thing) when neither is on hand.
+#[test]
+fn recipe_extracts_attested_archive_members() {
+    let env = TestEnv::new("recipe-extract");
+    let tool: Vec<u8> = (0u8..=255).cycle().take(1200).collect();
+    let readme = vec![0x5Au8; 900];
+    let rpm = fake_rpm(&[("usr/bin/tool", &tool), ("usr/share/doc/README", &readme)]);
+    let pkgid = sha256_hex(&rpm);
+    let rpm_url = "https://dl.example.org/pool/t/tool-1.0-1.fc44.x86_64.rpm";
+    install_rpm_files_dataset(
+        &env,
+        &[(&pkgid, "fedora-44", "tool", "1.0-1.fc44", rpm_url)],
+        &[
+            (&sha256_hex(&tool), "/usr/bin/tool", 0),
+            (&sha256_hex(&readme), "/usr/share/doc/README", 0),
+        ],
+    );
+    let tarball = plain_tar(&[("tool.bin", &tool), ("readme.txt", &readme)]);
+    let tar_path = env.write("demo.tar", &tarball);
+
+    let out = env.hdx(&["--offline", "recipe", tar_path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("2 extracts from 1 archive"),
+        "summary: {text}"
+    );
+
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("demo.tar.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    // New grammar forms bump the version so an older hdx bails.
+    assert_eq!(doc["hdx_recipe"], "1");
+    let sources = doc["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1, "one rpm, stated once: {sources:?}");
+    let aref = &sources[0]["ref"];
+    assert_eq!(aref["digests"]["sha256"], pkgid.as_str());
+    assert_eq!(aref["name"], "tool-1.0-1.fc44.x86_64.rpm");
+    assert_eq!(aref["claims"][0]["url"], rpm_url);
+    let inputs = doc["root"]["build"]["inputs"].as_array().unwrap();
+    let extracts: Vec<&serde_json::Value> =
+        inputs.iter().filter(|i| i["extract"].is_object()).collect();
+    assert_eq!(extracts.len(), 2, "inputs: {inputs:?}");
+    let e = &extracts[0]["extract"];
+    assert_eq!(e["name"], "tool.bin");
+    assert_eq!(e["path"], "/usr/bin/tool");
+    assert_eq!(e["archive"]["source"], 0);
+    assert_eq!(e["output"]["sha256"], sha256_hex(&tool).as_str());
+    assert_eq!(e["output"]["size"], 1200);
+    assert_eq!(e["claims"][0]["attestor"], "fedora");
+    // Both members are archive-fetchable; the tar metadata is residue.
+    assert_eq!(doc["coverage"]["fetchable_bytes"].as_u64().unwrap(), 2100);
+
+    // Route 1: the rpm blob — a real rpm→cpio walk per member.
+    let blobs = env.work().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join("some.rpm"), &rpm).unwrap();
+    let rebuilt = env.work().join("rebuilt.tar");
+    let recipe = env.work().join("demo.tar.recipe.json");
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        recipe.to_str().unwrap(),
+        blobs.to_str().unwrap(),
+        "--output",
+        rebuilt.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    assert_eq!(std::fs::read(&rebuilt).unwrap(), tarball);
+
+    // Route 2: the extracted bytes on hand, no rpm needed.
+    std::fs::remove_file(blobs.join("some.rpm")).unwrap();
+    std::fs::write(blobs.join("a"), &tool).unwrap();
+    std::fs::write(blobs.join("b"), &readme).unwrap();
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        recipe.to_str().unwrap(),
+        blobs.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+
+    // Route 3: neither — the report names the archive and its URL.
+    std::fs::remove_file(blobs.join("a")).unwrap();
+    std::fs::remove_file(blobs.join("b")).unwrap();
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        recipe.to_str().unwrap(),
+        blobs.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    let se = stderr(&out);
+    assert!(se.contains("tool-1.0-1.fc44.x86_64.rpm"), "stderr: {se}");
+    assert!(se.contains(&pkgid), "stderr: {se}");
+    assert!(se.contains(rpm_url), "stderr: {se}");
+
+    // A stale attestation dies at the walk, never silently: point an
+    // extract node at a path the rpm doesn't ship and re-check.
+    let mut bad = doc.clone();
+    let idx = bad["root"]["build"]["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|i| i["extract"].is_object())
+        .unwrap();
+    bad["root"]["build"]["inputs"][idx]["extract"]["path"] = serde_json::json!("/usr/bin/other");
+    let bad_path = env.write(
+        "bad.recipe.json",
+        serde_json::to_string(&bad).unwrap().as_bytes(),
+    );
+    std::fs::copy(
+        env.work().join("demo.tar.recipe.residue"),
+        env.work().join("bad.recipe.residue"),
+    )
+    .unwrap();
+    std::fs::write(blobs.join("some.rpm"), &rpm).unwrap();
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        bad_path.to_str().unwrap(),
+        blobs.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("no such path"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+/// A single file the witness places whole inside an archive mints as
+/// one extract node — the recipe IS the attestation.
+#[test]
+fn recipe_single_file_is_one_extract_node() {
+    let env = TestEnv::new("recipe-extract1");
+    let tool: Vec<u8> = (0u8..=255)
+        .cycle()
+        .map(|b| b.wrapping_mul(37))
+        .take(800)
+        .collect();
+    let rpm = fake_rpm(&[("usr/bin/tool", &tool)]);
+    let pkgid = sha256_hex(&rpm);
+    let rpm_url = "https://dl.example.org/pool/t/tool-1.0-1.fc44.x86_64.rpm";
+    install_rpm_files_dataset(
+        &env,
+        &[(&pkgid, "fedora-44", "tool", "1.0-1.fc44", rpm_url)],
+        &[(&sha256_hex(&tool), "/usr/bin/tool", 0)],
+    );
+    let path = env.write("tool.bin", &tool);
+
+    let out = env.hdx(&["--offline", "recipe", path.to_str().unwrap()]);
+    assert!(out.status.success(), "mint failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("100% fetchable"),
+        "summary: {}",
+        stdout(&out)
+    );
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.work().join("tool.bin.recipe.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(doc["hdx_recipe"], "1");
+    assert!(doc["root"]["extract"].is_object(), "doc: {doc}");
+    assert_eq!(doc["sources"].as_array().unwrap().len(), 1);
+
+    let blobs = env.work().join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join("the.rpm"), &rpm).unwrap();
+    let rebuilt = env.work().join("rebuilt.bin");
+    let out = env.hdx(&[
+        "recipe",
+        "check",
+        env.work().join("tool.bin.recipe.json").to_str().unwrap(),
+        blobs.to_str().unwrap(),
+        "--output",
+        rebuilt.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    assert_eq!(std::fs::read(&rebuilt).unwrap(), tool);
 }
 
 #[test]

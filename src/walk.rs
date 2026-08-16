@@ -235,6 +235,7 @@ mod tests {
             backend: backend.into(),
             claims: vec![Claim::new("claim", None)],
             coords: coords.iter().map(|s| s.to_string()).collect(),
+            archive: None,
         }
     }
 

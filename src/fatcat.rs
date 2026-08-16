@@ -125,6 +125,7 @@ where
             backend: NAME.into(),
             claims,
             coords,
+            archive: None,
         });
     }
     Ok(findings)

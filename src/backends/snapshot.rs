@@ -58,5 +58,6 @@ pub async fn lookup(client: &Client, coord: &Coord) -> Result<Option<Finding>> {
         backend: NAME.into(),
         claims,
         coords: vec![],
+        archive: None,
     }))
 }

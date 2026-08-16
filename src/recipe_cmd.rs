@@ -92,12 +92,27 @@ struct Compress {
     header: Vec<u8>,
 }
 
+/// An extract node: this member's bytes live at a path inside a
+/// published archive — a witness stated so (FILEDIGESTS-grade
+/// metadata), and the claim rides on the node. The output digest is
+/// locally verified like any leaf; the archive→path→bytes edge is
+/// ATTESTED, not mint-verified — mint never opens the rpm (`recipe
+/// check` walks it for real at rebuild). Same trust shape as a ref's
+/// claim URL: a stale attestation surfaces exactly like a dead link.
+struct Extract {
+    archive: crate::finding::Archive,
+    attestor: String,
+    statement: String,
+}
+
 struct Plan {
     /// Member idx → its build plan; members referenced but not built
     /// appear only as `Seg::Child` entries.
     builds: HashMap<usize, Build>,
     /// Member idx → its compression plan (gzip@0 nodes).
     compress: HashMap<usize, Compress>,
+    /// Member idx → its extract plan (leaves fetched via an archive).
+    extracts: HashMap<usize, Extract>,
     root: usize,
 }
 
@@ -218,11 +233,11 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
         }
     }
 
-    let claims_of = |i: usize| claims_json(&evidence[i].0);
-
     // The indexes already name the whole file: the recipe is a single
-    // reference — nothing to reconstruct, nothing literal.
-    let root_claims = claims_of(root);
+    // reference — nothing to reconstruct, nothing literal. (Direct
+    // claims only: an archive-interior claim's URL fetches the
+    // containing archive, so it earns an extract node, not a ref.)
+    let root_claims = claims_json(&evidence[root].0);
     if !root_claims.is_empty() {
         let doc = json!({
             "hdx_recipe": "0",
@@ -241,6 +256,7 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
     let mut plan = Plan {
         builds: HashMap::new(),
         compress: HashMap::new(),
+        extracts: HashMap::new(),
         root,
     };
     let mut planner = Planner {
@@ -250,13 +266,35 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
         spaces: &spaces,
         ticker: &ticker,
     };
-    let planned = planner.plan_node(root, &mut plan);
+    // A whole-file extract attestation wins outright (100% fetchable);
+    // otherwise plan the tree. Order matters: a plain root always
+    // "plans" as an all-literal build, which must not shadow this.
+    let planned = planner.plan_extract(root, &mut plan) || planner.plan_node(root, &mut plan);
     ticker.clear();
     ensure!(
         planned,
         "no member of {} is reachable as a byte range — nothing beyond a trivial full-literal recipe",
         path.display()
     );
+
+    // The whole file is one attested archive member: the recipe is a
+    // single extract node — nothing to splice, nothing literal.
+    if plan.extracts.contains_key(&root) {
+        let (sources, src_of) = sources_json(&plan);
+        let doc = json!({
+            "hdx_recipe": "1",
+            "source": source_json(path, &members[root]),
+            "sources": sources,
+            "root": node_json(root, &members, &plan, &evidence, &src_of),
+        });
+        let out = write_doc(path, &doc)?;
+        let line = format!(
+            "100% fetchable — an archive the indexes name ships these bytes; fetch it and extract\n→ {}",
+            out.display()
+        );
+        report_summary(json_out, &doc, None, &line);
+        return Ok(());
+    }
 
     // Verify: every ref re-read from its recorded ranges must
     // reproduce its digest, and every build re-spliced from its
@@ -308,16 +346,25 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
             fetchable += members[c.child].size;
         }
     }
+    let mut nextracts = 0usize;
     for (i, m) in members.iter().enumerate() {
         if referenced_as_leaf(&plan, i) && m.size > 0 {
-            nrefs += 1;
+            if plan.extracts.contains_key(&i) {
+                nextracts += 1;
+            } else {
+                nrefs += 1;
+            }
         }
     }
 
-    let doc = json!({
-        "hdx_recipe": "0",
+    // New grammar forms (extract nodes, the sources table) bump the
+    // version so an older hdx bails with its "unknown version" path
+    // instead of misreading the document.
+    let (sources, src_of) = sources_json(&plan);
+    let mut doc = json!({
+        "hdx_recipe": if plan.extracts.is_empty() { "0" } else { "1" },
         "source": source_json(path, &members[root]),
-        "root": node_json(root, &members, &plan, &evidence),
+        "root": node_json(root, &members, &plan, &evidence, &src_of),
         "residue": residue.as_ref().map(|r| json!({
             "sha256": hex_lower(&r.sha256),
             "size": r.file_len,
@@ -330,6 +377,9 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
             "residue_bytes": residue_total,
         },
     });
+    if !sources.is_empty() {
+        doc["sources"] = json!(sources);
+    }
     let out = write_doc(path, &doc)?;
 
     let covered = fetchable + residue_total;
@@ -344,13 +394,22 @@ pub fn mint(path: &Path, use_cache: bool, json_out: bool) -> Result<()> {
         line.push_str(&format!(" (sidecar {} zstd)", human(r.file_len)));
     }
     line.push_str(&format!(
-        " · verified byte-exact\n→ {} ({} ref{}, {} build{})",
+        " · verified byte-exact\n→ {} ({} ref{}, {} build{}",
         out.display(),
         nrefs,
         s(nrefs),
         plan.builds.len() + plan.compress.len(),
         s(plan.builds.len() + plan.compress.len()),
     ));
+    if nextracts > 0 {
+        line.push_str(&format!(
+            ", {nextracts} extract{} from {} archive{}",
+            s(nextracts),
+            sources.len(),
+            s(sources.len()),
+        ));
+    }
+    line.push(')');
     let mut compressors: Vec<String> = plan.compress.values().map(|c| c.params.name()).collect();
     compressors.sort();
     compressors.dedup();
@@ -394,6 +453,47 @@ impl Planner<'_> {
         self.plan_build(i, plan)
     }
 
+    /// Whether a witness claims THESE bytes at a URL. Archive-interior
+    /// claims don't count: their URL fetches the containing archive,
+    /// so a plain ref built on one would lie about fetchability —
+    /// those members are planned as extract nodes instead.
+    fn direct_claimed(&self, i: usize) -> bool {
+        self.evidence[i]
+            .0
+            .iter()
+            .any(|f| f.archive.is_none() && f.claims.iter().any(|c| c.url.is_some()))
+    }
+
+    /// Plan member `i` as an extract node: a witness states these
+    /// bytes sit at a path inside a sha256-named archive with a claim
+    /// URL. Weak-digest archives don't qualify (lookup keys, never
+    /// merge keys — and `check` finds local blobs by sha256).
+    fn plan_extract(&mut self, i: usize, plan: &mut Plan) -> bool {
+        if self.members[i].digests.is_none() || self.members[i].size < IDENTITY_MIN_BYTES {
+            return false;
+        }
+        let Some(f) = self.evidence[i].0.iter().find(|f| {
+            f.archive
+                .as_ref()
+                .is_some_and(|a| a.scheme == "sha256" && a.url.is_some())
+        }) else {
+            return false;
+        };
+        plan.extracts.insert(
+            i,
+            Extract {
+                archive: f.archive.clone().expect("filtered on archive"),
+                attestor: f.backend.clone(),
+                statement: f
+                    .claims
+                    .first()
+                    .map(|c| c.statement.clone())
+                    .unwrap_or_default(),
+            },
+        );
+        true
+    }
+
     /// Plan wrapper `i` as a gzip@0 node: its single decompressed
     /// child must itself be plannable (a claimed ref, or a verified
     /// build/chain), and a catalog compressor must reproduce the
@@ -427,8 +527,8 @@ impl Planner<'_> {
         // build. Fetchability stays at zero — honestly — but the
         // verified structure survives (and tar bytes zstd far better
         // than the gzip stream they came from).
-        let claimed = self.evidence[c].0.iter().any(|f| !f.claims.is_empty());
-        let synthetic = !claimed && !self.plan_node(c, plan);
+        let claimed = self.direct_claimed(c);
+        let synthetic = !claimed && !self.plan_node(c, plan) && !self.plan_extract(c, plan);
         let wruns: Vec<(u64, u64)> = wext.runs.iter().map(|&(_, off, len)| (off, len)).collect();
         let wview = wspace.slice(&wruns);
         let header = match crate::compressors::parse_gzip_header(&mut wview.rewound()) {
@@ -513,8 +613,8 @@ impl Planner<'_> {
             let Some(cruns) = rangeable(members, space, c) else {
                 continue;
             };
-            let claimed = self.evidence[c].0.iter().any(|f| !f.claims.is_empty());
-            if !claimed && !self.plan_node(c, plan) {
+            let claimed = self.direct_claimed(c);
+            if !claimed && !self.plan_node(c, plan) && !self.plan_extract(c, plan) {
                 continue; // unverified hypothesis — bytes stay literal
             }
             // Map the child's runs into this build's logical space;
@@ -611,6 +711,7 @@ impl Planner<'_> {
 /// extent overlap or a failed compressor search after recursion had
 /// already planned it).
 fn remove_plan_subtree(plan: &mut Plan, i: usize) {
+    plan.extracts.remove(&i);
     if let Some(c) = plan.compress.remove(&i) {
         remove_plan_subtree(plan, c.child);
     }
@@ -949,10 +1050,16 @@ fn verify_build(i: usize, plan: &mut Plan, vs: &mut VerifyState) -> Result<()> {
 
 // ------------------------------------------------------------- emitting
 
+/// A ref's claims: where THESE bytes are fetchable. Archive-interior
+/// findings are excluded — their URL fetches the containing archive
+/// (they surface as extract nodes, never as ref claims).
 fn claims_json(findings: &[crate::finding::Finding]) -> Vec<Value> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
     for f in findings {
+        if f.archive.is_some() {
+            continue;
+        }
         for c in &f.claims {
             if let Some(url) = &c.url {
                 if seen.insert((f.backend.clone(), url.clone())) {
@@ -1014,8 +1121,59 @@ fn source_json(path: &Path, root: &Member) -> Value {
     })
 }
 
-fn node_json(i: usize, members: &[Member], plan: &Plan, evidence: &[report::Evidence]) -> Value {
+/// The top-level sources table: one archive ref per distinct archive
+/// the plan's extract nodes fetch from, plus member idx → table idx.
+/// Claims are first-seen (every extract node carries its own witness
+/// line; the table entry exists so the archive is stated once).
+fn sources_json(plan: &Plan) -> (Vec<Value>, HashMap<usize, usize>) {
+    let mut order: Vec<usize> = plan.extracts.keys().copied().collect();
+    order.sort_unstable();
+    let mut idx_of_digest: HashMap<String, usize> = HashMap::new();
+    let mut sources = Vec::new();
+    let mut src_of = HashMap::new();
+    for i in order {
+        let e = &plan.extracts[&i];
+        let idx = *idx_of_digest
+            .entry(e.archive.digest.clone())
+            .or_insert_with(|| {
+                sources.push(json!({ "ref": {
+                    "digests": { "sha256": e.archive.digest },
+                    "name": e.archive.name,
+                    "claims": [{
+                        "attestor": e.attestor,
+                        "statement": e.statement,
+                        "url": e.archive.url,
+                    }],
+                }}));
+                sources.len() - 1
+            });
+        src_of.insert(i, idx);
+    }
+    (sources, src_of)
+}
+
+fn node_json(
+    i: usize,
+    members: &[Member],
+    plan: &Plan,
+    evidence: &[report::Evidence],
+    src_of: &HashMap<usize, usize>,
+) -> Value {
     let m = &members[i];
+    if let Some(e) = plan.extracts.get(&i) {
+        return json!({ "extract": {
+            "name": leaf_name(m),
+            "archive": { "source": src_of[&i] },
+            "path": e.archive.path,
+            "output": { "sha256": hex_lower(&m.digests.as_ref().expect("digests").sha256),
+                        "size": m.size },
+            "claims": [{
+                "attestor": e.attestor,
+                "statement": e.statement,
+                "url": e.archive.url,
+            }],
+        } });
+    }
     if let Some(c) = plan.compress.get(&i) {
         return json!({ "build": {
             "builder": "gzip@0",
@@ -1026,7 +1184,7 @@ fn node_json(i: usize, members: &[Member], plan: &Plan, evidence: &[report::Evid
             },
             "output": { "sha256": hex_lower(&m.digests.as_ref().expect("digests").sha256),
                         "size": m.size },
-            "inputs": [node_json(c.child, members, plan, evidence)],
+            "inputs": [node_json(c.child, members, plan, evidence, src_of)],
         } });
     }
     match plan.builds.get(&i) {
@@ -1037,7 +1195,7 @@ fn node_json(i: usize, members: &[Member], plan: &Plan, evidence: &[report::Evid
                 .iter()
                 .map(|seg| match seg {
                     Seg::Child { idx, from, len, .. } => {
-                        let node = node_json(*idx, members, plan, evidence);
+                        let node = node_json(*idx, members, plan, evidence, src_of);
                         if *from == 0 && *len == members[*idx].size {
                             node
                         } else {
@@ -1128,10 +1286,11 @@ pub fn check(recipe: &Path, dir: &Path, output: Option<&Path>) -> Result<()> {
     ))
     .with_context(|| format!("parse {}", recipe.display()))?;
     ensure!(
-        doc["hdx_recipe"] == json!("0"),
+        doc["hdx_recipe"] == json!("0") || doc["hdx_recipe"] == json!("1"),
         "{}: not an hdx recipe (or an unknown version)",
         recipe.display()
     );
+    let sources: Vec<Value> = doc["sources"].as_array().cloned().unwrap_or_default();
 
     // The residue sidecar sits next to the document: verify the file
     // as written, then open the uncompressed stream for offset reads
@@ -1188,7 +1347,7 @@ pub fn check(recipe: &Path, dir: &Path, output: Option<&Path>) -> Result<()> {
     // their claim URLs, before any rebuild work.
     let mut missing: Vec<(String, String, Vec<String>)> = Vec::new();
     let root = &doc["root"];
-    collect_missing(root, &blobs, &mut missing);
+    collect_missing(root, &sources, &blobs, &mut missing)?;
     if !missing.is_empty() {
         for (name, sha, urls) in &missing {
             eprintln!("missing: {name} (sha256 {sha})");
@@ -1213,6 +1372,7 @@ pub fn check(recipe: &Path, dir: &Path, output: Option<&Path>) -> Result<()> {
     };
     let mut ctx = CheckCtx {
         blobs: &blobs,
+        sources: &sources,
         residue,
         built: HashMap::new(),
     };
@@ -1237,9 +1397,26 @@ pub fn check(recipe: &Path, dir: &Path, output: Option<&Path>) -> Result<()> {
 
 struct CheckCtx<'a> {
     blobs: &'a HashMap<String, PathBuf>,
+    /// The document's top-level sources table (`{"source": i}` nodes
+    /// and `{"slice": {"source": i, …}}` index into it).
+    sources: &'a [Value],
     residue: Option<Spool>,
     /// Builds materialized for slicing, by output sha256.
     built: HashMap<String, Spool>,
+}
+
+/// Follow `{"source": i}` indirections into the sources table.
+fn resolve_source<'a>(node: &'a Value, sources: &'a [Value]) -> Result<&'a Value> {
+    let mut n = node;
+    for _ in 0..=sources.len() {
+        let Some(i) = n["source"].as_u64() else {
+            return Ok(n);
+        };
+        n = sources
+            .get(i as usize)
+            .with_context(|| format!("source index {i} out of range"))?;
+    }
+    bail!("source indirection loop in recipe")
 }
 
 /// RAM-or-tempfile bytes for a rebuilt container a slice addresses.
@@ -1330,22 +1507,31 @@ fn node_sha256(node: &Value) -> Result<String> {
             .context("build without output sha256")?
             .to_string());
     }
-    bail!("node is neither ref nor build")
+    if node["extract"].is_object() {
+        return Ok(node["extract"]["output"]["sha256"]
+            .as_str()
+            .context("extract without output sha256")?
+            .to_string());
+    }
+    bail!("node is neither ref, build, nor extract")
 }
 
 fn node_name(node: &Value) -> String {
     node["ref"]["name"]
         .as_str()
         .or(node["build"]["name"].as_str())
+        .or(node["extract"]["name"].as_str())
         .unwrap_or("?")
         .to_string()
 }
 
 fn collect_missing(
     node: &Value,
+    sources: &[Value],
     blobs: &HashMap<String, PathBuf>,
     missing: &mut Vec<(String, String, Vec<String>)>,
-) {
+) -> Result<()> {
+    let node = resolve_source(node, sources)?;
     if node["ref"].is_object() {
         let r = &node["ref"];
         let sha = r["digests"]["sha256"].as_str().unwrap_or("");
@@ -1367,7 +1553,20 @@ fn collect_missing(
                 missing.push(entry);
             }
         }
-        return;
+        return Ok(());
+    }
+    if node["extract"].is_object() {
+        // Either the extracted bytes themselves or the archive they
+        // are attested to live in satisfies an extract node; when
+        // neither is present, the ARCHIVE is what the claim URLs
+        // fetch, so that's what gets reported.
+        let e = &node["extract"];
+        if let Some(sha) = e["output"]["sha256"].as_str() {
+            if blobs.contains_key(sha) {
+                return Ok(());
+            }
+        }
+        return collect_missing(&e["archive"], sources, blobs, missing);
     }
     if node["build"].is_object() {
         let b = &node["build"];
@@ -1375,21 +1574,29 @@ fn collect_missing(
         // circuits its whole subtree.
         if let Some(sha) = b["output"]["sha256"].as_str() {
             if blobs.contains_key(sha) {
-                return;
+                return Ok(());
             }
         }
         for input in b["inputs"].as_array().into_iter().flatten() {
-            let inner = if input["slice"].is_object() {
-                &input["slice"]["of"]
+            let sl = &input["slice"];
+            let inner = if sl.is_object() {
+                // A slice addresses an inline node (`"of"`) or a
+                // sources-table entry (`"source"`).
+                if sl["of"].is_object() {
+                    &sl["of"]
+                } else {
+                    resolve_source(sl, sources)?
+                }
             } else {
                 input
             };
             if inner["literal"].is_object() {
                 continue;
             }
-            collect_missing(inner, blobs, missing);
+            collect_missing(inner, sources, blobs, missing)?;
         }
     }
+    Ok(())
 }
 
 /// Produce a node's bytes into `feed`, returning the byte count.
@@ -1398,6 +1605,7 @@ fn assemble(
     ctx: &mut CheckCtx,
     feed: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
 ) -> Result<u64> {
+    let node = resolve_source(node, ctx.sources)?;
     if node["literal"].is_object() {
         let l = &node["literal"];
         if let Some(hexs) = l["inline_hex"].as_str() {
@@ -1421,7 +1629,11 @@ fn assemble(
     }
     if node["slice"].is_object() {
         let sl = &node["slice"];
-        let of = &sl["of"];
+        let of = if sl["of"].is_object() {
+            &sl["of"]
+        } else {
+            resolve_source(sl, ctx.sources)?
+        };
         let from = sl["from"].as_u64().context("slice from")?;
         let len = sl["len"].as_u64().context("slice len")?;
         let sha = node_sha256(of)?;
@@ -1444,6 +1656,43 @@ fn assemble(
             Ok(())
         })?;
         return Ok(len);
+    }
+    if node["extract"].is_object() {
+        // The attested edge gets verified for real here: walk the
+        // locally-present archive to the stated path and require the
+        // output digest back. A local copy of the extracted bytes
+        // short-circuits the walk, same as a build's output would.
+        let e = &node["extract"];
+        let name = node_name(node);
+        let want = e["output"]["sha256"].as_str().context("extract sha256")?;
+        let size = e["output"]["size"].as_u64().context("extract size")?;
+        if ctx.blobs.contains_key(want) {
+            let as_ref = json!({ "ref": { "digests": { "sha256": want },
+                                          "name": e["name"] } });
+            return assemble(&as_ref, ctx, feed);
+        }
+        let archive = resolve_source(&e["archive"], ctx.sources)?;
+        let asha = node_sha256(archive)?;
+        let apath = ctx
+            .blobs
+            .get(&asha)
+            .with_context(|| format!("missing archive blob for {name}"))?;
+        let path = e["path"].as_str().context("extract path")?;
+        let mut h = sha2::Sha256::new();
+        let mut n = 0u64;
+        archive_extract(apath, path, &mut |b| {
+            h.update(b);
+            n += b.len() as u64;
+            feed(b)
+        })
+        .with_context(|| format!("{name}: extracting {path} from {}", node_name(archive)))?;
+        let got = hex_lower(&h.finalize());
+        ensure!(
+            got == want,
+            "{name}: extracted bytes hash to {got}, recipe says {want} — stale attestation, or a different build of the archive?"
+        );
+        ensure!(n == size, "{name}: extracted {n} bytes, recipe says {size}");
+        return Ok(n);
     }
     if node["ref"].is_object() {
         let r = &node["ref"];
@@ -1571,12 +1820,86 @@ fn assemble_gzip(
     Ok(n)
 }
 
+/// Stream one member's bytes out of a locally-present archive blob.
+/// rpm only for now (the attested-extraction witnesses are rpm
+/// repos); the format is sniffed, not declared — the grammar states
+/// containment, and knowing how to open archives is check's job.
+fn archive_extract(
+    archive: &Path,
+    member: &str,
+    feed: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+) -> Result<()> {
+    use std::io::{BufReader, Seek, SeekFrom};
+    let mut f = std::fs::File::open(archive)?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic)?;
+    ensure!(
+        magic == [0xed, 0xab, 0xee, 0xdb],
+        "not an rpm — hdx doesn't know how to extract from this archive"
+    );
+    f.seek(SeekFrom::Start(0))?;
+    let mut r = BufReader::new(f);
+    crate::peek_walk::skip_rpm_headers(&mut r).context("rpm header parse failed")?;
+    // The payload is a compressed cpio; sniff the wrapper.
+    let mut head = [0u8; 6];
+    r.read_exact(&mut head)?;
+    let src: Box<dyn Read> = Box::new(std::io::Cursor::new(head.to_vec()).chain(r));
+    let mut payload: Box<dyn Read> = if head[..2] == [0x1f, 0x8b] {
+        Box::new(flate2::read::MultiGzDecoder::new(src))
+    } else if head == [0xfd, b'7', b'z', b'X', b'Z', 0x00] {
+        Box::new(liblzma::read::XzDecoder::new_multi_decoder(src))
+    } else if head[..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+        Box::new(zstd::stream::read::Decoder::new(src)?)
+    } else if head.starts_with(b"BZh") {
+        Box::new(bzip2::read::MultiBzDecoder::new(src))
+    } else if head.starts_with(b"070701") || head.starts_with(b"070702") {
+        src
+    } else {
+        bail!("unrecognized rpm payload compression");
+    };
+    let want = member.trim_start_matches('/');
+    loop {
+        let mut hdr = [0u8; 110];
+        payload
+            .read_exact(&mut hdr)
+            .context("rpm payload ended before the stated path")?;
+        let Some((_mode, filesize, name)) =
+            crate::peek_walk::cpio_header(&hdr, |buf| payload.read_exact(buf))?
+        else {
+            bail!("bad cpio member magic in rpm payload");
+        };
+        if name == "TRAILER!!!" {
+            bail!("{member}: no such path in the rpm payload");
+        }
+        // Hardlinked content rides on ONE of its cpio entries; a
+        // zero-length entry for the stated path fails the digest
+        // check downstream, which is the honest outcome.
+        if name.trim_start_matches('/') == want {
+            let mut left = filesize;
+            let mut buf = vec![0u8; 1 << 20];
+            while left > 0 {
+                let cap = (left as usize).min(buf.len());
+                let n = payload.read(&mut buf[..cap])?;
+                ensure!(n > 0, "rpm payload truncated mid-member");
+                feed(&buf[..n])?;
+                left -= n as u64;
+            }
+            return Ok(());
+        }
+        let skip = filesize + (4 - filesize % 4) % 4;
+        let copied = std::io::copy(&mut Read::take(&mut payload, skip), &mut std::io::sink())?;
+        ensure!(copied == skip, "rpm payload truncated");
+    }
+}
+
 /// Materialize a node's bytes for random access (slices of rebuilt
 /// containers), in RAM below CHECK_SPOOL_MAX, else in a temp file.
 fn materialize(node: &Value, ctx: &mut CheckCtx) -> Result<Spool> {
+    let node = resolve_source(node, ctx.sources)?;
     let size = node["build"]["output"]["size"]
         .as_u64()
         .or(node["ref"]["size"].as_u64())
+        .or(node["extract"]["output"]["size"].as_u64())
         .unwrap_or(0);
     if size > CHECK_SPOOL_MAX {
         let dir = crate::filter::filters_dir()
@@ -1729,6 +2052,17 @@ fn jigdo_flatten(node: &Value, out: &mut Vec<JRegion>) -> Result<()> {
         push_literal(out, node["slice"]["len"].as_u64().context("slice len")?);
         return Ok(());
     }
+    if node["extract"].is_object() {
+        // Extracted bytes aren't fetchable as a whole file either —
+        // jigdo has no extraction step, so they ride in the template.
+        push_literal(
+            out,
+            node["extract"]["output"]["size"]
+                .as_u64()
+                .context("extract size")?,
+        );
+        return Ok(());
+    }
     if node["ref"].is_object() {
         let r = &node["ref"];
         let len = r["size"].as_u64().context("ref size")?;
@@ -1784,7 +2118,10 @@ pub fn emit_jigdo(recipe: &Path) -> Result<()> {
     let doc: Value = serde_json::from_reader(std::io::BufReader::new(
         std::fs::File::open(recipe).with_context(|| format!("open {}", recipe.display()))?,
     ))?;
-    ensure!(doc["hdx_recipe"] == json!("0"), "not an hdx recipe");
+    ensure!(
+        doc["hdx_recipe"] == json!("0") || doc["hdx_recipe"] == json!("1"),
+        "not an hdx recipe (or an unknown version)"
+    );
     let image_path = PathBuf::from(
         recipe
             .to_string_lossy()

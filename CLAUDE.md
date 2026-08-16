@@ -35,10 +35,15 @@ hdx recipe FILE       # reconstruction manifest: verified splice of
                       #   member byte ranges (refs by digest + claim
                       #   URLs) + gzip@0 compression nodes (GNU gzip
                       #   catalog via shell-out, byte-verified — the
-                      #   disarchive trick) + literal residue →
-                      #   FILE.recipe.json; `hdx recipe check RECIPE
+                      #   disarchive trick) + extract nodes ("fetch
+                      #   archive, extract PATH, expect digest" —
+                      #   attested by rpm-files FILEDIGESTS edges,
+                      #   archives stated once in a sources table)
+                      #   + literal residue → FILE.recipe.json;
+                      #   `hdx recipe check RECIPE
                       #   DIR` rebuilds from local blobs, never
-                      #   fetches; `hdx recipe jigdo` emits a stock-
+                      #   fetches (extracts walk the local rpm);
+                      #   `hdx recipe jigdo` emits a stock-
                       #   tool-consumable .jigdo/.template pair (the
                       #   disarchive projection is referee-only test
                       #   code now: tests/disarchive/)

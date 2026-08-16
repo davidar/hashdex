@@ -1809,7 +1809,7 @@ fn skip_n(r: &mut dyn Read, n: u64) -> Result<()> {
 /// RPM = lead ‖ signature header (padded to 8) ‖ header ‖ payload.
 /// Both headers are index blocks: magic(3) ver(1) reserved(4)
 /// nindex(u32be) hsize(u32be) ‖ nindex×16 ‖ hsize.
-fn skip_rpm_headers(r: &mut dyn Read) -> Result<()> {
+pub(crate) fn skip_rpm_headers(r: &mut dyn Read) -> Result<()> {
     skip_n(r, 96)?;
     for pad in [true, false] {
         let mut intro = [0u8; 16];
@@ -1830,7 +1830,7 @@ fn skip_rpm_headers(r: &mut dyn Read) -> Result<()> {
 /// and data padded to 4. Parses one header (already read into `hdr`)
 /// and pulls the padded name via `read_name`. Returns None on bad
 /// magic.
-fn cpio_header(
+pub(crate) fn cpio_header(
     hdr: &[u8; 110],
     mut read_name: impl FnMut(&mut [u8]) -> std::io::Result<()>,
 ) -> Result<Option<(u64, u64, String)>> {

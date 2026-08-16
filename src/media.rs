@@ -103,6 +103,7 @@ pub fn finding(row: &Row) -> Finding {
             Some(row.loc.to_string()),
         )],
         coords,
+        archive: None,
     }
 }
 
