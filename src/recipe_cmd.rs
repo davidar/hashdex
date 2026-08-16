@@ -952,14 +952,14 @@ impl LiteralSpool {
     }
 }
 
-/// What one pass over a packed stream produced: the pcluster nodes
-/// that came back byte-exact (by pcluster index), the verbatim
-/// splices, and the members whose packed bytes did not hash to their
-/// digest.
 /// What planning one own-pcluster file produced: its nodes with the
 /// image offsets they occupy, its verbatim splices, and a tally.
 type PlannedFile = (Vec<(PClusterNode, u64)>, Vec<Seg>, PcStats);
 
+/// What one pass over a packed stream produced: the pcluster nodes
+/// that came back byte-exact (by pcluster index), the verbatim
+/// splices, and the members whose packed bytes did not hash to their
+/// digest.
 type Swept = (
     Vec<(usize, PClusterNode)>,
     Vec<Seg>,
@@ -990,6 +990,37 @@ impl Cover {
     fn end(&self) -> u64 {
         self.pstart + self.len
     }
+}
+
+/// Everything the two planning passes share about one image: the
+/// parsed filesystem, the view its bytes are read through, its walk,
+/// the member index by path, and the compressor settings — including
+/// the preset the image has been shown to use, settled by the first
+/// pcluster that re-encodes byte-exact.
+struct ImgCtx<'a> {
+    fs: crate::erofs::Erofs,
+    view: View,
+    files: Vec<crate::erofs::FileItem>,
+    by_path: HashMap<&'a str, usize>,
+    cfg: crate::erofs::LzmaCfg,
+    preset: Mutex<Option<u32>>,
+}
+
+/// The packed sweep's marching orders: what to do with each pcluster,
+/// which ones must decode, and the covers worth verifying.
+struct SweepSet {
+    eligible: Vec<Elig>,
+    need: Vec<bool>,
+    used: Vec<Cover>,
+}
+
+/// The logical bytes available to the encoder, and whether the stream
+/// continues past them — which decides whether a starved encode is a
+/// margin problem (more input existed) or a mismatch.
+#[derive(Clone, Copy)]
+struct Feed<'a> {
+    bytes: &'a [u8],
+    more: bool,
 }
 
 /// What the pcluster sweep did, for the mint summary and the honest
@@ -1081,14 +1112,17 @@ impl Planner<'_> {
         for &c in self.kids[i].iter() {
             by_path.insert(self.members[c].path.as_str(), c);
         }
-        let preset = Mutex::new(None::<u32>);
+        let ctx = ImgCtx {
+            fs,
+            view,
+            files,
+            by_path,
+            cfg,
+            preset: Mutex::new(None),
+        };
         let mut segs: Vec<Seg> = Vec::new();
-        self.plan_packed_inode(
-            i, plan, &fs, &view, &files, &by_path, &cfg, &preset, &mut segs, &mut stats,
-        )?;
-        self.plan_own_pclusters(
-            i, plan, &fs, &view, &files, &by_path, &cfg, &preset, &mut segs, &mut stats,
-        )?;
+        self.plan_packed_inode(i, plan, &ctx, &mut segs, &mut stats)?;
+        self.plan_own_pclusters(i, plan, &ctx, &mut segs, &mut stats)?;
         if segs.is_empty() {
             return Ok(stats);
         }
@@ -1097,38 +1131,32 @@ impl Planner<'_> {
             .union(&tabled_of(&segs, &plan.pclusters))
             .copied()
             .collect();
-        splice_in(i, plan, segs, &view)?;
+        splice_in(i, plan, segs)?;
         Ok(stats)
     }
 
     /// Pass one: the packed inode, whose pclusters hold many members
     /// each.
-    #[allow(clippy::too_many_arguments)]
     fn plan_packed_inode(
         &mut self,
         i: usize,
         plan: &mut Plan,
-        fs: &crate::erofs::Erofs,
-        view: &View,
-        files: &[crate::erofs::FileItem],
-        by_path: &HashMap<&str, usize>,
-        cfg: &crate::erofs::LzmaCfg,
-        preset: &Mutex<Option<u32>>,
+        ctx: &ImgCtx,
         out: &mut Vec<Seg>,
         stats: &mut PcStats,
     ) -> Result<()> {
-        let (pcs, _) = fs.packed_pclusters()?;
+        let (pcs, _) = ctx.fs.packed_pclusters()?;
         stats.total += pcs.len();
         if pcs.is_empty() {
             return Ok(());
         }
         let mut covers: Vec<Cover> = Vec::new();
-        for f in files {
+        for f in &ctx.files {
             let Some(off) = f.plan.packed_whole() else {
                 continue; // own pclusters, or only a packed tail
             };
             let path = format!("{}!{}", self.members[i].path, f.path);
-            let Some(&c) = by_path.get(path.as_str()) else {
+            let Some(&c) = ctx.by_path.get(path.as_str()) else {
                 continue;
             };
             let m = &self.members[c];
@@ -1203,14 +1231,17 @@ impl Planner<'_> {
                 .iter()
                 .any(|c| c.pstart < pc.la + pc.llen && pc.la < c.end());
         }
+        let set = SweepSet {
+            eligible,
+            need,
+            used,
+        };
 
         let spool = match plan.literals.take() {
             Some(s) => s,
             None => LiteralSpool::new()?,
         };
-        let (nodes, mut segs, failed) = self.sweep_pclusters(
-            fs, view, &pcs, &eligible, &need, &used, cfg, preset, &spool, stats,
-        )?;
+        let (nodes, mut segs, failed) = self.sweep_pclusters(ctx, &pcs, &set, &spool, stats)?;
         plan.literals = Some(spool);
 
         // A member the packed bytes don't hash to is a mapping this
@@ -1275,27 +1306,21 @@ impl Planner<'_> {
     /// so files plan independently and in parallel: read the member
     /// back through the reader, require its digest, and re-encode or
     /// splice each of its pclusters.
-    #[allow(clippy::too_many_arguments)]
     fn plan_own_pclusters(
         &mut self,
         i: usize,
         plan: &mut Plan,
-        fs: &crate::erofs::Erofs,
-        view: &View,
-        files: &[crate::erofs::FileItem],
-        by_path: &HashMap<&str, usize>,
-        cfg: &crate::erofs::LzmaCfg,
-        preset: &Mutex<Option<u32>>,
+        ctx: &ImgCtx,
         out: &mut Vec<Seg>,
         stats: &mut PcStats,
     ) -> Result<()> {
         let mut todo: Vec<(usize, &crate::erofs::FileItem)> = Vec::new();
-        for f in files {
+        for f in &ctx.files {
             if f.plan.packed_whole().is_some() || f.plan.own_pclusters().is_empty() {
                 continue;
             }
             let path = format!("{}!{}", self.members[i].path, f.path);
-            let Some(&c) = by_path.get(path.as_str()) else {
+            let Some(&c) = ctx.by_path.get(path.as_str()) else {
                 continue;
             };
             let m = &self.members[c];
@@ -1309,7 +1334,7 @@ impl Planner<'_> {
         }
         // Everything a file with no fetchable evidence stores is
         // literal, and says so in the tally rather than vanishing.
-        let all: usize = files.iter().map(|f| f.plan.own_pclusters().len()).sum();
+        let all: usize = ctx.files.iter().map(|f| f.plan.own_pclusters().len()).sum();
         let planned: usize = todo.iter().map(|(_, f)| f.plan.own_pclusters().len()).sum();
         stats.total += all;
         stats.uncovered += all - planned;
@@ -1328,7 +1353,7 @@ impl Planner<'_> {
                         return;
                     }
                     let (c, f) = todo[k];
-                    match plan_own_file(fs, view, f, c, &self.members[c], cfg, preset) {
+                    match plan_own_file(ctx, f, c, &self.members[c]) {
                         Ok(v) => out_all.lock().unwrap().push(v),
                         Err(e) => *failed.lock().unwrap() = Some(e),
                     }
@@ -1385,23 +1410,20 @@ impl Planner<'_> {
     /// pool, and splice the uncompressed ones straight in. Returns the
     /// nodes that came back byte-exact, the verbatim splices, and the
     /// members whose digests didn't check out.
-    #[allow(clippy::too_many_arguments)]
     fn sweep_pclusters(
         &self,
-        fs: &crate::erofs::Erofs,
-        view: &View,
+        ctx: &ImgCtx,
         pcs: &[crate::erofs::PCluster],
-        eligible: &[Elig],
-        need: &[bool],
-        used: &[Cover],
-        cfg: &crate::erofs::LzmaCfg,
-        preset: &Mutex<Option<u32>>,
+        set: &SweepSet,
         spool: &LiteralSpool,
         stats: &mut PcStats,
     ) -> Result<Swept> {
+        let (fs, view) = (&ctx.fs, &ctx.view);
+        let (eligible, need, used) = (&set.eligible[..], &set.need[..], &set.used[..]);
         struct Job {
             k: usize,
             input: Vec<u8>,
+            more: bool,
             stored: Vec<u8>,
         }
         let jobs = std::sync::mpsc::sync_channel::<Job>(self.threads.max(1));
@@ -1426,20 +1448,24 @@ impl Planner<'_> {
                     let pc = &pcs[job.k];
                     // The first job settles the preset for the whole
                     // image (one compressor invocation built it); the
-                    // rest reuse it, and only re-search if it fails.
-                    let known = *preset.lock().unwrap();
+                    // rest reuse it, and a pcluster the settled preset
+                    // cannot reproduce stays literal.
+                    let known = *ctx.preset.lock().unwrap();
                     let outcome = plan_pcluster(
                         pc,
                         &job.stored,
-                        &job.input,
+                        Feed {
+                            bytes: &job.input,
+                            more: job.more,
+                        },
                         used,
                         known,
-                        cfg.dict_size,
+                        ctx.cfg.dict_size,
                         spool,
                     );
                     match outcome {
                         Ok(Some((node, p))) => {
-                            *preset.lock().unwrap() = Some(p);
+                            *ctx.preset.lock().unwrap() = Some(p);
                             out.lock().unwrap().push((job.k, node));
                             counts.lock().unwrap().0 += 1;
                         }
@@ -1508,14 +1534,22 @@ impl Planner<'_> {
                         Elig::No => {}
                         Elig::Encode => {
                             let mut input = bytes;
+                            let mut more = false;
                             if k + 1 < pcs.len() {
                                 let next = fs.decode_pcluster(&pcs[k + 1])?;
                                 let take = next.len().min(ENCODE_MARGIN);
+                                more = take < next.len() || k + 2 < pcs.len();
                                 input.extend_from_slice(&next[..take]);
                                 cur = Some(next);
                             }
                             let stored = read_stored(view, pc)?;
-                            if tx.send(Job { k, input, stored }).is_err() {
+                            let job = Job {
+                                k,
+                                input,
+                                more,
+                                stored,
+                            };
+                            if tx.send(job).is_err() {
                                 break;
                             }
                         }
@@ -1570,19 +1604,15 @@ impl Planner<'_> {
 /// with the image offsets they occupy, the verbatim splices, and a
 /// tally.
 fn plan_own_file(
-    fs: &crate::erofs::Erofs,
-    view: &View,
+    ctx: &ImgCtx,
     f: &crate::erofs::FileItem,
     idx: usize,
     member: &Member,
-    cfg: &crate::erofs::LzmaCfg,
-    preset: &Mutex<Option<u32>>,
 ) -> Result<PlannedFile> {
     let mut stats = PcStats::default();
-    let empty = (Vec::new(), Vec::new(), PcStats::default());
     let pcs = f.plan.own_pclusters();
     let Some(zp) = f.plan.zplan() else {
-        return Ok(empty);
+        return Ok((Vec::new(), Vec::new(), stats));
     };
     // The whole member is the cover: these pclusters hold its bytes
     // and nobody else's.
@@ -1594,7 +1624,7 @@ fn plan_own_file(
     // The spool is only reachable when a node's input span isn't
     // covered, which can't happen with a whole-member cover.
     let spool = LiteralSpool::new()?;
-    let mut reader = fs.zreader(zp);
+    let mut reader = ctx.fs.zreader(zp);
     let mut hasher = sha2::Sha256::new();
     let mut window: Vec<u8> = Vec::new();
     let mut at = 0u64; // logical offset of window[0]
@@ -1606,29 +1636,32 @@ fn plan_own_file(
         let want = pc.la + pc.llen + ENCODE_MARGIN as u64;
         fill(&mut reader, &mut hasher, &mut window, at, want)?;
         if pc.la < at {
-            return Ok(empty); // extents out of order — not a plan we make
+            // Extents out of order — not a plan we make. Everything
+            // already planned is discarded with the file, so it must
+            // not stay in the tally as if it had been emitted.
+            stats.verified = 0;
+            stats.verbatim = 0;
+            stats.unverified_members += 1;
+            return Ok((Vec::new(), Vec::new(), stats));
         }
         let lo = (pc.la - at) as usize;
         if lo >= window.len() {
             continue;
         }
-        let stored = read_stored(view, pc)?;
+        let stored = read_stored(&ctx.view, pc)?;
         if pc.lzma {
             // Read the shared preset into a local: a guard temporary in
             // the scrutinee would still be held inside the arms, and an
             // arm locks it again.
-            let known = *preset.lock().unwrap();
-            match plan_pcluster(
-                pc,
-                &stored,
-                &window[lo..],
-                &covers,
-                known,
-                cfg.dict_size,
-                &spool,
-            ) {
+            let known = *ctx.preset.lock().unwrap();
+            let feed = Feed {
+                bytes: &window[lo..],
+                // `fill` stopped at `want`, not EOF: the stream goes on.
+                more: at + window.len() as u64 >= want,
+            };
+            match plan_pcluster(pc, &stored, feed, &covers, known, ctx.cfg.dict_size, &spool) {
                 Ok(Some((node, p))) => {
-                    *preset.lock().unwrap() = Some(p);
+                    *ctx.preset.lock().unwrap() = Some(p);
                     stats.verified += 1;
                     nodes.push((node, pc.pa));
                 }
@@ -1662,6 +1695,10 @@ fn plan_own_file(
     fill(&mut reader, &mut hasher, &mut window, at, u64::MAX)?;
     let got: [u8; 32] = hasher.finalize().into();
     if got != member.digests.as_ref().expect("digests").sha256 {
+        // The nodes and splices are dropped with the member, so the
+        // tally must not count them as emitted.
+        stats.verified = 0;
+        stats.verbatim = 0;
         stats.unverified_members += 1;
         return Ok((Vec::new(), Vec::new(), stats));
     }
@@ -1766,16 +1803,16 @@ const MARGIN_SHORT: &str = "encoder ran out of input before filling the pcluster
 /// `known` is the preset the image has already been shown to use; with
 /// none, every preset is tried (mkfs runs one compressor config per
 /// image, so the first answer settles it).
-#[allow(clippy::too_many_arguments)]
 fn plan_pcluster(
     pc: &crate::erofs::PCluster,
     stored: &[u8],
-    stream: &[u8],
+    feed: Feed,
     covers: &[Cover],
     known: Option<u32>,
     dict_size: u32,
     spool: &LiteralSpool,
 ) -> Result<Option<(PClusterNode, u32)>> {
+    let stream = feed.bytes;
     let pad = crate::erofs::pcluster_padding(stored);
     ensure!(pad < stored.len(), "pcluster is all padding");
     let cap = stored.len() - pad;
@@ -1809,8 +1846,12 @@ fn plan_pcluster(
         for &fed in &lengths {
             let (out, consumed) =
                 crate::erofs::microlzma_encode(&stream[..fed], cap, p, dict_size)?;
-            if out.len() < cap && consumed == fed as u64 && fed < stream.len() {
-                short = true; // ran out of input, not output: feed more
+            // Ran out of input, not output: feed more. When even the
+            // whole buffered stream starves the encoder but the real
+            // stream goes on, that is still a margin problem — mkfs
+            // had more input, so a clean-ended candidate can't match.
+            if out.len() < cap && consumed == fed as u64 && (fed < stream.len() || feed.more) {
+                short = true;
                 continue;
             }
             let mut candidate = vec![0u8; pad];
@@ -1895,7 +1936,7 @@ fn plan_pcluster(
 
 /// Merge freshly planned segments into an already-planned build,
 /// re-tiling its literal gaps around them.
-fn splice_in(i: usize, plan: &mut Plan, extra: Vec<Seg>, _view: &View) -> Result<()> {
+fn splice_in(i: usize, plan: &mut Plan, extra: Vec<Seg>) -> Result<()> {
     let build = plan
         .builds
         .get_mut(&i)
